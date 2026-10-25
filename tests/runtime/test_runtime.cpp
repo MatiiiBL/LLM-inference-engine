@@ -560,6 +560,24 @@ TEST_CASE("Arena honours alignment") {
   w[1].v[31] = 1.0f;
 }
 
+TEST_CASE("Arena::allocate_array throws instead of wrapping count * sizeof(T)") {
+  Arena arena(1024);
+  arena.allocate(10, 1);
+  // 2^62 floats is 2^64 bytes, which wraps to a 0-byte request that would
+  // succeed; one more float wraps to 4 bytes.
+  CHECK_THROWS_AS(arena.allocate_array<float>(std::size_t{1} << 62), std::bad_alloc);
+  CHECK_THROWS_AS(arena.allocate_array<float>((std::size_t{1} << 62) + 1), std::bad_alloc);
+  struct Wide {
+    float v[32];
+  };
+  constexpr std::size_t max_wide = std::numeric_limits<std::size_t>::max() / sizeof(Wide);
+  CHECK_THROWS_AS(arena.allocate_array<Wide>(max_wide + 1), std::bad_alloc);
+  // The largest count that does not wrap reaches the arena's own check.
+  CHECK_THROWS_AS(arena.allocate_array<Wide>(max_wide), std::bad_alloc);
+  CHECK(arena.used() == 10);
+  CHECK_NOTHROW(arena.allocate_array<float>(0));
+}
+
 TEST_CASE("Arena allocations do not overlap") {
   Arena arena(4096);
   auto* a = static_cast<unsigned char*>(arena.allocate(100, 1));

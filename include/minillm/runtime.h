@@ -12,7 +12,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <new>
 #include <type_traits>
 
 #include "minillm/tensor.h"
@@ -77,10 +79,13 @@ class Arena {
   void* allocate(std::size_t bytes, std::size_t align = 64);
 
   /// Typed convenience wrapper. The memory is NOT initialized and no
-  /// destructor is ever run, so T must be trivially destructible.
+  /// destructor is ever run, so T must be trivially destructible. Throws
+  /// std::bad_alloc if `count * sizeof(T)` does not fit in a size_t, rather
+  /// than letting the byte count wrap to a small allocation.
   template <class T>
   T* allocate_array(std::size_t count) {
     static_assert(std::is_trivially_destructible_v<T>, "Arena never runs destructors");
+    if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) throw std::bad_alloc();
     return static_cast<T*>(allocate(count * sizeof(T), alignof(T) < 64 ? 64 : alignof(T)));
   }
 
