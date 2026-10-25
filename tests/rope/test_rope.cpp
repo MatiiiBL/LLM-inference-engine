@@ -11,6 +11,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/allclose.h"
@@ -26,6 +27,56 @@ namespace {
 bool bitwise_equal(const Tensor& a, const Tensor& b) {
   return a.shape() == b.shape() &&
          std::memcmp(a.f32(), b.f32(), static_cast<std::size_t>(a.numel()) * sizeof(float)) == 0;
+}
+
+// The [cos | sin] row the contract defines for one position, computed here
+// independently of ops::rope: the float32 inv_freq chain from ops.h, a float32
+// angle, then cos and sin in double rounded to float.
+std::vector<float> expected_row(std::int64_t head_dim, float theta, std::int64_t pos) {
+  const std::int64_t half = head_dim / 2;
+  std::vector<float> row(static_cast<std::size_t>(head_dim));
+  for (std::int64_t i = 0; i < half; ++i) {
+    const float exponent = static_cast<float>(2 * i) / static_cast<float>(head_dim);
+    const float inv_freq = 1.0f / std::pow(theta, exponent);
+    const float angle = static_cast<float>(pos) * inv_freq;
+    row[static_cast<std::size_t>(i)] = static_cast<float>(std::cos(static_cast<double>(angle)));
+    row[static_cast<std::size_t>(i + half)] =
+        static_cast<float>(std::sin(static_cast<double>(angle)));
+  }
+  return row;
+}
+
+// [n_tokens, n_heads, head_dim] with every head [1 ... 1 | 0 ... 0]. Rotating
+// it writes x[i] = 1*cos - 0*sin = cos and x[i + half] = 0*cos + 1*sin = sin
+// exactly, fused multiply-add or not, so the output IS the cos/sin row and can
+// be compared bit for bit.
+Tensor unit_heads(std::int64_t n_tokens, std::int64_t n_heads, std::int64_t head_dim) {
+  Tensor t = Tensor::zeros({n_tokens, n_heads, head_dim});
+  for (std::int64_t r = 0; r < n_tokens * n_heads; ++r) {
+    for (std::int64_t i = 0; i < head_dim / 2; ++i) t.f32()[r * head_dim + i] = 1.0f;
+  }
+  return t;
+}
+
+// Rotates unit heads at `positions` and counts elements that differ from
+// expected_row in any bit.
+std::int64_t row_mismatches(std::int64_t head_dim, float theta,
+                            const std::vector<std::int64_t>& positions) {
+  const auto n_tokens = static_cast<std::int64_t>(positions.size());
+  const std::int64_t n_heads = 2;
+  Tensor q = unit_heads(n_tokens, n_heads, head_dim);
+  ops::rope(q, nullptr, positions, theta);
+
+  std::int64_t mismatches = 0;
+  for (std::int64_t t = 0; t < n_tokens; ++t) {
+    const std::vector<float> row =
+        expected_row(head_dim, theta, positions[static_cast<std::size_t>(t)]);
+    for (std::int64_t h = 0; h < n_heads; ++h) {
+      const float* head = q.f32() + (t * n_heads + h) * head_dim;
+      if (std::memcmp(head, row.data(), row.size() * sizeof(float)) != 0) ++mismatches;
+    }
+  }
+  return mismatches;
 }
 
 }  // namespace
@@ -90,10 +141,10 @@ TEST_CASE("ops::rope matches transformers") {
 
 TEST_CASE("ops::rope agrees with ref::rope on unordered and repeated positions") {
   // The model always passes start_pos + [0..n), but the contract is any
-  // positions >= 0, in any order.
-  const std::vector<std::int64_t> positions{4000, 0, 137, 137, 1};
-  Tensor q_actual = random_tensor({5, 9, 64}, 304);
-  Tensor k_actual = random_tensor({5, 3, 64}, 305);
+  // positions >= 0, in any order — including ones far past any context.
+  const std::vector<std::int64_t> positions{4000, 0, 137, 137, 1, 20000, 1 << 20};
+  Tensor q_actual = random_tensor({7, 9, 64}, 304);
+  Tensor k_actual = random_tensor({7, 3, 64}, 305);
   Tensor q_expected = q_actual.copy_contiguous();
   Tensor k_expected = k_actual.copy_contiguous();
 
@@ -221,4 +272,84 @@ TEST_CASE("ops::rope writes nothing when it throws") {
                   std::invalid_argument);
   CHECK(bitwise_equal(q, q_before));
   CHECK(bitwise_equal(k, k_before));
+}
+
+TEST_CASE("ops::rope agrees with ref::rope on long prefills") {
+  // 16384 is where this implementation stops caching rows at head_dim 64, so
+  // start 16300 straddles the table and the per-call path in one call.
+  for (const std::int64_t start : {0, 16300}) {
+    const std::int64_t n_tokens = 200;
+    std::vector<std::int64_t> positions(static_cast<std::size_t>(n_tokens));
+    for (std::int64_t t = 0; t < n_tokens; ++t) positions[static_cast<std::size_t>(t)] = start + t;
+
+    Tensor q_actual = random_tensor({n_tokens, 9, 64}, 313);
+    Tensor k_actual = random_tensor({n_tokens, 3, 64}, 314);
+    Tensor q_expected = q_actual.copy_contiguous();
+    Tensor k_expected = k_actual.copy_contiguous();
+
+    ref::rope(q_expected, &k_expected, positions, 100000.0f);
+    ops::rope(q_actual, &k_actual, positions, 100000.0f);
+    const std::string label = "ops::rope prefill start=" + std::to_string(start);
+    assert_allclose(q_actual, q_expected, tol::kRope, label + " q");
+    assert_allclose(k_actual, k_expected, tol::kRope, label + " k");
+  }
+}
+
+TEST_CASE("ops::rope's cached cos/sin rows are bit-identical to recomputing them") {
+  // Each position is visited cold, warm, and inside a mixed batch, so a row is
+  // read from a freshly built table, from a grown copy of one, and from the
+  // per-call path past the table's reach; every one must equal the row the
+  // contract defines, in every bit. (6, 12345) is a key no other test uses, so
+  // its first visit really is cold.
+  struct Key {
+    std::int64_t head_dim;
+    float theta;
+  };
+  const std::vector<std::int64_t> positions{0,     1,     63,    64,      65,      137,    4000,
+                                            8191,  8192,  16383, 16384,   20000,   1 << 20,
+                                            1 << 24};
+  for (const Key key : {Key{6, 12345.0f}, Key{64, 100000.0f}, Key{128, 500000.0f}}) {
+    CAPTURE(key.head_dim);
+    CAPTURE(key.theta);
+    for (const std::int64_t pos : positions) {
+      CAPTURE(pos);
+      CHECK(row_mismatches(key.head_dim, key.theta, {pos}) == 0);
+    }
+    for (auto it = positions.rbegin(); it != positions.rend(); ++it) {
+      CAPTURE(*it);
+      CHECK(row_mismatches(key.head_dim, key.theta, {*it}) == 0);
+    }
+    CHECK(row_mismatches(key.head_dim, key.theta, positions) == 0);
+  }
+
+  // More keys than the cache keeps, so some are evicted and rebuilt.
+  for (int round = 0; round < 2; ++round) {
+    for (const float theta : {1000.0f, 2000.0f, 3000.0f, 4000.0f, 5000.0f, 6000.0f}) {
+      CAPTURE(theta);
+      CHECK(row_mismatches(16, theta, {0, 9, 300}) == 0);
+    }
+  }
+}
+
+TEST_CASE("ops::rope is safe to call concurrently") {
+  // Threads sweep interleaved positions on keys that start cold, so tables
+  // are built, grown and swapped while other threads are reading them. Under
+  // tsan this is the race check; everywhere it checks no thread ever reads a
+  // wrong row.
+  const int n_threads = 8;
+  std::vector<std::int64_t> mismatches(n_threads, 0);
+  std::vector<std::thread> threads;
+  for (int j = 0; j < n_threads; ++j) {
+    threads.emplace_back([j, &mismatches] {
+      const float theta = j % 2 == 0 ? 31337.0f : 71717.0f;
+      for (std::int64_t pos = j; pos < 4096; pos += 13 * n_threads) {
+        mismatches[static_cast<std::size_t>(j)] += row_mismatches(64, theta, {pos, pos + 1});
+      }
+    });
+  }
+  for (std::thread& t : threads) t.join();
+  for (int j = 0; j < n_threads; ++j) {
+    CAPTURE(j);
+    CHECK(mismatches[static_cast<std::size_t>(j)] == 0);
+  }
 }
