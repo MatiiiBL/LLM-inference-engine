@@ -1,12 +1,14 @@
 // Workflow 04-matmul owns this file.
 //
-// In Phase 0 ops::matmul forwards to ref::matmul, so these pass trivially.
-// They become the real safety net the moment you write a fast kernel: keep
-// both the ref:: comparison (cheap, any shape) and the torch comparison
-// (ground truth), and add the shapes your kernel special-cases.
+// ops::matmul is checked two ways: against ref::matmul on random inputs (cheap,
+// any shape, including the tails a blocked kernel special-cases) and against
+// the torch golden data (ground truth).
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -18,30 +20,43 @@
 using namespace minillm;
 using namespace minillm::test;
 
+namespace {
+
+std::string shape_label(std::int64_t m, std::int64_t k, std::int64_t n) {
+  return "m=" + std::to_string(m) + " k=" + std::to_string(k) + " n=" + std::to_string(n);
+}
+
+}  // namespace
+
 TEST_CASE("ops::matmul agrees with ref::matmul at the model's shapes") {
-  // [m, k] x [n, k] for every linear layer in the forward pass. m = 1 is the
-  // decode step, m = 8 a short prefill.
+  // [m, k] x [n, k] for every linear layer in the forward pass, at m = 1 (the
+  // decode step) and m = 8 (a short prefill). o_proj has q_proj's shape and
+  // gate_proj has up_proj's, so each distinct shape appears once. lm_head uses
+  // the full 49152-row vocabulary; only the golden file trims it.
   struct Case {
     const char* name;
-    std::int64_t m;
     std::int64_t k;
     std::int64_t n;
   };
   const Case cases[] = {
-      {"q_proj decode", 1, 576, 576},   {"q_proj prefill", 8, 576, 576},
-      {"kv_proj prefill", 8, 576, 192}, {"mlp_up prefill", 8, 576, 1536},
-      {"mlp_down prefill", 8, 1536, 576}, {"lm_head decode", 1, 576, 4096},
+      {"q_proj/o_proj", 576, 576},     {"k_proj/v_proj", 576, 192},
+      {"gate_proj/up_proj", 576, 1536}, {"down_proj", 1536, 576},
+      {"lm_head", 576, 49152},
   };
 
-  for (const Case& c : cases) {
-    const Tensor x = random_tensor({c.m, c.k}, 201);
-    const Tensor w = random_tensor({c.n, c.k}, 202);
-    Tensor expected = Tensor::zeros({c.m, c.n});
-    Tensor actual = Tensor::zeros({c.m, c.n});
+  for (const std::int64_t m : {1, 8}) {
+    for (const Case& c : cases) {
+      const Tensor x = random_tensor({m, c.k}, 201);
+      const Tensor w = random_tensor({c.n, c.k}, 202);
+      Tensor expected = Tensor::zeros({m, c.n});
+      Tensor actual = Tensor::zeros({m, c.n});
 
-    ref::matmul(x, w, expected);
-    ops::matmul(x, w, actual);
-    assert_allclose(actual, expected, tol::kMatmul, std::string("ops::matmul vs ref ") + c.name);
+      ref::matmul(x, w, expected);
+      ops::matmul(x, w, actual);
+      assert_allclose(actual, expected, tol::kMatmul,
+                      std::string("ops::matmul vs ref ") + c.name + " " +
+                          shape_label(m, c.k, c.n));
+    }
   }
 }
 
@@ -61,6 +76,92 @@ TEST_CASE("ops::matmul handles awkward sizes") {
                       "ops::matmul vs ref k=" + std::to_string(k) + " n=" + std::to_string(n));
     }
   }
+}
+
+TEST_CASE("ops::matmul handles every row count") {
+  // The sweep above fixes m = 3. A kernel that blocks rows has a row tail of
+  // its own, so walk m past every plausible row block, at a k with both a
+  // vector body and a remainder and an n that leaves a column tail as well.
+  struct Inner {
+    std::int64_t k;
+    std::int64_t n;
+  };
+  const Inner inners[] = {{37, 19}, {576, 64}};
+  std::vector<std::int64_t> rows;
+  for (std::int64_t m = 1; m <= 17; ++m) rows.push_back(m);
+  for (const std::int64_t m : {31, 33, 64}) rows.push_back(m);
+
+  for (const Inner& in : inners) {
+    for (const std::int64_t m : rows) {
+      const Tensor x = random_tensor({m, in.k}, 205);
+      const Tensor w = random_tensor({in.n, in.k}, 206);
+      Tensor expected = Tensor::zeros({m, in.n});
+      Tensor actual = Tensor::zeros({m, in.n});
+      ref::matmul(x, w, expected);
+      ops::matmul(x, w, actual);
+      assert_allclose(actual, expected, tol::kMatmul,
+                      "ops::matmul vs ref " + shape_label(m, in.k, in.n));
+    }
+  }
+}
+
+TEST_CASE("ops::matmul overwrites every output element") {
+  // out is fully overwritten, never accumulated into. Starting from NaN means
+  // an element that is skipped, or added to instead of stored, cannot pass.
+  // k = 0 is an empty sum, which is 0.
+  struct Case {
+    std::int64_t m;
+    std::int64_t k;
+    std::int64_t n;
+  };
+  const Case cases[] = {{1, 576, 576}, {8, 1536, 576}, {5, 9, 7}, {3, 0, 4}};
+
+  for (const Case& c : cases) {
+    const Tensor x = random_tensor({c.m, c.k}, 207);
+    const Tensor w = random_tensor({c.n, c.k}, 208);
+    Tensor expected = Tensor::zeros({c.m, c.n});
+    Tensor actual = Tensor::empty({c.m, c.n});
+    std::fill_n(actual.f32(), actual.numel(), std::numeric_limits<float>::quiet_NaN());
+
+    ref::matmul(x, w, expected);
+    ops::matmul(x, w, actual);
+    assert_allclose(actual, expected, tol::kMatmul,
+                    "ops::matmul over NaN " + shape_label(c.m, c.k, c.n));
+  }
+}
+
+TEST_CASE("ops::matmul rejects invalid arguments") {
+  const Tensor x = Tensor::zeros({2, 3});
+  Tensor out = Tensor::zeros({2, 4});
+
+  // The cases ref::matmul is held to (tests/ops_ref/test_matmul.cpp).
+  // w's second dimension is in_features and must match x's width.
+  CHECK_THROWS_AS(ops::matmul(x, Tensor::zeros({4, 5}), out), std::invalid_argument);
+  // out must be [m, n].
+  CHECK_THROWS_AS(ops::matmul(x, Tensor::zeros({5, 3}), out), std::invalid_argument);
+  // rank 3 is not a matrix.
+  CHECK_THROWS_AS(ops::matmul(Tensor::zeros({2, 2, 2}), Tensor::zeros({2, 2}), out),
+                  std::invalid_argument);
+
+  // out has the wrong number of rows.
+  Tensor out_rows = Tensor::zeros({3, 4});
+  CHECK_THROWS_AS(ops::matmul(x, Tensor::zeros({4, 3}), out_rows), std::invalid_argument);
+
+  // Every operand must be f32.
+  Tensor out_bf16 = Tensor::zeros({2, 4}, DType::BF16);
+  CHECK_THROWS_AS(ops::matmul(Tensor::zeros({2, 3}, DType::BF16), Tensor::zeros({4, 3}), out),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(ops::matmul(x, Tensor::zeros({4, 3}, DType::BF16), out), std::invalid_argument);
+  CHECK_THROWS_AS(ops::matmul(x, Tensor::zeros({4, 3}), out_bf16), std::invalid_argument);
+
+  // Every operand must be contiguous: a column slice keeps its parent's row
+  // stride, so it is not.
+  Tensor out_view = Tensor::zeros({2, 8}).slice(1, 0, 4);
+  CHECK_THROWS_AS(ops::matmul(Tensor::zeros({2, 6}).slice(1, 0, 3), Tensor::zeros({4, 3}), out),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(ops::matmul(x, Tensor::zeros({4, 6}).slice(1, 0, 3), out),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(ops::matmul(x, Tensor::zeros({4, 3}), out_view), std::invalid_argument);
 }
 
 TEST_CASE("ops::matmul matches torch") {
