@@ -266,9 +266,9 @@ TEST_CASE("threads are started once, in the constructor, and reused") {
       });
       seen.insert(slot.begin(), slot.end());
     }
-    // Bounded by size() and including the caller: the same threads every time.
+    // Bounded by size(): the same threads every time. (Chunks are claimed,
+    // so which of them ran any given call — the caller included — varies.)
     CHECK(seen.size() <= static_cast<std::size_t>(threads));
-    CHECK(seen.count(std::this_thread::get_id()) == 1);
 
     if (before >= 0) {
       CHECK(started == before + threads - 1);
@@ -410,8 +410,10 @@ TEST_CASE("pools can be created and destroyed back to back") {
 
 TEST_CASE("back-to-back calls see the caller's writes and return theirs") {
   // The caller writes inputs before each call and reads outputs after it; a
-  // missing happens-before edge on either side is a TSan report here.
-  for (const int threads : {2, 8}) {
+  // missing happens-before edge on either side is a TSan report here. The
+  // 32-thread pool oversubscribes the machine, so workers routinely wake up
+  // after the call they were woken for has finished.
+  for (const int threads : {2, 8, 32}) {
     CAPTURE(threads);
     ThreadPool pool(threads);
     constexpr Index n = 64;
@@ -430,6 +432,37 @@ TEST_CASE("back-to-back calls see the caller's writes and return theirs") {
       }
     }
     CHECK(mismatches == 0);
+  }
+}
+
+TEST_CASE("no wakeup is lost while threads are falling asleep") {
+  // Idle threads spin for a while and then sleep. Sweeping both the gap
+  // between calls and the length of a chunk across that window hands out
+  // work, and finishes it, at every point of the spin-to-sleep transition.
+  // A lost wakeup hangs here (ctest times out) instead of passing.
+  using clock = std::chrono::steady_clock;
+  const auto busy_wait = [](std::chrono::microseconds us) {
+    const auto until = clock::now() + us;
+    while (clock::now() < until) {
+    }
+  };
+  for (const int threads : {2, 8}) {
+    CAPTURE(threads);
+    ThreadPool pool(threads);
+    std::vector<int> hits(static_cast<std::size_t>(threads));
+    int wrong = 0;
+    for (int iter = 0; iter < 400; ++iter) {
+      busy_wait(std::chrono::microseconds(iter % 200));
+      const auto chunk_time = std::chrono::microseconds((iter * 37) % 200);
+      std::fill(hits.begin(), hits.end(), 0);
+      pool.parallel_for(threads, [&](Index begin, Index end) {
+        // Only the last chunk is slow, so the caller is left waiting on it.
+        if (end == threads) busy_wait(chunk_time);
+        for (Index i = begin; i < end; ++i) ++hits[static_cast<std::size_t>(i)];
+      });
+      wrong += static_cast<int>(threads - std::count(hits.begin(), hits.end(), 1));
+    }
+    CHECK(wrong == 0);
   }
 }
 
@@ -490,6 +523,12 @@ TEST_CASE("Arena used() counts padding and is the same for the same requests") {
     CHECK(arena.used() == 68);
     arena.allocate_array<float>(1);
     CHECK(arena.used() == 132);
+  }
+  // Up to a page, in fact, whatever alignment malloc happens to give.
+  for (int run = 0; run < 3; ++run) {
+    Arena arena(3 * 4096);
+    arena.allocate(1, 4096);
+    CHECK(arena.used() == 1);
   }
 }
 
