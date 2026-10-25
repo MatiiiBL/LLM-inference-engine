@@ -12,11 +12,11 @@ Whitespace (\\s, i.e. the White_Space property) is ten ranges and lives in
 tokenizer.cpp directly.
 
 The tables follow this interpreter's unicodedata version, which is recorded in
-the generated header. It must match the Unicode version of the tokenizers
-build being reproduced — 16.0 for tokenizers 0.23 (its Rust std and its
-Oniguruma agree on it) — or code points assigned in between classify
-differently. (Its Rust std is one version further, on 17.0; the 13 numbers
-17.0 added are listed by hand in tokenizer.cpp's is_numeric.) Python 3.14
+the generated header. It must match the Unicode version of the Oniguruma in
+the tokenizers build being reproduced — 16.0 for tokenizers 0.23 — or code
+points assigned in between classify differently. That build's Rust std is
+one version further, on 17.0, so char::is_numeric also knows the 13 numbers
+17.0 added; tokenizer.cpp's is_numeric lists those by hand. Python 3.14
 ships 16.0:
 
     python3.14 src/tokenizer/gen_unicode_tables.py > src/tokenizer/unicode_tables.h
