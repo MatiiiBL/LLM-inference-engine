@@ -3,10 +3,10 @@
 // The stages run in the order sampler.h documents. Two things keep every draw
 // reproducible across platforms and standard libraries:
 //
-//   * Candidates are ordered by (logit descending, id ascending), a strict
-//     total order, and always walked in a canonical order — never in whatever
-//     arrangement std::nth_element happened to leave behind, which differs
-//     between libc++ and libstdc++.
+//   * Candidates are ordered by (value descending, id ascending), a strict
+//     total order, and always summed and walked in a canonical order — never
+//     in whatever arrangement std::nth_element happened to leave behind,
+//     which differs between libc++ and libstdc++.
 //   * The draw maps raw std::mt19937_64 output (fully specified by the
 //     standard) to [0, 1) by hand and walks the cumulative sum itself.
 //     std::uniform_real_distribution and std::discrete_distribution are not
@@ -46,12 +46,12 @@ std::string format_float(float v) {
   return os.str();
 }
 
-/// (logit descending, id ascending). A strict total order as long as no logit
+/// (value descending, id ascending). A strict total order as long as no value
 /// is NaN, so "the k largest" is a well-defined set even with ties.
-struct ByLogitDesc {
-  const float* logits;
+struct Descending {
+  const float* values;
   bool operator()(std::int32_t a, std::int32_t b) const {
-    return logits[a] > logits[b] || (logits[a] == logits[b] && a < b);
+    return values[a] > values[b] || (values[a] == values[b] && a < b);
   }
 };
 
@@ -85,6 +85,36 @@ void apply_repetition_penalty(std::span<float> logits, std::span<const std::int3
     // Dividing a negative logit would make the token *more* likely.
     x[id] = x[id] > 0.0f ? x[id] / penalty : x[id] * penalty;
   }
+}
+
+/// Stage 4. Shrinks `ids` to the shortest prefix, in descending weight order,
+/// whose weight reaches `threshold`, and returns that prefix's weight. The
+/// first id is always kept.
+///
+/// Unless `ids` is already sorted, the order is established lazily, in
+/// growing chunks: the nucleus is usually a sliver of the vocabulary, and
+/// sorting all 49152 candidates would cost more than everything else in a
+/// sample put together.
+double keep_nucleus(std::vector<std::int32_t>& ids, const float* weights, double threshold,
+                    bool sorted) {
+  const Descending order{weights};
+  std::size_t ordered = sorted ? ids.size() : 0;  // ids[0, ordered) are final
+  std::size_t chunk = 64;
+  double kept = 0.0;
+  std::size_t n_kept = 0;
+  do {
+    if (n_kept == ordered) {
+      const auto first = ids.begin() + static_cast<std::ptrdiff_t>(ordered);
+      ordered = std::min(ids.size(), ordered + chunk);
+      const auto last = ids.begin() + static_cast<std::ptrdiff_t>(ordered);
+      if (last != ids.end()) std::nth_element(first, last, ids.end(), order);
+      std::sort(first, last, order);
+      chunk *= 4;
+    }
+    kept += weights[ids[n_kept++]];
+  } while (n_kept < ids.size() && kept < threshold);
+  ids.resize(n_kept);
+  return kept;
 }
 
 /// 53 random bits from one engine output, as a double in [0, 1).
@@ -141,19 +171,19 @@ std::int32_t Sampler::sample(std::span<float> logits, std::span<const std::int32
                             : n;
   const bool top_p = params_.top_p < 1.0f;
 
-  // Every token still in play, in index order until a filter needs them sorted.
+  // Every token still in play, in index order unless top-k sorts them.
   std::vector<std::int32_t> ids(n);
   std::iota(ids.begin(), ids.end(), 0);
-  const ByLogitDesc order{x};
 
-  // 3. Top-k: a selection, not a sort of the whole vocabulary.
+  // 3. Top-k: a selection, not a sort of the whole vocabulary. Sorting the k
+  // survivors gives an order that does not depend on how nth_element arranged
+  // them, so the sums and the walk below are the same on every platform.
   if (k < n) {
+    const Descending order{x};
     std::nth_element(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(k), ids.end(), order);
     ids.resize(k);
+    std::sort(ids.begin(), ids.end(), order);
   }
-  // Top-p needs the candidates in descending order. Top-k alone only needs an
-  // order that does not depend on how nth_element arranged them.
-  if (k < n || top_p) std::sort(ids.begin(), ids.end(), order);
 
   float max_logit = kNegInf;
   for (const std::int32_t id : ids) max_logit = std::max(max_logit, x[id]);
@@ -172,18 +202,10 @@ std::int32_t Sampler::sample(std::span<float> logits, std::span<const std::int32
     total += x[id];
   }
 
-  // 4. Top-p: the shortest descending prefix holding top_p of the mass. The
-  // loop body runs at least once, so at least one token is always kept.
-  if (top_p) {
-    const double threshold = static_cast<double>(params_.top_p) * total;
-    double kept = 0.0;
-    std::size_t n_kept = 0;
-    do {
-      kept += x[ids[n_kept++]];
-    } while (n_kept < ids.size() && kept < threshold);
-    ids.resize(n_kept);
-    total = kept;
-  }
+  // 4. Top-p: the shortest descending prefix holding top_p of the mass. A
+  // weight is exp(logit - max), monotonic in the logit, so ordering by weight
+  // agrees with ordering by logit except between logits exp rounds together.
+  if (top_p) total = keep_nucleus(ids, x, static_cast<double>(params_.top_p) * total, k < n);
 
   // 5. One multinomial draw: the first token whose cumulative weight exceeds
   // u * total, so a zero-weight token can never be picked.
