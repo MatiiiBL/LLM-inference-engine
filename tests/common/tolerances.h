@@ -61,6 +61,10 @@ inline constexpr Tolerance kMatmul{1e-4, 2e-4};
 /// Measured: abs 6.0e-7, rel 8.6e-5 (q[8, 9, 64], kv[8, 3, 64]);
 /// abs 1.2e-6, rel 3.1e-3 on a real layer's post-RoPE q/k/v, where the large
 /// rel is an element of magnitude ~4e-4.
+/// ops::attention (online softmax, polynomial exp) measured the same way:
+/// abs 3.6e-7 on the three oracle cases, abs 1.3e-6 on the real layers, and
+/// at most abs 3.3e-6 from ref::attention across tests/attention, that one
+/// with logits near 100.
 inline constexpr Tolerance kAttention{1e-4, 1e-5};
 
 /// RoPE at small positions. The reference reproduces transformers' inv_freq
@@ -71,12 +75,17 @@ inline constexpr Tolerance kAttention{1e-4, 1e-5};
 inline constexpr Tolerance kRope{1e-5, 1e-6};
 
 /// Q/K/V and output projections inside an attention block — a matmul on real
-/// weights, so matmul-like bounds with room for inputs that already carry
-/// error.
-/// PROVISIONAL: nothing measures this until workflow 06 compares against
-/// oracle/data/attention/*_q_proj.npy and friends. Replace with measured
-/// values then.
-inline constexpr Tolerance kProjection{2e-4, 2e-4};
+/// weights, with room for inputs that already carry error. Real projection
+/// outputs reach ~16 in magnitude but most sit well below 1, so unlike
+/// kMatmul's N(0, 1) case rtol does real work here.
+/// Measured (layers 0 and 15, oracle/data/attention/): abs 2.9e-6, rel 2.0e-3
+/// for q/k/v/o_proj each fed its golden input, the large rel coming from
+/// elements near zero; abs 1.4e-5, rel 7.8e-3 for the whole block chained
+/// from hidden_in. Those are release numbers — debug and asan reproduce the
+/// single-stage projections bit for bit. At this bound the worst single
+/// stage uses 4% of the tolerance and the chained block 21%, which leaves
+/// ~5x for a reassociating matmul.
+inline constexpr Tolerance kProjection{1e-4, 1e-5};
 
 /// Per-layer hidden states. 30 layers of residual accumulation; the error at
 /// layer i is roughly the error at layer i-1 plus one block's worth.
