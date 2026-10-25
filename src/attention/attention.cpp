@@ -363,11 +363,7 @@ void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
   // head's group, for that row. Rows are numbered from the last, so the
   // pairs with the most keys are claimed first and the cheap ones even out
   // the end.
-  const std::int64_t units = n_tokens * n_kv_heads;
-  const std::int64_t unit_macs =
-      std::max<std::int64_t>(1, 2 * group * head_dim * (start_pos + (n_tokens + 1) / 2));
-  kernel_parallel_for(units, (kMinChunkMacs + unit_macs - 1) / unit_macs,
-                      [&](std::int64_t begin, std::int64_t end) {
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
     for (std::int64_t u = begin; u < end; ++u) {
       const std::int64_t t = n_tokens - 1 - u / n_kv_heads;
       const std::int64_t g = u % n_kv_heads;
@@ -392,7 +388,11 @@ void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
         h0 += tile;
       }
     }
-  });
+  };
+  // Multiply-adds per unit, for a row of average length: q·k and p·v.
+  const std::int64_t unit_macs =
+      std::max<std::int64_t>(1, 2 * group * head_dim * (start_pos + (n_tokens + 1) / 2));
+  kernel_parallel_for(n_tokens * n_kv_heads, (kMinChunkMacs + unit_macs - 1) / unit_macs, run);
 }
 
 }  // namespace minillm::ops

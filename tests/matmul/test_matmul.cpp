@@ -7,6 +7,9 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -16,6 +19,7 @@
 #include "common/oracle.h"
 #include "common/random.h"
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 
 using namespace minillm;
 using namespace minillm::test;
@@ -24,6 +28,50 @@ namespace {
 
 std::string shape_label(std::int64_t m, std::int64_t k, std::int64_t n) {
   return "m=" + std::to_string(m) + " k=" + std::to_string(k) + " n=" + std::to_string(n);
+}
+
+/// The kernel thread counts the threaded path is checked at. 10 is the
+/// development machine's hardware_concurrency(); on a smaller machine it
+/// oversubscribes, which exercises the split just as well.
+constexpr int kThreadCounts[] = {1, 2, 3, 4, 10};
+
+/// Calls run() at threads = 1, then at every other count in kThreadCounts,
+/// and checks that each result is bitwise identical to the 1-thread one,
+/// which it returns. Restores the thread count, pass or fail.
+Tensor check_thread_invariant(const std::string& label, const std::function<Tensor()>& run) {
+  struct Restore {
+    int threads;
+    ~Restore() { set_num_threads(threads); }
+  } restore{num_threads()};
+  const auto exact = [](float v) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.9g", static_cast<double>(v));
+    return std::string(buf);
+  };
+  set_num_threads(1);
+  Tensor single = run();
+  for (const int threads : kThreadCounts) {
+    if (threads == 1) continue;
+    set_num_threads(threads);
+    const Tensor multi = run();
+    REQUIRE(multi.shape() == single.shape());
+    const float* a = multi.f32();
+    const float* b = single.f32();
+    for (std::int64_t i = 0; i < single.numel(); ++i) {
+      if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+        FAIL_CHECK(label << ": threads = " << threads << " differs from threads = 1 at index "
+                         << i << ": " << exact(a[i]) << " vs " << exact(b[i]));
+        break;
+      }
+    }
+  }
+  return single;
+}
+
+Tensor nan_filled(const Shape& shape) {
+  Tensor t = Tensor::empty(shape);
+  std::fill_n(t.f32(), t.numel(), std::numeric_limits<float>::quiet_NaN());
+  return t;
 }
 
 }  // namespace
@@ -57,6 +105,46 @@ TEST_CASE("ops::matmul agrees with ref::matmul at the model's shapes") {
                       std::string("ops::matmul vs ref ") + c.name + " " +
                           shape_label(m, c.k, c.n));
     }
+  }
+}
+
+TEST_CASE("ops::matmul is bitwise identical at every thread count") {
+  // Threads split the output features into whole column panels, so every
+  // element keeps its single-thread accumulation order: not close, equal.
+  struct Case {
+    const char* name;
+    std::int64_t m;
+    std::int64_t k;
+    std::int64_t n;
+  };
+  const Case cases[] = {
+      {"prefill q_proj/o_proj", 128, 576, 576},
+      {"prefill k_proj/v_proj", 128, 576, 192},
+      {"prefill gate_proj/up_proj", 128, 576, 1536},
+      {"prefill down_proj", 128, 1536, 576},
+      {"decode q_proj/o_proj", 1, 576, 576},
+      {"decode k_proj/v_proj", 1, 576, 192},
+      {"decode gate_proj/up_proj", 1, 576, 1536},
+      {"decode down_proj", 1, 1536, 576},
+      {"lm_head", 1, 576, 49152},
+      {"n = 1", 5, 37, 1},
+      {"n = 7", 128, 576, 7},
+      {"n = 49152, a row tail", 3, 64, 49152},
+      {"a leftover column in a threaded split", 7, 33, 1537},
+  };
+  for (const Case& c : cases) {
+    const std::string label =
+        std::string("ops::matmul ") + c.name + " " + shape_label(c.m, c.k, c.n);
+    const Tensor x = random_tensor({c.m, c.k}, 211);
+    const Tensor w = random_tensor({c.n, c.k}, 212);
+    const Tensor single = check_thread_invariant(label, [&] {
+      Tensor out = nan_filled({c.m, c.n});
+      ops::matmul(x, w, out);
+      return out;
+    });
+    Tensor expected = Tensor::zeros({c.m, c.n});
+    ref::matmul(x, w, expected);
+    assert_allclose(single, expected, tol::kMatmul, label + " vs ref");
   }
 }
 

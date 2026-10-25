@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 
 namespace minillm::ops {
 namespace {
@@ -54,6 +55,9 @@ constexpr std::int64_t kMaxTableFloats = std::int64_t{1} << 20;
 constexpr std::int64_t kMinRows = 64;
 // One model needs one key. The bound only matters to callers that sweep theta.
 constexpr std::size_t kMaxTables = 4;
+// Smallest share of a call worth handing to another thread, in floats
+// rotated. Whole tokens are split.
+constexpr std::int64_t kMinChunkFloats = 8192;
 
 [[noreturn]] void fail(const std::string& message) {
   throw std::invalid_argument("ops::rope: " + message);
@@ -234,27 +238,32 @@ void rope(Tensor& q, Tensor* k, std::span<const std::int64_t> positions, float t
     }
   }
   const std::shared_ptr<const Table> table = table_for(head_dim, theta, rows_needed);
-  std::vector<float> scratch(any_past_cap ? static_cast<std::size_t>(head_dim) : 0);
 
   const std::int64_t n_q_heads = q.dim(1);
   const std::int64_t n_kv_heads = k != nullptr ? k->dim(1) : 0;
   float* q_data = q.f32();
   float* k_data = k != nullptr ? k->f32() : nullptr;
-  for (std::size_t t = 0; t < positions.size(); ++t) {
-    const std::int64_t pos = positions[t];
-    const float* row;
-    if (pos < table->n_rows) {
-      row = table->rows.data() + pos * head_dim;
-    } else {
-      fill_row(scratch.data(), table->inv_freq, pos);
-      row = scratch.data();
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
+    // A row past the cap is computed per token, into this chunk's own scratch.
+    std::vector<float> scratch(any_past_cap ? static_cast<std::size_t>(head_dim) : 0);
+    for (std::int64_t tok = begin; tok < end; ++tok) {
+      const std::int64_t pos = positions[static_cast<std::size_t>(tok)];
+      const float* row;
+      if (pos < table->n_rows) {
+        row = table->rows.data() + pos * head_dim;
+      } else {
+        fill_row(scratch.data(), table->inv_freq, pos);
+        row = scratch.data();
+      }
+      rotate_heads(q_data + tok * n_q_heads * head_dim, n_q_heads, row, half);
+      if (k_data != nullptr) {
+        rotate_heads(k_data + tok * n_kv_heads * head_dim, n_kv_heads, row, half);
+      }
     }
-    const auto tok = static_cast<std::int64_t>(t);
-    rotate_heads(q_data + tok * n_q_heads * head_dim, n_q_heads, row, half);
-    if (k_data != nullptr) {
-      rotate_heads(k_data + tok * n_kv_heads * head_dim, n_kv_heads, row, half);
-    }
-  }
+  };
+  const std::int64_t token_floats = std::max<std::int64_t>(1, (n_q_heads + n_kv_heads) * head_dim);
+  kernel_parallel_for(static_cast<std::int64_t>(positions.size()),
+                      (kMinChunkFloats + token_floats - 1) / token_floats, run);
 }
 
 }  // namespace minillm::ops

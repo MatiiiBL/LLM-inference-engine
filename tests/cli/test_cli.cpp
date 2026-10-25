@@ -550,7 +550,11 @@ struct EndToEnd {
   std::array<RunResult, 3> oracle;  ///< kOraclePrompts, as many tokens as the oracle, --ignore-eos
   RunResult stop_at_eos;            ///< kOraclePrompts[1] again, stopping at eos
   RunResult multibyte;              ///< kMultiBytePrompt
+  /// kOraclePrompts[0] again, at each of kThreadCounts; `oracle` runs at the default.
+  std::array<RunResult, 2> threads;
 };
+
+constexpr std::array<int, 2> kThreadCounts = {1, 4};
 
 std::vector<std::string> greedy_args(std::string_view prompt, std::size_t max_tokens,
                                      bool ignore_eos) {
@@ -606,14 +610,20 @@ const EndToEnd& end_to_end() {
     }
     children.push_back(spawn(cli_exe(), greedy_args(kOraclePrompts[1], n_oracle[1], false)));
     children.push_back(spawn(cli_exe(), greedy_args(kMultiBytePrompt, kMultiByteTokens, false)));
+    for (const int threads : kThreadCounts) {
+      std::vector<std::string> args = greedy_args(kOraclePrompts[0], n_oracle[0], true);
+      args.insert(args.end(), {"--threads", std::to_string(threads)});
+      children.push_back(spawn(cli_exe(), args));
+    }
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) r.oracle[i] = wait_for(children[i]);
     r.stop_at_eos = wait_for(children[3]);
     r.multibyte = wait_for(children[4]);
+    for (std::size_t i = 0; i < kThreadCounts.size(); ++i) r.threads[i] = wait_for(children[5 + i]);
 
     // Until every module the binary uses is implemented, it stops at the
     // first stub it reaches and says so.
     for (const RunResult* run : {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos,
-                                 &r.multibyte}) {
+                                 &r.multibyte, &r.threads[0], &r.threads[1]}) {
       if (run->exit_code != 0 && contains(run->err, "not implemented")) {
         r.skip_reason =
             "the engine is incomplete — " + line_containing(run->err, "not implemented");
@@ -863,12 +873,15 @@ TEST_CASE("the usage text lists exactly the flags the parser accepts, with their
   }
 }
 
-TEST_CASE("the usage text does not promise that --threads does anything") {
-  // run() has nowhere to send it: nothing in include/ takes a thread count.
-  const std::string line = line_containing(std::string(cli::kUsage), "--threads ");
+TEST_CASE("the usage text says what --threads does") {
+  // run() hands it to set_num_threads, so it is no longer a no-op.
+  const std::string usage(cli::kUsage);
+  const std::string line = line_containing(usage, "--threads ");
   CAPTURE(line);
-  CHECK(contains(line, "no effect"));
-  CHECK_FALSE(contains(line, "per core"));
+  CHECK(contains(line, "threads"));
+  CHECK_FALSE(contains(line, "no effect"));
+  CHECK_FALSE(contains(usage, "not used"));
+  CHECK(contains(usage, "--threads 0 uses one thread per hardware thread"));
 }
 
 // ===========================================================================
@@ -1382,6 +1395,21 @@ TEST_CASE("end to end: greedy decoding reproduces the oracle's tokens for every 
     }
     assert_equal(generated_ids(run), oracle_npy(base + "greedy_ids.npy").as_i32_narrowing(),
                  label + " greedy ids");
+  }
+}
+
+TEST_CASE("end to end: --threads sizes the pool and leaves greedy output unchanged") {
+  const EndToEnd* e2e = e2e_or_skip();
+  if (!e2e) return;
+  const std::vector<std::int32_t> oracle = oracle_npy("model/p0_greedy_ids.npy").as_i32_narrowing();
+  for (std::size_t i = 0; i < kThreadCounts.size(); ++i) {
+    const std::string threads = std::to_string(kThreadCounts[i]);
+    const RunResult& run = e2e->threads[i];
+    CAPTURE(threads);
+    // The load banner reports num_threads(), which only set_num_threads changes.
+    CHECK(contains(line_containing(run.err, "minillm: loaded "), "; " + threads + " thread(s)"));
+    assert_equal(generated_ids(run), oracle, "prompt 0 greedy ids at --threads " + threads);
+    CHECK(run.out == e2e->oracle[0].out);
   }
 }
 

@@ -346,7 +346,9 @@ std::vector<Timing> time_round_robin(const std::vector<Contender>& contenders, c
     }
   }
   std::vector<Timing> timings;
-  for (std::size_t i = 0; i < contenders.size(); ++i) timings.push_back({Stats(rounds[i]), calls[i]});
+  for (std::size_t i = 0; i < contenders.size(); ++i) {
+    timings.push_back({Stats(rounds[i]), calls[i]});
+  }
   return timings;
 }
 
@@ -789,7 +791,9 @@ int run(const Options& opt) {
               kBuildProblem ? kBuildProblem : "release build", kCompiler,
               std::thread::hardware_concurrency());
   std::string counts;
-  for (const int threads : opt.threads) counts += (counts.empty() ? "" : ", ") + std::to_string(threads);
+  for (const int threads : opt.threads) {
+    counts += (counts.empty() ? "" : ", ") + std::to_string(threads);
+  }
   std::printf("threads kernels run on %s thread(s) (--threads)\n", counts.c_str());
   std::printf("model   %s: %lld layers, hidden %lld, mlp %lld, heads %lld/%lld x %lld, vocab %lld\n",
               opt.model_dir.string().c_str(), static_cast<long long>(cfg.num_hidden_layers),
@@ -819,8 +823,8 @@ int run(const Options& opt) {
 
   const double rss = peak_rss_mib();
   std::printf("\npeak RSS of the whole run: %.1f MiB\n", rss);
-  report.add_value("memory.peak_rss.process", *std::max_element(opt.threads.begin(), opt.threads.end()),
-                   rss, "MiB", 1);
+  const int most = *std::max_element(opt.threads.begin(), opt.threads.end());
+  report.add_value("memory.peak_rss.process", most, rss, "MiB", 1);
 
   report.print_summary();
   report.print_machine_lines();

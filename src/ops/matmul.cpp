@@ -182,19 +182,15 @@ void matmul(const Tensor& x, const Tensor& w, Tensor& out) {
   // columns [u * kCols, (u + 1) * kCols), the last unit holds the n % kCols
   // leftovers. Every column then goes through the same tile as on one
   // thread, so the result does not depend on the thread count.
-  const std::int64_t units = (n + kCols - 1) / kCols;
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
+    const std::int64_t j_end = std::min(end * kCols, n);
+    std::int64_t j = begin * kCols;
+    for (; j + kCols <= j_end; j += kCols) panel<kCols>(px, pw + j * k, po + j, m, k, n);
+    // Leftover W rows one at a time; panel<1> still blocks over x's rows.
+    for (; j < j_end; ++j) panel<1>(px, pw + j * k, po + j, m, k, n);
+  };
   const std::int64_t unit_macs = std::max<std::int64_t>(1, m * k * kCols);
-  kernel_parallel_for(units, (kMinChunkMacs + unit_macs - 1) / unit_macs,
-                      [&](std::int64_t begin, std::int64_t end) {
-                        const std::int64_t j_end = std::min(end * kCols, n);
-                        std::int64_t j = begin * kCols;
-                        for (; j + kCols <= j_end; j += kCols) {
-                          panel<kCols>(px, pw + j * k, po + j, m, k, n);
-                        }
-                        // Leftover W rows one at a time; panel<1> still blocks
-                        // over x's rows.
-                        for (; j < j_end; ++j) panel<1>(px, pw + j * k, po + j, m, k, n);
-                      });
+  kernel_parallel_for((n + kCols - 1) / kCols, (kMinChunkMacs + unit_macs - 1) / unit_macs, run);
 }
 
 }  // namespace minillm::ops

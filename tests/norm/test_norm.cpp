@@ -7,8 +7,11 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -18,6 +21,7 @@
 #include "common/oracle.h"
 #include "common/random.h"
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 
 using namespace minillm;
 using namespace minillm::test;
@@ -50,6 +54,50 @@ void assert_identical(const Tensor& actual, const Tensor& expected, const std::s
       return;
     }
   }
+}
+
+/// The kernel thread counts the threaded path is checked at. 10 is the
+/// development machine's hardware_concurrency(); on a smaller machine it
+/// oversubscribes, which exercises the split just as well.
+constexpr int kThreadCounts[] = {1, 2, 3, 4, 10};
+
+/// Calls run() at threads = 1, then at every other count in kThreadCounts,
+/// and checks that each result is bitwise identical to the 1-thread one,
+/// which it returns. Restores the thread count, pass or fail.
+Tensor check_thread_invariant(const std::string& label, const std::function<Tensor()>& run) {
+  struct Restore {
+    int threads;
+    ~Restore() { set_num_threads(threads); }
+  } restore{num_threads()};
+  const auto exact = [](float v) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "%.9g", static_cast<double>(v));
+    return std::string(buf);
+  };
+  set_num_threads(1);
+  Tensor single = run();
+  for (const int threads : kThreadCounts) {
+    if (threads == 1) continue;
+    set_num_threads(threads);
+    const Tensor multi = run();
+    REQUIRE(multi.shape() == single.shape());
+    const float* a = multi.f32();
+    const float* b = single.f32();
+    for (std::int64_t i = 0; i < single.numel(); ++i) {
+      if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
+        FAIL_CHECK(label << ": threads = " << threads << " differs from threads = 1 at index "
+                         << i << ": " << exact(a[i]) << " vs " << exact(b[i]));
+        break;
+      }
+    }
+  }
+  return single;
+}
+
+Tensor nan_filled(const Shape& shape) {
+  Tensor t = Tensor::empty(shape);
+  std::fill_n(t.f32(), t.numel(), std::numeric_limits<float>::quiet_NaN());
+  return t;
 }
 
 }  // namespace
@@ -181,6 +229,68 @@ TEST_CASE("ops:: agrees with ref:: at awkward widths") {
       peaked.f32()[pos] = 100.0f;
       CHECK_MESSAGE(ops::argmax(peaked) == pos, "ops::argmax width " << k << " peak at " << pos);
     }
+  }
+}
+
+TEST_CASE("ops::rmsnorm, ops::silu_mul and ops::add are bitwise identical at every thread count") {
+  // Threads split rmsnorm by rows and the elementwise ops by runs of whole
+  // vectors, so each element takes exactly its single-thread path, scalar
+  // tail included: not close, equal. The shapes are the model's prefill and
+  // decode ones, plus sizes that are not a multiple of the vector width and
+  // ones large enough to be split at every thread count.
+  const Tensor norm_w = random_tensor_uniform({kHidden}, 301, 0.5f, 1.5f);
+  for (const std::int64_t rows : {std::int64_t{128}, std::int64_t{1}, std::int64_t{7}}) {
+    const std::string label = "ops::rmsnorm [" + std::to_string(rows) + ", 576]";
+    const Tensor x = random_tensor({rows, kHidden}, 302);
+    const Tensor single = check_thread_invariant(label, [&] {
+      Tensor out = nan_filled({rows, kHidden});
+      ops::rmsnorm(x, norm_w, 1e-5f, out);
+      return out;
+    });
+    Tensor expected = Tensor::zeros({rows, kHidden});
+    ref::rmsnorm(x, norm_w, 1e-5f, expected);
+    assert_allclose(single, expected, tol::kReduction, label + " vs ref");
+  }
+  {
+    // 49152 rows: many rows per chunk, at every count.
+    const std::string label = "ops::rmsnorm [49152, 7]";
+    const Tensor x = random_tensor({kVocab, 7}, 303);
+    const Tensor w = random_tensor_uniform({7}, 304, 0.5f, 1.5f);
+    const Tensor single = check_thread_invariant(label, [&] {
+      Tensor out = nan_filled({kVocab, 7});
+      ops::rmsnorm(x, w, 1e-5f, out);
+      return out;
+    });
+    Tensor expected = Tensor::zeros({kVocab, 7});
+    ref::rmsnorm(x, w, 1e-5f, expected);
+    assert_allclose(single, expected, tol::kReduction, label + " vs ref");
+  }
+
+  const Shape shapes[] = {{128, kIntermediate}, {1, kIntermediate}, {128, kHidden}, {1, kHidden},
+                          {1},                  {7},                {kVocab},       {kVocab + 3}};
+  for (const Shape& shape : shapes) {
+    const Tensor a = random_tensor(shape, 305);
+    const Tensor b = random_tensor(shape, 306);
+
+    const std::string silu_label = "ops::silu_mul " + shape.to_string();
+    const Tensor silu = check_thread_invariant(silu_label, [&] {
+      Tensor out = nan_filled(shape);
+      ops::silu_mul(a, b, out);
+      return out;
+    });
+    Tensor silu_ref = Tensor::zeros(shape);
+    ref::silu_mul(a, b, silu_ref);
+    assert_allclose(silu, silu_ref, tol::kElementwise, silu_label + " vs ref");
+
+    const std::string add_label = "ops::add " + shape.to_string();
+    const Tensor sum = check_thread_invariant(add_label, [&] {
+      Tensor out = nan_filled(shape);
+      ops::add(a, b, out);
+      return out;
+    });
+    Tensor sum_ref = Tensor::zeros(shape);
+    ref::add(a, b, sum_ref);
+    assert_allclose(sum, sum_ref, tol::kElementwise, add_label + " vs ref");
   }
 }
 

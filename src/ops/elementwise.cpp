@@ -5,6 +5,7 @@
 // differs from ref only in its exp, which is within 1 ulp of correctly
 // rounded; argmax returns exactly ref's index.
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -12,6 +13,7 @@
 
 #include "f32x4.h"
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 #include "validate.h"
 
 namespace minillm::ops {
@@ -24,6 +26,24 @@ using detail::kLanes;
 using detail::load;
 using detail::splat;
 using detail::store;
+
+/// Floats per unit of work handed to kernel_parallel_for. A multiple of the
+/// vector width, so a chunk boundary never moves an element between the
+/// vector loop and the scalar tail: only the end of the whole range has one.
+constexpr std::int64_t kUnit = 256;
+
+/// Smallest share of a call worth handing to another thread, in floats.
+constexpr std::int64_t kSiluMulMinFloats = 4096;
+constexpr std::int64_t kAddMinFloats = 16384;
+
+/// fn(lo, hi) over [0, n) in runs of whole units, at least min_floats long.
+template <class Fn>
+void parallel_units(std::int64_t n, std::int64_t min_floats, const Fn& fn) {
+  const std::int64_t grain = (min_floats + kUnit - 1) / kUnit;
+  kernel_parallel_for((n + kUnit - 1) / kUnit, grain, [&](std::int64_t begin, std::int64_t end) {
+    fn(begin * kUnit, std::min(end * kUnit, n));
+  });
+}
 
 }  // namespace
 
@@ -66,22 +86,25 @@ void silu_mul(const Tensor& gate, const Tensor& up, Tensor& out) {
   detail::require_same_shape("silu_mul", "gate", gate, "up", up);
   detail::require_same_shape("silu_mul", "gate", gate, "out", out);
 
-  const float* g = gate.f32();
-  const float* u = up.f32();
-  float* o = out.f32();
   const std::int64_t n = gate.numel();
+  parallel_units(n, kSiluMulMinFloats, [&](std::int64_t lo, std::int64_t hi) {
+    const float* g = gate.f32() + lo;
+    const float* u = up.f32() + lo;
+    float* o = out.f32() + lo;
+    const std::int64_t len = hi - lo;
 
-  // silu(v) * u = v / (1 + exp(-v)) * u, in ref's order. Both inputs are
-  // loaded before the store, so out may alias gate or up.
-  const f32x4 one = splat(1.0f);
-  std::int64_t i = detail::for_each_vector(n, [&](std::int64_t j) {
-    const f32x4 v = load(g + j);
-    store(o + j, v / (one + detail::exp(-v)) * load(u + j));
+    // silu(v) * u = v / (1 + exp(-v)) * u, in ref's order. Both inputs are
+    // loaded before the store, so out may alias gate or up.
+    const f32x4 one = splat(1.0f);
+    std::int64_t i = detail::for_each_vector(len, [&](std::int64_t j) {
+      const f32x4 v = load(g + j);
+      store(o + j, v / (one + detail::exp(-v)) * load(u + j));
+    });
+    for (; i < len; ++i) {
+      const float v = g[i];
+      o[i] = v / (1.0f + std::exp(-v)) * u[i];
+    }
   });
-  for (; i < n; ++i) {
-    const float v = g[i];
-    o[i] = v / (1.0f + std::exp(-v)) * u[i];
-  }
 }
 
 void add(const Tensor& a, const Tensor& b, Tensor& out) {
@@ -91,14 +114,16 @@ void add(const Tensor& a, const Tensor& b, Tensor& out) {
   detail::require_same_shape("add", "a", a, "b", b);
   detail::require_same_shape("add", "a", a, "out", out);
 
-  const float* pa = a.f32();
-  const float* pb = b.f32();
-  float* po = out.f32();
   const std::int64_t n = a.numel();
-
-  std::int64_t i = detail::for_each_vector(
-      n, [&](std::int64_t j) { store(po + j, load(pa + j) + load(pb + j)); });
-  for (; i < n; ++i) po[i] = pa[i] + pb[i];
+  parallel_units(n, kAddMinFloats, [&](std::int64_t lo, std::int64_t hi) {
+    const float* pa = a.f32() + lo;
+    const float* pb = b.f32() + lo;
+    float* po = out.f32() + lo;
+    const std::int64_t len = hi - lo;
+    std::int64_t i = detail::for_each_vector(
+        len, [&](std::int64_t j) { store(po + j, load(pa + j) + load(pb + j)); });
+    for (; i < len; ++i) po[i] = pa[i] + pb[i];
+  });
 }
 
 std::int32_t argmax(const Tensor& x) {
