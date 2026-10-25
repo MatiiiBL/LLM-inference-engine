@@ -16,13 +16,13 @@ __pycache__/
 /.venv/
 /oracle/.venv/
 
-# Personal Claude Code config (worktree.symlinkDirectories, so agent
-# worktrees can see the local-only docs/ below)
-/.claude/settings.local.json
+# Local tool config — the whole directory, so nothing in it can be
+# committed by accident.
+/.claude/
 
 # Local-only: the workflow briefs and architecture notes are not shared.
-# Agent worktrees get them via worktree.symlinkDirectories, NOT via git —
-# untracked files never appear in a new worktree on their own.
+# Untracked files never appear in a new worktree on their own, so working
+# copies that need these get them symlinked in rather than from git.
 docs/
 
 # Editors / OS

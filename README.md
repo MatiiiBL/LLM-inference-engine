@@ -20,10 +20,9 @@ Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) before writing any code. It
 has the data flow of a forward pass, every layout convention, and the tolerance
 policy.
 
-> `docs/` is **local-only and not committed** (see `.gitignore`). Agent
-> worktrees receive it through `worktree.symlinkDirectories` in
-> `.claude/settings.local.json`, not through git. If you cloned this repo and
-> `docs/` is missing, that is why — ask whoever set it up for a copy.
+> `docs/` is **local-only and not committed** (see `.gitignore`). If you cloned
+> this repo and `docs/` is missing, that is why — ask whoever set it up for a
+> copy.
 
 ## Requirements
 
