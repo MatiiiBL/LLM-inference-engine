@@ -8,13 +8,15 @@
 //     per block, and the output accumulated so far is rescaled only when the
 //     max grows. The kernel therefore never allocates and has no length
 //     limit.
-//   * The query heads that share a KV head (one GQA group) walk the blocks
-//     together, so the K and V rows fetched for the first head of the group
-//     are still in L1 for the rest.
-//   * The inner loops keep their working set in registers: a 64-float slice
-//     of the query while scoring a block of keys, a 64-float slice of the
-//     output while summing the block's V rows. Accumulating the output in
-//     memory instead makes every key wait on the previous key's stores.
+//   * The query heads that share a KV head (one GQA group) are processed as
+//     tiles of up to kMaxTile heads, and every K or V vector loaded is used by
+//     every head of the tile. Loads, not multiplies, are what bound this
+//     kernel, so a tile of three runs close to three times the heads per
+//     cycle of one head at a time.
+//   * The inner loops keep their working set in registers: the tile's query
+//     slices while scoring a block of keys, its output slices while summing
+//     the block's V rows. Accumulating the output in memory instead makes
+//     every key wait on the previous key's stores.
 //   * Arithmetic is spelled out on 4-float vectors (f32x4), the softmax's
 //     max, exp and sum included. Left to itself the auto-vectorizer builds
 //     the dot products out of 2-wide operations and cannot vectorize the
@@ -42,11 +44,15 @@
 namespace minillm::ops {
 namespace {
 
-/// Keys per block. One block's scores for one head sit on the stack.
+/// Keys per block. One block's scores for a tile sit on the stack.
 constexpr std::int64_t kKeyBlock = 128;
-/// Query heads handled together. A larger GQA group is split into several
-/// passes over the keys; SmolLM2's group is 3.
-constexpr std::int64_t kMaxHeads = 8;
+/// Query heads per tile. Three heads' kSlice-float query or output slices
+/// are 24 vectors, which leaves room for the loads in NEON's 32 registers.
+/// SmolLM2's GQA group is exactly 3; a larger group takes several tiles.
+constexpr std::int64_t kMaxTile = 3;
+/// Floats of head_dim handled per pass over a block. head_dim % kSlice
+/// trailing dimensions go through a scalar loop.
+constexpr std::int64_t kSlice = 32;
 
 /// Four floats in one SIMD register: NEON on arm64, SSE on x86-64. GCC and
 /// Clang, the supported compilers, lower arithmetic on it directly to vector
@@ -63,6 +69,8 @@ f32x4 load4(const float* p) {
 void store4(float* p, f32x4 v) { std::memcpy(p, &v, sizeof(v)); }
 
 f32x4 splat4(float x) { return f32x4{x, x, x, x}; }
+
+float sum4(f32x4 v) { return (v[0] + v[2]) + (v[1] + v[3]); }
 
 /// e^x for x <= 0, four lanes at a time — the softmax only ever exponentiates
 /// scores minus their running max. Cody-Waite reduction x = n ln2 + r with
@@ -155,151 +163,165 @@ void validate(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
 /// strides; the kernel indexes rows through stride(0) and stride(1).
 bool rows_are_packed(const Tensor& t) { return t.shape()[2] <= 1 || t.stride(2) == 1; }
 
-/// s[j] += dot(q[0:kWidth], k_j[0:kWidth]) for each of n keys, where k_j is
-/// j * k_stride floats past k. The query slice stays in registers across the
-/// keys, and four accumulators keep the FMA units busy.
-template <std::int64_t kWidth>
-void add_partial_scores(const float* q, const float* k, std::int64_t k_stride, std::int64_t n,
-                        float* s) {
-  static_assert(kWidth % 16 == 0);
-  constexpr std::int64_t kVecs = kWidth / 4;
-  f32x4 qv[kVecs];
-  for (std::int64_t i = 0; i < kVecs; ++i) qv[i] = load4(q + 4 * i);
+/// One block's scores for a tile: s[h][j] for head h of the tile, key j.
+template <std::int64_t kHeads>
+using Scores = float[kHeads][kKeyBlock];
+
+/// s[h][j] += dot(q_h[0:kSlice], k_j[0:kSlice]) for each head h of the tile
+/// and each of n keys. q_h is h * head_dim floats past q and k_j is
+/// j * k_stride floats past k. The tile's query slices stay in registers,
+/// and each K vector is loaded once for all kHeads heads.
+template <std::int64_t kHeads>
+void add_slice_scores(const float* q, std::int64_t head_dim, const float* k,
+                      std::int64_t k_stride, std::int64_t n, Scores<kHeads>& s) {
+  constexpr std::int64_t kVecs = kSlice / 4;
+  f32x4 qv[kHeads][kVecs];
+  for (std::int64_t h = 0; h < kHeads; ++h) {
+    for (std::int64_t i = 0; i < kVecs; ++i) qv[h][i] = load4(q + h * head_dim + 4 * i);
+  }
 
   for (std::int64_t j = 0; j < n; ++j) {
     const float* kj = k + j * k_stride;
-    f32x4 acc[4] = {};
-    for (std::int64_t i = 0; i < kVecs; i += 4) {
-      for (std::int64_t l = 0; l < 4; ++l) acc[l] += qv[i + l] * load4(kj + 4 * (i + l));
+    f32x4 acc[kHeads] = {};
+    for (std::int64_t i = 0; i < kVecs; ++i) {
+      const f32x4 kv = load4(kj + 4 * i);
+      for (std::int64_t h = 0; h < kHeads; ++h) acc[h] += qv[h][i] * kv;
     }
-    const f32x4 sum = (acc[0] + acc[1]) + (acc[2] + acc[3]);
-    s[j] += (sum[0] + sum[2]) + (sum[1] + sum[3]);
+    for (std::int64_t h = 0; h < kHeads; ++h) s[h][j] += sum4(acc[h]);
   }
 }
 
-/// out[0:kWidth] += sum over j of p[j] * v_j[0:kWidth], with the output slice
-/// held in registers across the keys.
-template <std::int64_t kWidth>
-void add_partial_weighted_sum(const float* p, const float* v, std::int64_t v_stride,
-                              std::int64_t n, float* out) {
-  static_assert(kWidth % 4 == 0);
-  constexpr std::int64_t kVecs = kWidth / 4;
-  f32x4 acc[kVecs];
-  for (std::int64_t i = 0; i < kVecs; ++i) acc[i] = load4(out + 4 * i);
+/// out_h[0:kSlice] += sum over j of p[h][j] * v_j[0:kSlice] for each head h
+/// of the tile, out_h being h * head_dim floats past out. The tile's output
+/// slices stay in registers, and each V vector is loaded once for all heads.
+template <std::int64_t kHeads>
+void add_slice_weighted_sum(const Scores<kHeads>& p, const float* v, std::int64_t v_stride,
+                            std::int64_t n, float* out, std::int64_t head_dim) {
+  constexpr std::int64_t kVecs = kSlice / 4;
+  f32x4 acc[kHeads][kVecs];
+  for (std::int64_t h = 0; h < kHeads; ++h) {
+    for (std::int64_t i = 0; i < kVecs; ++i) acc[h][i] = load4(out + h * head_dim + 4 * i);
+  }
 
   for (std::int64_t j = 0; j < n; ++j) {
-    const f32x4 pj = {p[j], p[j], p[j], p[j]};
     const float* vj = v + j * v_stride;
-    for (std::int64_t i = 0; i < kVecs; ++i) acc[i] += pj * load4(vj + 4 * i);
+    f32x4 pj[kHeads];
+    for (std::int64_t h = 0; h < kHeads; ++h) pj[h] = splat4(p[h][j]);
+    for (std::int64_t i = 0; i < kVecs; ++i) {
+      const f32x4 vv = load4(vj + 4 * i);
+      for (std::int64_t h = 0; h < kHeads; ++h) acc[h][i] += pj[h] * vv;
+    }
   }
-  for (std::int64_t i = 0; i < kVecs; ++i) store4(out + 4 * i, acc[i]);
-}
 
-/// s[j] += dot(q, k_j) over all of head_dim: 64-wide slices, then 16-wide,
-/// then whatever is left one dimension at a time.
-void add_scores(const float* q, const float* k, std::int64_t k_stride, std::int64_t n,
-                std::int64_t head_dim, float* s) {
-  std::int64_t d = 0;
-  for (; d + 64 <= head_dim; d += 64) add_partial_scores<64>(q + d, k + d, k_stride, n, s);
-  for (; d + 16 <= head_dim; d += 16) add_partial_scores<16>(q + d, k + d, k_stride, n, s);
-  for (; d < head_dim; ++d) {
-    for (std::int64_t j = 0; j < n; ++j) s[j] += q[d] * k[j * k_stride + d];
+  for (std::int64_t h = 0; h < kHeads; ++h) {
+    for (std::int64_t i = 0; i < kVecs; ++i) store4(out + h * head_dim + 4 * i, acc[h][i]);
   }
 }
 
-/// out += sum over j of p[j] * v_j over all of head_dim, sliced like
-/// add_scores().
-void add_weighted_sum(const float* p, const float* v, std::int64_t v_stride, std::int64_t n,
-                      std::int64_t head_dim, float* out) {
-  std::int64_t d = 0;
-  for (; d + 64 <= head_dim; d += 64) add_partial_weighted_sum<64>(p, v + d, v_stride, n, out + d);
-  for (; d + 16 <= head_dim; d += 16) add_partial_weighted_sum<16>(p, v + d, v_stride, n, out + d);
-  for (; d < head_dim; ++d) {
-    float acc = out[d];
-    for (std::int64_t j = 0; j < n; ++j) acc += p[j] * v[j * v_stride + d];
-    out[d] = acc;
+/// Turns one block of raw dot products s[0, n) into softmax weights relative
+/// to the head's running max, and folds them into the running sum. If the
+/// block raises the max, the head's partial output, accumulated against the
+/// old max, is rescaled first.
+void softmax_block(float* s, std::int64_t n, float scale, bool first_block, float& running_max,
+                   float& running_sum, float* out, std::int64_t head_dim) {
+  // Scale, and take the block max four lanes at a time. max is exact, so the
+  // lane split cannot change the result.
+  std::int64_t j = 0;
+  f32x4 max4 = splat4(-std::numeric_limits<float>::infinity());
+  for (; j + 4 <= n; j += 4) {
+    const f32x4 x = load4(s + j) * scale;
+    store4(s + j, x);
+    max4 = x > max4 ? x : max4;
   }
+  float block_max = std::max(std::max(max4[0], max4[1]), std::max(max4[2], max4[3]));
+  for (; j < n; ++j) {
+    s[j] *= scale;
+    block_max = std::max(block_max, s[j]);
+  }
+
+  if (block_max > running_max) {
+    if (!first_block) {  // before the first block there is nothing to rescale
+      const float correction = std::exp(running_max - block_max);
+      running_sum *= correction;
+      for (std::int64_t d = 0; d < head_dim; ++d) out[d] *= correction;
+    }
+    running_max = block_max;
+  }
+
+  // Weights, four lanes at a time. The last partial vector is padded with
+  // -inf, whose weight is exactly 0.
+  const float m = running_max;
+  f32x4 total = splat4(0.0f);
+  for (j = 0; j + 4 <= n; j += 4) {
+    const f32x4 w = exp4(load4(s + j) - m);
+    store4(s + j, w);
+    total += w;
+  }
+  if (j < n) {
+    f32x4 x = splat4(-std::numeric_limits<float>::infinity());
+    for (std::int64_t l = 0; j + l < n; ++l) x[l] = s[j + l] - m;
+    const f32x4 w = exp4(x);
+    for (std::int64_t l = 0; j + l < n; ++l) s[j + l] = w[l];
+    total += w;
+  }
+  running_sum += sum4(total);
 }
 
-/// One query token against keys [0, n_keys) of one KV head, for `n_heads`
-/// consecutive query heads of that head's group.
+/// One query token against keys [0, n_keys) of one KV head, for a tile of
+/// kHeads consecutive query heads of that head's group.
 ///
-///   q, out  n_heads rows of head_dim floats, contiguous; out is overwritten
+///   q, out  kHeads rows of head_dim floats, contiguous; out is overwritten
 ///   k, v    that KV head's row at key 0; key j is j * k_stride (v_stride)
 ///           floats further on
-void attend(const float* q, float* out, std::int64_t n_heads, const float* k,
-            std::int64_t k_stride, const float* v, std::int64_t v_stride, std::int64_t n_keys,
-            std::int64_t head_dim, float scale) {
-  float s[kKeyBlock];
-  float running_max[kMaxHeads];
-  float running_sum[kMaxHeads];
-  for (std::int64_t h = 0; h < n_heads; ++h) {
+template <std::int64_t kHeads>
+void attend(const float* q, float* out, const float* k, std::int64_t k_stride, const float* v,
+            std::int64_t v_stride, std::int64_t n_keys, std::int64_t head_dim, float scale) {
+  Scores<kHeads> s;
+  float running_max[kHeads];
+  float running_sum[kHeads];
+  for (std::int64_t h = 0; h < kHeads; ++h) {
     running_max[h] = -std::numeric_limits<float>::infinity();
     running_sum[h] = 0.0f;
   }
-  std::fill_n(out, n_heads * head_dim, 0.0f);
+  std::fill_n(out, kHeads * head_dim, 0.0f);
+  const std::int64_t sliced = head_dim - head_dim % kSlice;
 
   for (std::int64_t j0 = 0; j0 < n_keys; j0 += kKeyBlock) {
     const std::int64_t n_block = std::min(kKeyBlock, n_keys - j0);
     const float* k_block = k + j0 * k_stride;
     const float* v_block = v + j0 * v_stride;
 
-    for (std::int64_t h = 0; h < n_heads; ++h) {
-      float* oh = out + h * head_dim;
-
-      std::fill_n(s, n_block, 0.0f);
-      add_scores(q + h * head_dim, k_block, k_stride, n_block, head_dim, s);
-
-      // Scale, and take the block max four lanes at a time. max is exact, so
-      // the lane split cannot change the result.
-      std::int64_t j = 0;
-      f32x4 max4 = splat4(-std::numeric_limits<float>::infinity());
-      for (; j + 4 <= n_block; j += 4) {
-        const f32x4 x = load4(s + j) * scale;
-        store4(s + j, x);
-        max4 = x > max4 ? x : max4;
-      }
-      float block_max = std::max(std::max(max4[0], max4[1]), std::max(max4[2], max4[3]));
-      for (; j < n_block; ++j) {
-        s[j] *= scale;
-        block_max = std::max(block_max, s[j]);
-      }
-
-      // Shift by the running max. If this block raised it, everything
-      // accumulated so far was weighted against the old max and is rescaled.
-      if (block_max > running_max[h]) {
-        if (j0 > 0) {  // before the first block there is nothing to rescale
-          const float correction = std::exp(running_max[h] - block_max);
-          running_sum[h] *= correction;
-          for (std::int64_t d = 0; d < head_dim; ++d) oh[d] *= correction;
+    for (std::int64_t h = 0; h < kHeads; ++h) std::fill_n(s[h], n_block, 0.0f);
+    for (std::int64_t d = 0; d < sliced; d += kSlice) {
+      add_slice_scores<kHeads>(q + d, head_dim, k_block + d, k_stride, n_block, s);
+    }
+    for (std::int64_t d = sliced; d < head_dim; ++d) {
+      for (std::int64_t h = 0; h < kHeads; ++h) {
+        for (std::int64_t j = 0; j < n_block; ++j) {
+          s[h][j] += q[h * head_dim + d] * k_block[j * k_stride + d];
         }
-        running_max[h] = block_max;
       }
+    }
 
-      // Weights, four lanes at a time. The last partial vector is padded
-      // with -inf, whose weight is exactly 0.
-      const float m = running_max[h];
-      f32x4 sum4 = splat4(0.0f);
-      for (j = 0; j + 4 <= n_block; j += 4) {
-        const f32x4 w = exp4(load4(s + j) - m);
-        store4(s + j, w);
-        sum4 += w;
-      }
-      if (j < n_block) {
-        f32x4 x = splat4(-std::numeric_limits<float>::infinity());
-        for (std::int64_t l = 0; j + l < n_block; ++l) x[l] = s[j + l] - m;
-        const f32x4 w = exp4(x);
-        for (std::int64_t l = 0; j + l < n_block; ++l) s[j + l] = w[l];
-        sum4 += w;
-      }
-      running_sum[h] += (sum4[0] + sum4[2]) + (sum4[1] + sum4[3]);
+    for (std::int64_t h = 0; h < kHeads; ++h) {
+      softmax_block(s[h], n_block, scale, j0 == 0, running_max[h], running_sum[h],
+                    out + h * head_dim, head_dim);
+    }
 
-      // Unnormalized; divided by the running sum once all blocks are in.
-      add_weighted_sum(s, v_block, v_stride, n_block, head_dim, oh);
+    // Unnormalized; divided by the running sum once all blocks are in.
+    for (std::int64_t d = 0; d < sliced; d += kSlice) {
+      add_slice_weighted_sum<kHeads>(s, v_block + d, v_stride, n_block, out + d, head_dim);
+    }
+    for (std::int64_t d = sliced; d < head_dim; ++d) {
+      for (std::int64_t h = 0; h < kHeads; ++h) {
+        float acc = out[h * head_dim + d];
+        for (std::int64_t j = 0; j < n_block; ++j) acc += s[h][j] * v_block[j * v_stride + d];
+        out[h * head_dim + d] = acc;
+      }
     }
   }
 
-  for (std::int64_t h = 0; h < n_heads; ++h) {
+  for (std::int64_t h = 0; h < kHeads; ++h) {
     float* oh = out + h * head_dim;
     for (std::int64_t d = 0; d < head_dim; ++d) oh[d] /= running_sum[h];
   }
@@ -322,6 +344,8 @@ void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
   const std::int64_t head_dim = q.shape()[2];
   const std::int64_t n_kv_heads = k_cache.shape()[1];
   const std::int64_t group = n_q_heads / n_kv_heads;
+  const std::int64_t ks = k_cache.stride(0);
+  const std::int64_t vs = v_cache.stride(0);
 
   const float* pq = q.f32();
   const float* pk = k_cache.f32();
@@ -335,12 +359,20 @@ void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
 
     for (std::int64_t g = 0; g < n_kv_heads; ++g) {
       // Query heads g * group .. (g + 1) * group - 1 read KV head g.
+      const float* k = pk + g * k_cache.stride(1);
+      const float* v = pv + g * v_cache.stride(1);
       const std::int64_t h_end = (g + 1) * group;
-      for (std::int64_t h0 = g * group; h0 < h_end; h0 += kMaxHeads) {
-        const std::int64_t row = t * n_q_heads + h0;
-        attend(pq + row * head_dim, po + row * head_dim, std::min(kMaxHeads, h_end - h0),
-               pk + g * k_cache.stride(1), k_cache.stride(0), pv + g * v_cache.stride(1),
-               v_cache.stride(0), n_keys, head_dim, scale);
+      for (std::int64_t h0 = g * group; h0 < h_end;) {
+        const std::int64_t tile = std::min(kMaxTile, h_end - h0);
+        const float* qt = pq + (t * n_q_heads + h0) * head_dim;
+        float* ot = po + (t * n_q_heads + h0) * head_dim;
+        static_assert(kMaxTile == 3, "instantiate attend<> for every tile size");
+        switch (tile) {
+          case 3: attend<3>(qt, ot, k, ks, v, vs, n_keys, head_dim, scale); break;
+          case 2: attend<2>(qt, ot, k, ks, v, vs, n_keys, head_dim, scale); break;
+          default: attend<1>(qt, ot, k, ks, v, vs, n_keys, head_dim, scale); break;
+        }
+        h0 += tile;
       }
     }
   }

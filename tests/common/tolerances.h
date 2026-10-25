@@ -61,6 +61,10 @@ inline constexpr Tolerance kMatmul{1e-4, 2e-4};
 /// Measured: abs 6.0e-7, rel 8.6e-5 (q[8, 9, 64], kv[8, 3, 64]);
 /// abs 1.2e-6, rel 3.1e-3 on a real layer's post-RoPE q/k/v, where the large
 /// rel is an element of magnitude ~4e-4.
+/// ops::attention (online softmax, polynomial exp) measured the same way:
+/// abs 3.6e-7 on the three oracle cases, abs 1.3e-6 on the real layers, and
+/// at most abs 3.3e-6 from ref::attention across tests/attention, that one
+/// with logits near 100.
 inline constexpr Tolerance kAttention{1e-4, 1e-5};
 
 /// RoPE at small positions. The reference reproduces transformers' inv_freq

@@ -242,6 +242,7 @@ TEST_CASE("ops::attention agrees with ref::attention across head layouts and len
       {"head_dim 1", 3, 2, 1, 1, 2, 5},
       {"head_dim 5", 4, 6, 2, 5, 0, 4},
       {"head_dim 17", 3, 9, 3, 17, 129, 140},
+      {"head_dim 80", 3, 6, 2, 80, 140, 150},
       {"head_dim 128", 2, 8, 2, 128, 255, 257},
   };
 
