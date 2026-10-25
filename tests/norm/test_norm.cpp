@@ -449,3 +449,21 @@ TEST_CASE("ops:: kernels validate their arguments") {
   CHECK_THROWS_AS(ops::argmax(Tensor::zeros({0})), std::invalid_argument);
   CHECK_THROWS_AS(ops::argmax(Tensor::zeros({5}, DType::BF16)), std::invalid_argument);
 }
+
+TEST_CASE("ops:: kernels accept zero-size inputs") {
+  // A wrap() of nullptr is a legal zero-size tensor; nothing may dereference it.
+  const Tensor null_table = Tensor::wrap(nullptr, {4, 0});
+  Tensor null_out = Tensor::wrap(nullptr, {1, 0});
+  ops::embedding(null_table, std::vector<std::int32_t>{3}, null_out);
+
+  Tensor no_ids = Tensor::zeros({0, kHidden});
+  ops::embedding(Tensor::zeros({4, kHidden}), std::span<const std::int32_t>{}, no_ids);
+
+  const Tensor no_rows = Tensor::zeros({0, kHidden});
+  Tensor no_rows_out = Tensor::zeros({0, kHidden});
+  ops::rmsnorm(no_rows, Tensor::zeros({kHidden}), 1e-5f, no_rows_out);
+  ops::add(no_rows, no_rows, no_rows_out);
+  ops::silu_mul(no_rows, no_rows, no_rows_out);
+  Tensor no_cols = Tensor::zeros({0});
+  ops::softmax(no_cols);
+}
