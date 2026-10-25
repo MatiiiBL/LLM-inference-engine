@@ -1,11 +1,15 @@
 // Workflow 05-rope owns this file.
 //
-// In Phase 0 ops::rope forwards to ref::rope. The comparisons that matter when
-// you optimize: cached cos/sin tables must agree with recomputed values, and
-// the rotate_half pairing must survive whatever reindexing you do.
+// ops::rope against ref::rope (random inputs), against transformers (the
+// golden data), and against the properties a rotation must have. The ones
+// that matter most: the rotate_half pairing (i with i + head_dim/2) and that
+// argument validation happens before anything is written.
 
 #include <doctest/doctest.h>
 
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -16,6 +20,15 @@
 
 using namespace minillm;
 using namespace minillm::test;
+
+namespace {
+
+bool bitwise_equal(const Tensor& a, const Tensor& b) {
+  return a.shape() == b.shape() &&
+         std::memcmp(a.f32(), b.f32(), static_cast<std::size_t>(a.numel()) * sizeof(float)) == 0;
+}
+
+}  // namespace
 
 TEST_CASE("ops::rope agrees with ref::rope at the model's shapes") {
   // 9 query heads, 3 KV heads, head_dim 64, rope_theta 100000.
@@ -73,4 +86,139 @@ TEST_CASE("ops::rope matches transformers") {
     assert_allclose(q, q_expected, rope_tol, "ops::rope " + variant + " q");
     assert_allclose(k, k_expected, rope_tol, "ops::rope " + variant + " k");
   }
+}
+
+TEST_CASE("ops::rope agrees with ref::rope on unordered and repeated positions") {
+  // The model always passes start_pos + [0..n), but the contract is any
+  // positions >= 0, in any order.
+  const std::vector<std::int64_t> positions{4000, 0, 137, 137, 1};
+  Tensor q_actual = random_tensor({5, 9, 64}, 304);
+  Tensor k_actual = random_tensor({5, 3, 64}, 305);
+  Tensor q_expected = q_actual.copy_contiguous();
+  Tensor k_expected = k_actual.copy_contiguous();
+
+  ref::rope(q_expected, &k_expected, positions, 100000.0f);
+  ops::rope(q_actual, &k_actual, positions, 100000.0f);
+  assert_allclose(q_actual, q_expected, tol::kRope, "ops::rope unordered q");
+  assert_allclose(k_actual, k_expected, tol::kRope, "ops::rope unordered k");
+}
+
+TEST_CASE("ops::rope pairs dimension i with i + head_dim/2") {
+  // One token at position 1, one head, head_dim 4 => half = 2, and
+  // inv_freq[0] = 1 so the first pair rotates by exactly 1 radian. With a
+  // unit input, x0 * cos - x2 * sin is exactly cos, so this compares exactly.
+  Tensor q = Tensor::zeros({1, 1, 4});
+  q.f32()[0] = 1.0f;
+
+  const std::vector<std::int64_t> positions{1};
+  ops::rope(q, nullptr, positions, 10000.0f);
+
+  // Dimension 0 pairs with dimension 2: x0 -> x0*cos - x2*sin, x2 -> x2*cos + x0*sin.
+  CHECK(q.f32()[0] == static_cast<float>(std::cos(1.0)));
+  CHECK(q.f32()[2] == static_cast<float>(std::sin(1.0)));
+  // The interleaved convention would have put sin(1) in dimension 1.
+  CHECK(q.f32()[1] == 0.0f);
+  CHECK(q.f32()[3] == 0.0f);
+}
+
+TEST_CASE("ops::rope at position 0 is the identity") {
+  Tensor q = random_tensor({3, 9, 64}, 306);
+  Tensor k = random_tensor({3, 3, 64}, 307);
+  const Tensor q_before = q.copy_contiguous();
+  const Tensor k_before = k.copy_contiguous();
+
+  const std::vector<std::int64_t> positions{0, 0, 0};
+  ops::rope(q, &k, positions, 100000.0f);
+  CHECK(bitwise_equal(q, q_before));
+  CHECK(bitwise_equal(k, k_before));
+}
+
+TEST_CASE("ops::rope preserves the norm of each rotated pair") {
+  Tensor q = random_tensor({4, 9, 64}, 308);
+  const Tensor before = q.copy_contiguous();
+  const std::vector<std::int64_t> positions{0, 1, 137, 4000};
+  ops::rope(q, nullptr, positions, 100000.0f);
+
+  const std::int64_t n_heads = 9;
+  const std::int64_t head_dim = 64;
+  const std::int64_t half = head_dim / 2;
+  for (std::int64_t t = 0; t < 4; ++t) {
+    for (std::int64_t h = 0; h < n_heads; ++h) {
+      for (std::int64_t i = 0; i < half; ++i) {
+        const std::int64_t lo = (t * n_heads + h) * head_dim + i;
+        const std::int64_t hi = lo + half;
+        const double n_before = static_cast<double>(before.f32()[lo]) * before.f32()[lo] +
+                                static_cast<double>(before.f32()[hi]) * before.f32()[hi];
+        const double n_after = static_cast<double>(q.f32()[lo]) * q.f32()[lo] +
+                               static_cast<double>(q.f32()[hi]) * q.f32()[hi];
+        CHECK(n_after == doctest::Approx(n_before).epsilon(tol::kRope.rtol));
+      }
+    }
+  }
+}
+
+TEST_CASE("ops::rope with k == nullptr rotates q exactly as it would alongside k") {
+  const std::vector<std::int64_t> positions{5, 6};
+  Tensor q_alone = random_tensor({2, 9, 64}, 309);
+  Tensor q_with_k = q_alone.copy_contiguous();
+  Tensor k = random_tensor({2, 3, 64}, 310);
+
+  ops::rope(q_alone, nullptr, positions, 100000.0f);
+  ops::rope(q_with_k, &k, positions, 100000.0f);
+  CHECK(bitwise_equal(q_alone, q_with_k));
+}
+
+TEST_CASE("ops::rope validates its arguments") {
+  Tensor q = Tensor::zeros({2, 2, 4});
+  const std::vector<std::int64_t> two{0, 1};
+
+  // positions must have one entry per token, for q and for k.
+  CHECK_THROWS_AS(ops::rope(q, nullptr, std::vector<std::int64_t>{0}, 10000.0f),
+                  std::invalid_argument);
+  Tensor k_short = Tensor::zeros({1, 1, 4});
+  CHECK_THROWS_AS(ops::rope(q, &k_short, two, 10000.0f), std::invalid_argument);
+  // head_dim must be even.
+  Tensor odd = Tensor::zeros({2, 2, 5});
+  CHECK_THROWS_AS(ops::rope(odd, nullptr, two, 10000.0f), std::invalid_argument);
+  // rank must be 3.
+  Tensor flat = Tensor::zeros({2, 4});
+  CHECK_THROWS_AS(ops::rope(flat, nullptr, two, 10000.0f), std::invalid_argument);
+  Tensor k_flat = Tensor::zeros({2, 4});
+  CHECK_THROWS_AS(ops::rope(q, &k_flat, two, 10000.0f), std::invalid_argument);
+  // theta must be positive, and NaN is not positive.
+  CHECK_THROWS_AS(ops::rope(q, nullptr, two, 0.0f), std::invalid_argument);
+  CHECK_THROWS_AS(ops::rope(q, nullptr, two, -10000.0f), std::invalid_argument);
+  CHECK_THROWS_AS(ops::rope(q, nullptr, two, std::nanf("")), std::invalid_argument);
+  // negative positions are a bug, not a convention.
+  CHECK_THROWS_AS(ops::rope(q, nullptr, std::vector<std::int64_t>{0, -1}, 10000.0f),
+                  std::invalid_argument);
+  // q and k must agree on head_dim.
+  Tensor k_wrong = Tensor::zeros({2, 1, 8});
+  CHECK_THROWS_AS(ops::rope(q, &k_wrong, two, 10000.0f), std::invalid_argument);
+  // f32 only, and contiguous only.
+  Tensor bf16 = Tensor::zeros({2, 2, 4}, DType::BF16);
+  CHECK_THROWS_AS(ops::rope(bf16, nullptr, two, 10000.0f), std::invalid_argument);
+  Tensor wide = Tensor::zeros({2, 4, 4});
+  Tensor strided = wide.slice(1, 0, 2);
+  REQUIRE_FALSE(strided.is_contiguous());
+  CHECK_THROWS_AS(ops::rope(strided, nullptr, two, 10000.0f), std::invalid_argument);
+}
+
+TEST_CASE("ops::rope writes nothing when it throws") {
+  // Every argument is checked before the first write, so a bad k or a bad
+  // position late in the list cannot leave q half rotated.
+  Tensor q = random_tensor({2, 2, 4}, 311);
+  Tensor k = random_tensor({2, 1, 4}, 312);
+  const Tensor q_before = q.copy_contiguous();
+  const Tensor k_before = k.copy_contiguous();
+
+  Tensor k_wrong = Tensor::zeros({2, 1, 8});
+  CHECK_THROWS_AS(ops::rope(q, &k_wrong, std::vector<std::int64_t>{3, 4}, 10000.0f),
+                  std::invalid_argument);
+  CHECK(bitwise_equal(q, q_before));
+
+  CHECK_THROWS_AS(ops::rope(q, &k, std::vector<std::int64_t>{3, -1}, 10000.0f),
+                  std::invalid_argument);
+  CHECK(bitwise_equal(q, q_before));
+  CHECK(bitwise_equal(k, k_before));
 }
