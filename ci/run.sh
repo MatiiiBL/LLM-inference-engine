@@ -13,13 +13,13 @@
 #   oracle  generate oracle/data/ and models/ (python oracle/generate.py)
 #           unless they are already there
 #   asan    build the asan preset with zero warnings, run ctest, and fail if
-#           any oracle check was skipped
+#           any check was skipped other than those pending another workflow
 #   tsan    the same for the tsan preset
 #   bench   build the release preset with zero warnings and run minillm_bench;
 #           results land in build/release/bench-{output.txt,results.jsonl}
 #
 # Environment:
-#   MINILLM_ALLOW_ORACLE_SKIPS=1  report skipped oracle checks instead of failing
+#   MINILLM_ALLOW_ORACLE_SKIPS=1  report those skips instead of failing
 #   MINILLM_BENCH_ARGS="..."      extra minillm_bench arguments, e.g. "--samples 7"
 #   PYTHON=python3.12             interpreter for oracle/.venv (default python3)
 #
@@ -118,37 +118,71 @@ build_preset() {
 #     - <reason>
 #   [minillm] oracle dir: <dir>
 #
-# and ctest keeps that output in LastTest.log. A skip that names missing oracle
-# data means the oracle is broken or absent, which must fail the run rather
-# than pass as a suspiciously fast green one. A skip pending another workflow's
+# and ctest keeps that output in LastTest.log. A skip pending another workflow's
 # module is expected until that workflow lands, so it is listed, not counted.
+# Any other skip fails the run: it means oracle/data/ or the checkpoint in
+# models/ is absent or broken (or, for the CLI's "binary not found", the build
+# is), and that must be a red run rather than a suspiciously fast green one.
+#
+# So the audit matches an allowlist of pending reasons, PENDING_SKIPS, not a
+# denylist of missing-data ones. The suites word a missing file in at least
+# seven ways ("missing oracle data:", "missing model file:", "missing
+# checkpoint:", "missing checkpoint file:", "cli: missing ...", "cli end to
+# end: missing oracle data: ...", "cli end to end: --model '...' is not a model
+# directory: ..."), and the next suite may invent an eighth. A denylist lets
+# that one through as green; an allowlist fails it closed. The price is that a
+# reworded pending skip fails too, naming itself, until its entry is updated.
+#
+# Each entry is an extended regex for one whole reason, anchored at both ends,
+# with no wildcard that could match a missing file's path. Delete an entry when
+# its module lands. The tokenizer has, so the CLI's "the tokenizer is still a
+# stub" is deliberately absent: if it shows up again, that is a regression.
+PENDING_SKIPS=(
+  # workflow 08-runtime: the thread pool and the arena
+  '^runtime: parallel_for and Arena tests pending workflow 08-runtime$'
+  # the forward pass, assembled after Wave 1
+  '^model: forward-pass tests pending the post-Wave-1 assembly$'
+  # the CLI's end-to-end runs, which stop at the first of those stubs they reach
+  '^cli end to end: the engine is incomplete — minillm: error: not implemented: [A-Za-z_:]+ \((assembled after Wave 1|workflow 08-runtime)\)$'
+)
+
 test_preset() {
   local preset=$1
   local test_log="build/$preset/Testing/Temporary/LastTest.log"
   log "test $preset"
   ctest --preset "$preset"
 
-  local skips oracle pending
+  local skips reason re pending="" counted="" n=0
   skips=$(awk '
     /^\[minillm\] [0-9]+ check\(s\) skipped:/ { on = 1; next }
     /^\[minillm\] oracle dir:/                { on = 0 }
     on && /^  - / { sub(/^  - /, ""); print }
   ' "$test_log")
-  oracle=$(printf '%s\n' "$skips" | grep '^missing oracle data:' || true)
-  pending=$(printf '%s\n' "$skips" | grep -v '^missing oracle data:' | grep . || true)
+  while IFS= read -r reason; do
+    [[ -n $reason ]] || continue
+    # ${a[@]+"${a[@]}"}: bash 3.2 calls an empty array unbound under set -u.
+    for re in ${PENDING_SKIPS[@]+"${PENDING_SKIPS[@]}"}; do
+      if [[ $reason =~ $re ]]; then
+        pending+="  - $reason"$'\n'
+        continue 2
+      fi
+    done
+    counted+="  - $reason"$'\n'
+    n=$((n + 1))
+  done <<<"$skips"
 
   if [[ -n $pending ]]; then
-    printf '\n%s: skipped, pending other workflows (not counted):\n%s\n' "$preset" "$(sed 's/^/  - /' <<<"$pending")"
+    printf '\n%s: skipped, pending other workflows (not counted):\n%s' "$preset" "$pending"
   fi
-  if [[ -z $oracle ]]; then
+  if [[ $n -eq 0 ]]; then
     printf '\n%s: zero oracle checks skipped\n' "$preset"
     return
   fi
-  printf '\n%s: %s oracle check(s) skipped:\n%s\n' "$preset" "$(grep -c . <<<"$oracle")" "$(sed 's/^/  - /' <<<"$oracle")"
+  printf '\n%s: %s check(s) skipped, not pending another workflow:\n%s' "$preset" "$n" "$counted"
   if [[ ${MINILLM_ALLOW_ORACLE_SKIPS:-0} == 1 ]]; then
     echo "(allowed by MINILLM_ALLOW_ORACLE_SKIPS=1)"
   else
-    die "$preset: oracle checks were skipped; run 'ci/run.sh oracle' (or set MINILLM_ALLOW_ORACLE_SKIPS=1)"
+    die "$preset: checks were skipped; run 'ci/run.sh oracle' (or set MINILLM_ALLOW_ORACLE_SKIPS=1). A skip that is genuinely pending another workflow belongs in PENDING_SKIPS."
   fi
 }
 

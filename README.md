@@ -115,11 +115,12 @@ A run fails on:
   that build tree afterwards, so an incremental build cannot hide one. The
   build log is also grepped for linker and CMake warnings.
 - A failing test under ASan+UBSan or under TSan.
-- **Any skipped oracle check.** With the oracle in place there are none, so a
-  skip means the oracle is missing or broken. That should be a red run, not a
-  suspiciously fast green one. Skips that are pending another workflow's
-  module are listed but not counted. `MINILLM_ALLOW_ORACLE_SKIPS=1` turns the
-  failure into a report.
+- **Any skipped oracle check.** With `oracle/data/` and `models/` in place there
+  are none, so a skip means one of them is missing or broken. That should be a
+  red run, not a suspiciously fast green one. Skips that are pending another
+  workflow's module are listed but not counted; they are an explicit list,
+  `PENDING_SKIPS` in `ci/run.sh`, and every other skip fails the run however
+  it is worded. `MINILLM_ALLOW_ORACLE_SKIPS=1` turns the failure into a report.
 - The benchmark exiting non-zero.
 
 A second job, `fresh clone, no oracle`, runs the three commands from
