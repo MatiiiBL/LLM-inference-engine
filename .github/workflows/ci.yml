@@ -1,0 +1,166 @@
+# minillm CI — owned by workflow 10-bench-ci.
+#
+# Every build-and-test step is a stage of ci/run.sh, so `ci/run.sh` reproduces
+# this pipeline locally with one command. What each stage asserts is
+# documented at the top of that script.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The full pipeline: zero warnings, ctest under ASan+UBSan and TSan with zero
+  # skipped oracle checks, then the benchmarks. GCC on Linux, AppleClang on
+  # macOS: the two compilers warn about different things.
+  pipeline:
+    name: pipeline (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 500M
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build ccache
+          # The sanitizers cannot place their shadow memory with the 32 bits
+          # of mmap ASLR entropy that recent Ubuntu kernels default to.
+          sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja ccache
+
+      - name: Tool versions
+        run: |
+          cmake --version | head -n 1
+          echo "ninja $(ninja --version)"
+          c++ --version | head -n 1
+
+      # FetchContent sources (doctest, nlohmann/json), keyed on the URL and
+      # URL_HASH lines in CMakeLists.txt: a new pin is a new key.
+      - name: FetchContent cache key
+        id: deps
+        run: echo "key=$(grep -E '^[[:space:]]*URL(_HASH)?[[:space:]]' CMakeLists.txt | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FetchContent sources
+        uses: actions/cache@v4
+        with:
+          path: .cache/fetchcontent
+          key: fetchcontent-${{ runner.os }}-${{ steps.deps.outputs.key }}
+
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: .cache/ccache
+          key: ccache-${{ runner.os }}-${{ github.sha }}
+          restore-keys: ccache-${{ runner.os }}-
+
+      # oracle/data/ and models/ are gitignored and a few hundred MB. They are
+      # a pure function of the generator and its requirements, so that is the
+      # key; a changed generator regenerates. Restore and save are separate
+      # steps so a fresh oracle is saved even if a later step fails.
+      - name: Restore oracle data and model
+        id: oracle
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            oracle/data
+            models
+          key: oracle-${{ runner.os }}-${{ hashFiles('oracle/generate.py', 'oracle/requirements.txt') }}
+
+      - name: Set up Python (oracle cache miss)
+        if: steps.oracle.outputs.cache-hit != 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Generate oracle data (oracle cache miss)
+        if: steps.oracle.outputs.cache-hit != 'true'
+        run: ci/run.sh oracle
+
+      - name: Save oracle data and model
+        if: steps.oracle.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            oracle/data
+            models
+          key: ${{ steps.oracle.outputs.cache-primary-key }}
+
+      - name: ASan + UBSan — zero warnings, ctest, zero oracle skips
+        run: ci/run.sh asan
+
+      - name: TSan — zero warnings, ctest, zero oracle skips
+        run: ci/run.sh tsan
+
+      - name: Release — benchmarks
+        run: ci/run.sh bench
+
+      - name: Benchmark table in the job summary
+        if: always() && hashFiles('build/release/bench-output.txt') != ''
+        run: |
+          {
+            echo "### minillm_bench on ${{ matrix.os }}"
+            echo '```'
+            grep -v '^BENCH ' build/release/bench-output.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # One JSON object per measurement, kept per run so drift can be tracked.
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.os }}
+          path: |
+            build/release/bench-results.jsonl
+            build/release/bench-output.txt
+          if-no-files-found: ignore
+
+      - name: Upload build and test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.os }}
+          path: |
+            build/*/ci-build.log
+            build/*/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore
+
+  # The README's promise, checked literally: a fresh clone with no oracle data
+  # and no caches builds and tests green, with the oracle checks skipping
+  # loudly rather than failing.
+  fresh-clone:
+    name: fresh clone, no oracle
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ninja-build
+          sudo sysctl vm.mmap_rnd_bits=28
+
+      - run: cmake --preset asan
+      - run: cmake --build --preset asan
+      - run: ctest --preset asan
