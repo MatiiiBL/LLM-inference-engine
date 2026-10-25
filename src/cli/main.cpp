@@ -58,9 +58,10 @@ int run(const minillm::cli::Options& opts) {
   // Cheap checks first, so a typo never waits on a 500 MB weight load.
   cli::check_model_dir(opts.model_dir);
   opts.sampling.validate();
-  // opts.threads is parsed and range-checked but goes nowhere yet: nothing in
-  // include/ lets the CLI hand a thread count to the kernels (Model takes
-  // none, the ops take no pool, and runtime.h has no process-wide pool).
+  // opts.threads is parsed and range-checked but goes nowhere yet, as --help
+  // says: nothing in include/ lets the CLI hand a thread count to the kernels
+  // (Model takes none, the ops take no pool, and runtime.h has no
+  // process-wide pool).
 
   const Clock::time_point t_load = Clock::now();
   ModelConfig cfg = ModelConfig::from_json_file(opts.model_dir / "config.json");

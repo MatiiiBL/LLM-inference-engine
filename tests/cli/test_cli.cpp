@@ -39,6 +39,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <optional>
+#include <random>
 #include <set>
 #include <span>
 #include <sstream>
@@ -106,8 +107,8 @@ std::string model_dir_error(const fs::path& dir) {
 }
 
 /// Strict UTF-8 validation: no overlong forms, surrogates, or code points
-/// past U+10FFFF. Deliberately stricter than Utf8Stream, which only needs to
-/// know where a character ends.
+/// past U+10FFFF. Written separately from the decoder in Utf8Stream, so a
+/// mistake in that one cannot hide here too.
 bool is_valid_utf8(std::string_view s) {
   std::size_t i = 0;
   while (i < s.size()) {
@@ -210,6 +211,110 @@ std::optional<Tokenizer> load_tokenizer() {
     skip(std::string("cli: the tokenizer is still a stub (") + e.what() + ")");
     return std::nullopt;
   }
+}
+
+/// A tokenizer whose id b is the single byte b, for all 256 bytes: SmolLM2's
+/// configuration with no merges. decode() of such ids is the tokenizer's own
+/// lossy UTF-8 conversion of any byte string, so Utf8Stream is held to the
+/// real replacement rule on bytes SmolLM2's vocab has no token for (C0, C1,
+/// F5-FF), with no model files needed.
+const Tokenizer& byte_tokenizer() {
+  static const Tokenizer tok = [] {
+    std::string vocab;
+    char32_t next = 0x100;
+    for (int b = 0; b < 256; ++b) {
+      // GPT-2's byte alphabet: printable Latin-1 stands for itself, every
+      // other byte for the next code point from U+0100 up.
+      const bool printable = (b >= 0x21 && b <= 0x7E) || (b >= 0xA1 && b <= 0xAC) || b >= 0xAE;
+      const char32_t c = printable ? static_cast<char32_t>(b) : next++;
+      std::string ch;
+      if (c == '"' || c == '\\') ch += '\\';
+      if (c < 0x80) {
+        ch += static_cast<char>(c);
+      } else {  // all below U+0800: two bytes
+        ch += static_cast<char>(0xC0 | (c >> 6));
+        ch += static_cast<char>(0x80 | (c & 0x3F));
+      }
+      vocab += (b == 0 ? "\"" : ", \"") + ch + "\": " + std::to_string(b);
+    }
+    const std::string json =
+        R"({"version": "1.0", "truncation": null, "padding": null, "added_tokens": [],)"
+        R"( "normalizer": null, "pre_tokenizer": {"type": "Sequence", "pretokenizers":)"
+        R"( [{"type": "Digits", "individual_digits": true}, {"type": "ByteLevel",)"
+        R"( "add_prefix_space": false, "trim_offsets": true, "use_regex": true}]},)"
+        R"( "post_processor": null, "decoder": {"type": "ByteLevel", "add_prefix_space": true,)"
+        R"( "trim_offsets": true, "use_regex": true}, "model": {"type": "BPE", "dropout": null,)"
+        R"( "unk_token": null, "continuing_subword_prefix": null, "end_of_word_suffix": null,)"
+        R"( "fuse_unk": false, "byte_fallback": false, "ignore_merges": false, "vocab": {)" +
+        vocab + R"(}, "merges": []}})";
+    const fs::path file = make_temp_dir("byte_tokenizer") / "tokenizer.json";
+    write_file(file, json);
+    return Tokenizer::from_file(file);
+  }();
+  return tok;
+}
+
+/// Tokenizer::decode() of `bytes`, through byte_tokenizer().
+std::string decode_bytes(std::string_view bytes) {
+  std::vector<std::int32_t> ids;
+  for (const char c : bytes) ids.push_back(static_cast<unsigned char>(c));
+  return byte_tokenizer().decode(ids);
+}
+
+/// `n` U+FFFDs: what decode() writes for `n` ill-formed subsequences.
+std::string fffd(std::size_t n = 1) {
+  std::string s;
+  for (std::size_t i = 0; i < n; ++i) s += "\xEF\xBF\xBD";
+  return s;
+}
+
+struct Streamed {
+  std::string text;          ///< everything push() and finish() returned, in order
+  bool pieces_valid = true;  ///< every one of those pieces was valid UTF-8 on its own
+};
+
+/// Pushes `bytes` through a fresh Utf8Stream in pieces, cutting at each offset
+/// in `cuts` (ascending, inside the string), then finishes it.
+Streamed stream_in_pieces(std::string_view bytes, std::span<const std::size_t> cuts) {
+  cli::Utf8Stream stream;
+  Streamed r;
+  const auto take = [&](const std::string& piece) {
+    r.pieces_valid = r.pieces_valid && is_valid_utf8(piece);
+    r.text += piece;
+  };
+  std::size_t from = 0;
+  for (const std::size_t cut : cuts) {
+    take(stream.push(bytes.substr(from, cut - from)));
+    from = cut;
+  }
+  take(stream.push(bytes.substr(from)));
+  take(stream.finish());
+  return r;
+}
+
+/// The same, one byte at a time.
+Streamed stream_bytewise(std::string_view bytes) {
+  std::vector<std::size_t> cuts;
+  for (std::size_t i = 1; i < bytes.size(); ++i) cuts.push_back(i);
+  return stream_in_pieces(bytes, cuts);
+}
+
+/// Printable form of a byte string for failure messages: ASCII as is,
+/// everything else as \xHH.
+std::string escaped(std::string_view bytes) {
+  static constexpr char kHex[] = "0123456789ABCDEF";
+  std::string s;
+  for (const char c : bytes) {
+    const auto b = static_cast<unsigned char>(c);
+    if (b >= 0x20 && b < 0x7F) {
+      s += c;
+    } else {
+      s += "\\x";
+      s += kHex[b >> 4];
+      s += kHex[b & 0xF];
+    }
+  }
+  return s;
 }
 
 /// "eos_token_id" from the checkpoint's config.json: the id the CLI stops on.
@@ -758,6 +863,14 @@ TEST_CASE("the usage text lists exactly the flags the parser accepts, with their
   }
 }
 
+TEST_CASE("the usage text does not promise that --threads does anything") {
+  // run() has nowhere to send it: nothing in include/ takes a thread count.
+  const std::string line = line_containing(std::string(cli::kUsage), "--threads ");
+  CAPTURE(line);
+  CHECK(contains(line, "no effect"));
+  CHECK_FALSE(contains(line, "per core"));
+}
+
 // ===========================================================================
 // 1b. The model-directory check
 // ===========================================================================
@@ -858,19 +971,172 @@ TEST_CASE("Utf8Stream: every way of cutting mixed text reassembles exactly, neve
   CHECK(joined == text);
 }
 
-TEST_CASE("Utf8Stream: bytes that can never complete pass through instead of being held") {
+TEST_CASE("Utf8Stream: bytes that can never complete come out at once, as U+FFFD") {
   cli::Utf8Stream s;
-  CHECK(s.push("\x80") == "\x80");                  // stray continuation byte
-  CHECK(s.push("\xFF") == "\xFF");                  // never valid in UTF-8
-  CHECK(s.push("\xC3" "a") == "\xC3" "a");          // lead byte cut short by ASCII
-  CHECK(s.push("\xC3\xA9\xA9") == "\xC3\xA9\xA9");  // one continuation byte too many
+  // Compared as escaped(), so a failure shows bytes rather than two U+FFFDs.
+  CHECK(escaped(s.push("\x80")) == escaped(fffd()));                // stray continuation byte
+  CHECK(escaped(s.push("\xFF")) == escaped(fffd()));                // never valid in UTF-8
+  CHECK(escaped(s.push("\xC3" "a")) == escaped(fffd() + "a"));      // lead cut short by ASCII
+  CHECK(escaped(s.push("\xC3\xA9\xA9")) == escaped("é" + fffd()));  // one continuation too many
   CHECK(s.pending() == 0u);
+  CHECK(s.finish().empty());
+}
 
-  // A character still incomplete when the stream ends comes out of finish(),
-  // unchanged, so not a byte is lost.
-  CHECK(s.push("ok\xE6\x9D") == "ok");
-  CHECK(s.finish() == "\xE6\x9D");
-  CHECK(s.pending() == 0u);
+TEST_CASE("Utf8Stream: a character the stream ends inside is one U+FFFD, as in decode()") {
+  // é = C3 A9, € = E2 82 AC, 😀 = F0 9F 98 80: every proper prefix of each.
+  for (const std::string_view cut : {"\xC3", "\xE2", "\xE2\x82", "\xF0", "\xF0\x9F",
+                                     "\xF0\x9F\x98"}) {
+    const std::string bytes = "ok " + std::string(cut);
+    const std::string expected = "ok " + fffd();
+    CAPTURE(escaped(bytes));
+    REQUIRE(escaped(decode_bytes(bytes)) == escaped(expected));
+
+    // Held back while the next push could still complete it...
+    cli::Utf8Stream s;
+    CHECK(s.push(bytes) == "ok ");
+    CHECK(s.pending() == cut.size());
+    // ...and replaced, not passed through, once the stream ends.
+    CHECK(escaped(s.finish()) == escaped(fffd()));
+    CHECK(s.pending() == 0u);
+
+    const Streamed bytewise = stream_bytewise(bytes);
+    CHECK(escaped(bytewise.text) == escaped(expected));
+    CHECK(bytewise.pieces_valid);
+  }
+}
+
+TEST_CASE("Utf8Stream: ill-formed bytes are one U+FFFD per maximal subpart, as in decode()") {
+  struct Case {
+    std::string bytes;
+    std::string expected;
+  };
+  // Literals are split after a \x escape that a hex digit would extend.
+  const Case cases[] = {
+      // Unicode §3.9, Table 3-8, the standard's own example: F1 80 80, E1 80
+      // and C2 are each a truncated sequence, one U+FFFD apiece; a stray
+      // continuation byte is one U+FFFD on its own.
+      {"a\xF1\x80\x80\xE1\x80\xC2" "b\x80" "c\x80\xBF" "d",
+       "a" + fffd(3) + "b" + fffd() + "c" + fffd(2) + "d"},
+      // Bytes that never start a sequence.
+      {"x\xC0\xAFy", "x" + fffd(2) + "y"},
+      {"x\xC1\xBFy", "x" + fffd(2) + "y"},
+      {"x\xF5\x80\x80\x80y", "x" + fffd(4) + "y"},
+      {"x\xFEy\xFFz", "x" + fffd() + "y" + fffd() + "z"},
+      // Overlong encodings: the second byte is out of range for the lead.
+      {"x\xE0\x80\xAFy", "x" + fffd(3) + "y"},
+      {"x\xE0\x9F\xBFy", "x" + fffd(3) + "y"},
+      {"x\xF0\x8F\xBF\xBFy", "x" + fffd(4) + "y"},
+      // Surrogates, alone and as a would-be pair; past U+10FFFF.
+      {"x\xED\xA0\x80y", "x" + fffd(3) + "y"},
+      {"x\xED\xA0\xBD\xED\xB8\x80y", "x" + fffd(6) + "y"},
+      {"x\xF4\x90\x80\x80y", "x" + fffd(4) + "y"},
+      // Stray continuation bytes.
+      {"x\x80y", "x" + fffd() + "y"},
+      {"x\xBF\x80\x80y", "x" + fffd(3) + "y"},
+      {"\xC3\xA9\xA9\xA9", "é" + fffd(2)},
+      // A truncated sequence is one U+FFFD however long, and the byte that
+      // cut it short starts afresh.
+      {"x\xE2\x82y", "x" + fffd() + "y"},
+      {"x\xF0\x9F\x98y", "x" + fffd() + "y"},
+      {"\xF0\x9F\x98\xF0\x9F\x98\x80", fffd() + "😀"},
+      {"\xC3\xC3\xA9", fffd() + "é"},
+      {"\xE2\x82\xE2\x82\xAC\xE2", fffd() + "€" + fffd()},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(escaped(c.bytes));
+    // The table is the tokenizer's rule, not just this test's reading of it.
+    REQUIRE(escaped(decode_bytes(c.bytes)) == escaped(c.expected));
+
+    const Streamed whole = stream_in_pieces(c.bytes, {});
+    CHECK(escaped(whole.text) == escaped(c.expected));
+    CHECK(whole.pieces_valid);
+    const Streamed bytewise = stream_bytewise(c.bytes);
+    CHECK(escaped(bytewise.text) == escaped(c.expected));
+    CHECK(bytewise.pieces_valid);
+  }
+}
+
+TEST_CASE("Utf8Stream: every cut of every short byte string adds up to decode() of all of it") {
+  // Each byte where one of UTF-8's ranges starts or ends, plus ASCII. All
+  // strings of up to four of them, so every sequence length, complete and
+  // cut short, meets every kind of neighbour; each cut every possible way.
+  constexpr std::array<unsigned char, 18> kBytes = {'a',  0x80, 0x8F, 0x90, 0x9F, 0xA0,
+                                                    0xBF, 0xC0, 0xC2, 0xDF, 0xE0, 0xE1,
+                                                    0xED, 0xF0, 0xF1, 0xF4, 0xF5, 0xFF};
+  std::size_t strings = 0;
+  std::size_t failures = 0;
+  std::string first_failure;
+  std::vector<std::size_t> cuts;
+  for (std::size_t len = 1; len <= 4; ++len) {
+    std::vector<std::size_t> digit(len, 0);
+    for (bool more = true; more;) {
+      std::string bytes;
+      for (const std::size_t d : digit) bytes += static_cast<char>(kBytes[d]);
+      const std::string expected = decode_bytes(bytes);
+      ++strings;
+      // Bit k of `mask` set: cut after byte k.
+      for (std::size_t mask = 0; mask < (std::size_t{1} << (len - 1)); ++mask) {
+        cuts.clear();
+        for (std::size_t k = 0; k + 1 < len; ++k) {
+          if ((mask >> k) & 1) cuts.push_back(k + 1);
+        }
+        const Streamed got = stream_in_pieces(bytes, cuts);
+        if (got.text == expected && got.pieces_valid) continue;
+        if (failures++ == 0) {
+          first_failure = escaped(bytes) + " cut " + std::to_string(cuts.size()) +
+                          " time(s), mask " + std::to_string(mask) + ": got " +
+                          escaped(got.text) + ", decode() gives " + escaped(expected);
+        }
+      }
+      more = false;
+      for (std::size_t k = len; k-- > 0;) {  // next string, odometer style
+        if (++digit[k] < kBytes.size()) {
+          more = true;
+          break;
+        }
+        digit[k] = 0;
+      }
+    }
+  }
+  CHECK(strings == 18u + 18u * 18u + 18u * 18u * 18u + 18u * 18u * 18u * 18u);
+  CHECK_MESSAGE(failures == 0, failures << " mismatch(es); first: " << first_failure);
+}
+
+TEST_CASE("Utf8Stream: long random byte strings cut at random add up to decode() of all of it") {
+  // Ill-formed bytes right next to whole characters of every length, and
+  // pieces that only complete across a cut. std::mt19937's output is fixed
+  // by the standard, so this is the same sequence on every platform.
+  const std::string_view pieces[] = {
+      "a", " ", "é", "€", "😀", "東",                                         // whole
+      "\xC3", "\xE2\x82", "\xF0\x9F\x98",                                     // cut short
+      "\x80", "\xBF", "\xED\xA0\x80", "\xE0\x80", "\xF4\x90", "\xC0", "\xFF",  // never valid
+  };
+  std::mt19937 rng(20261024);
+  std::size_t failures = 0;
+  std::string first_failure;
+  for (int trial = 0; trial < 3000; ++trial) {
+    std::string bytes;
+    const std::size_t n = rng() % 24;
+    for (std::size_t k = 0; k < n; ++k) {
+      if (rng() % 4 == 0) {
+        bytes += static_cast<char>(rng() % 256);
+      } else {
+        bytes += pieces[rng() % std::size(pieces)];
+      }
+    }
+    std::vector<std::size_t> cuts;
+    for (std::size_t i = 1; i < bytes.size(); ++i) {
+      if (rng() % 3 == 0) cuts.push_back(i);
+    }
+    const std::string expected = decode_bytes(bytes);
+    const Streamed got = stream_in_pieces(bytes, cuts);
+    if (got.text == expected && got.pieces_valid) continue;
+    if (failures++ == 0) {
+      first_failure = "trial " + std::to_string(trial) + ", " + escaped(bytes) + ": got " +
+                      escaped(got.text) + ", decode() gives " + escaped(expected);
+    }
+  }
+  CHECK_MESSAGE(failures == 0, failures << " mismatch(es); first: " << first_failure);
 }
 
 // ===========================================================================
@@ -966,6 +1232,60 @@ TEST_CASE("streaming decode_token through Utf8Stream reproduces a one-call decod
   }
   // Otherwise no token split a character and the buffering went untested.
   CHECK(partial_tokens > 0);
+}
+
+TEST_CASE("streamed real ids match a one-call decode even when they stop mid-character") {
+  const std::optional<Tokenizer> tok = load_tokenizer();
+  if (!tok) return;
+
+  // Every prefix of the ids is a run that --max-tokens could have cut off.
+  // Pushing each token's bytes and then finishing is what main() does.
+  std::int64_t cut_mid_character = 0;
+  for (const std::string_view text : {"Tokyo (東京) is located in", "日本の首都は東京です。",
+                                      "emoji: 😀🍕👍🏽", "naïve café"}) {
+    const std::vector<std::int32_t> ids = tok->encode(text);
+    std::string bytes;
+    std::vector<std::size_t> cuts;  // token boundaries inside `bytes`
+    for (std::size_t n = 1; n <= ids.size(); ++n) {
+      if (!bytes.empty()) cuts.push_back(bytes.size());
+      bytes += tok->decode_token(ids[n - 1]);
+      if (!is_valid_utf8(bytes)) ++cut_mid_character;
+      const std::string expected = tok->decode(std::span<const std::int32_t>(ids.data(), n));
+      CAPTURE(escaped(bytes));
+      const Streamed got = stream_in_pieces(bytes, cuts);
+      CHECK(escaped(got.text) == escaped(expected));
+      CHECK(got.pieces_valid);
+    }
+  }
+  CHECK(cut_mid_character > 0);
+
+  // Ill-formed bytes a sampled model can emit, spelled with the vocab's
+  // single-byte tokens: a stray continuation byte, an overlong form, a
+  // surrogate, a code point past U+10FFFF, a character cut short mid-text.
+  std::array<std::int32_t, 256> byte_id;
+  byte_id.fill(-1);
+  for (std::int32_t id = 0; id < tok->vocab_size(); ++id) {
+    const std::string piece = tok->decode_token(id);
+    if (piece.size() == 1) byte_id[static_cast<unsigned char>(piece[0])] = id;
+  }
+  for (const std::string_view bad :
+       {"\x80", "\xE0\x80\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80", "\xE6\x9D" " "}) {
+    const std::string bytes = "ok " + std::string(bad) + "ok";
+    CAPTURE(escaped(bytes));
+    std::vector<std::int32_t> ids;
+    std::vector<std::size_t> cuts;
+    for (std::size_t i = 0; i < bytes.size(); ++i) {
+      const std::int32_t id = byte_id[static_cast<unsigned char>(bytes[i])];
+      REQUIRE(id >= 0);
+      ids.push_back(id);
+      if (i > 0) cuts.push_back(i);
+    }
+    const std::string expected = tok->decode(ids);
+    CHECK(contains(expected, fffd()));
+    const Streamed got = stream_in_pieces(bytes, cuts);
+    CHECK(escaped(got.text) == escaped(expected));
+    CHECK(got.pieces_valid);
+  }
 }
 
 // ===========================================================================
