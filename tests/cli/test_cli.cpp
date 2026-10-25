@@ -47,6 +47,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "../../src/cli/args.h"
@@ -437,6 +438,24 @@ bool have_cli() {
 
 RunResult run_cli(const std::vector<std::string>& args) { return wait_for(spawn(cli_exe(), args)); }
 
+/// Runs minillm once per argument list, at most `at_once` at a time, and
+/// returns the results in the same order.
+std::vector<RunResult> run_all(const std::vector<std::vector<std::string>>& arg_lists,
+                               std::size_t at_once) {
+  std::vector<RunResult> results(arg_lists.size());
+  std::vector<Child> started;
+  std::size_t reaped = 0;
+  for (const std::vector<std::string>& args : arg_lists) {
+    if (started.size() - reaped == at_once) {
+      results[reaped] = wait_for(started[reaped]);
+      ++reaped;
+    }
+    started.push_back(spawn(cli_exe(), args));
+  }
+  for (; reaped < started.size(); ++reaped) results[reaped] = wait_for(started[reaped]);
+  return results;
+}
+
 /// The ids on the stderr line "<label>: 1 2 3" that --print-ids writes.
 std::optional<std::vector<std::int32_t>> printed_ids(const std::string& err,
                                                      std::string_view label) {
@@ -572,12 +591,17 @@ int threaded_count() {
   return static_cast<int>(std::min(4u, std::max(2u, std::thread::hardware_concurrency())));
 }
 
+/// Most minillm processes the end-to-end runs start at once. Each holds the
+/// model's 540 MB of weights (several times that in sanitizer shadow memory),
+/// and CI's macOS runner has 7 GB and 3 cores.
+constexpr std::size_t kRunsAtOnce = 2;
+
 /// Runs every end-to-end invocation the first time a test asks for one. Each
 /// is a full model load plus a few dozen decode steps, and they are
-/// independent, so they run all at once in parallel, one kernel thread each:
-/// several processes that each spread every op over all the cores would
-/// mostly wait for one another's threads to be scheduled. Then, alone, one
-/// run with several kernel threads.
+/// independent, so they run kRunsAtOnce at a time with one kernel thread
+/// each: processes that each spread every op over all the cores would mostly
+/// wait for one another's threads to be scheduled. Then, alone, one run with
+/// several kernel threads.
 const EndToEnd& end_to_end() {
   static const EndToEnd e2e = [] {
     EndToEnd r;
@@ -612,16 +636,16 @@ const EndToEnd& end_to_end() {
     }
 
     // The oracle never stops early, so --ignore-eos to match it token for token.
-    std::vector<Child> children;
+    std::vector<std::vector<std::string>> batch;
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) {
-      children.push_back(spawn(cli_exe(), greedy_args(kOraclePrompts[i], n_oracle[i], true, 1)));
+      batch.push_back(greedy_args(kOraclePrompts[i], n_oracle[i], true, 1));
     }
-    children.push_back(spawn(cli_exe(), greedy_args(kOraclePrompts[1], n_oracle[1], false, 1)));
-    children.push_back(
-        spawn(cli_exe(), greedy_args(kMultiBytePrompt, kMultiByteTokens, false, 1)));
-    for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) r.oracle[i] = wait_for(children[i]);
-    r.stop_at_eos = wait_for(children[3]);
-    r.multibyte = wait_for(children[4]);
+    batch.push_back(greedy_args(kOraclePrompts[1], n_oracle[1], false, 1));
+    batch.push_back(greedy_args(kMultiBytePrompt, kMultiByteTokens, false, 1));
+    std::vector<RunResult> results = run_all(batch, kRunsAtOnce);
+    for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) r.oracle[i] = std::move(results[i]);
+    r.stop_at_eos = std::move(results[3]);
+    r.multibyte = std::move(results[4]);
     r.threaded = run_cli(greedy_args(kOraclePrompts[0], n_oracle[0], true, threaded_count()));
 
     // Until every module the binary uses is implemented, it stops at the
