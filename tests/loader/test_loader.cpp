@@ -864,12 +864,16 @@ TEST_CASE("safetensors: a file too short for the header length is rejected") {
   TempDir dir;
   const fs::path p = dir.write("short.safetensors", std::string("\x10\x00\x00", 3));
   const doctest::Contains names_file(p.string().c_str());
+  // Without the size check the short read fails too, so match the wording.
+  const doctest::Contains too_short("too short for the 8-byte header length");
   CHECK_THROWS_WITH_AS(read_safetensors_header(p), names_file, std::runtime_error);
+  CHECK_THROWS_WITH_AS(read_safetensors_header(p), too_short, std::runtime_error);
   CHECK_THROWS_WITH_AS(load_safetensors(p), names_file, std::runtime_error);
 
   const fs::path empty = dir.write("empty.safetensors", "");
   CHECK_THROWS_WITH_AS(read_safetensors_header(empty), doctest::Contains(empty.string().c_str()),
                        std::runtime_error);
+  CHECK_THROWS_WITH_AS(read_safetensors_header(empty), too_short, std::runtime_error);
 }
 
 TEST_CASE("safetensors: a header length past the end of the file is rejected") {
@@ -879,6 +883,8 @@ TEST_CASE("safetensors: a header length past the end of the file is rejected") {
   bytes[0] = 100;
   const fs::path p = dir.write("long_header.safetensors", bytes);
   CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(p.string().c_str()),
+                       std::runtime_error);
+  CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains("but only 2 follow it"),
                        std::runtime_error);
 }
 
@@ -892,9 +898,13 @@ TEST_CASE("safetensors: a header that is not valid JSON is rejected") {
   CHECK_THROWS_WITH_AS(load_safetensors(p), doctest::Contains(p.string().c_str()),
                        std::runtime_error);
 
+  // items() on an array yields keys "0", "1", whose entries are then rejected
+  // as non-objects, so only the wording shows the root check fired.
   const fs::path array = dir.write("array.safetensors", safetensors_file("[1, 2]", ""));
   CHECK_THROWS_WITH_AS(read_safetensors_header(array), doctest::Contains(array.string().c_str()),
                        std::runtime_error);
+  CHECK_THROWS_WITH_AS(read_safetensors_header(array),
+                       doctest::Contains("header must be a JSON object"), std::runtime_error);
 }
 
 TEST_CASE("safetensors: data_offsets past the end of the file are rejected") {
@@ -934,23 +944,31 @@ TEST_CASE("safetensors: a byte range that disagrees with dtype x shape is reject
 TEST_CASE("safetensors: malformed header entries are rejected") {
   TempDir dir;
   const std::string data(16, 'x');
-  for (const char* entry : {
-           R"({"dtype":"I64","shape":[2],"data_offsets":[0,16]})",         // unsupported dtype
-           R"({"shape":[4],"data_offsets":[0,16]})",                       // no dtype
-           R"({"dtype":"F32","data_offsets":[0,16]})",                     // no shape
-           R"({"dtype":"F32","shape":[4]})",                               // no offsets
-           R"({"dtype":"F32","shape":[],"data_offsets":[0,4]})",           // rank 0
-           R"({"dtype":"F32","shape":[1,1,1,1,4],"data_offsets":[0,16]})", // rank 5
-           R"({"dtype":"F32","shape":[-4],"data_offsets":[0,16]})",        // negative extent
-           R"({"dtype":"F32","shape":[4],"data_offsets":[16,0]})",         // reversed
-           R"({"dtype":"F32","shape":[4],"data_offsets":[0]})",            // one offset
-           R"({"dtype":"F32","shape":[4],"data_offsets":[0.0,16.0]})",     // not integers
-           R"({"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,16]})",  // overflow
-           R"([0, 16])",                                                   // not an object
-       }) {
+  // Several of these also fail a later check (a reversed range has the wrong
+  // size, a negative extent overflows), so each names the wording it expects.
+  // string_view, not const char*, so CAPTURE prints the entry, not a pointer.
+  const std::pair<std::string_view, const char*> cases[] = {
+      {R"({"dtype":"I64","shape":[2],"data_offsets":[0,16]})", "unsupported dtype"},
+      {R"({"shape":[4],"data_offsets":[0,16]})", "missing string \"dtype\""},
+      {R"({"dtype":"F32","data_offsets":[0,16]})", "missing array \"shape\""},
+      {R"({"dtype":"F32","shape":[4]})", "\"data_offsets\" must be [begin, end]"},
+      {R"({"dtype":"F32","shape":[],"data_offsets":[0,4]})", "has rank 0"},
+      {R"({"dtype":"F32","shape":[1,1,1,1,4],"data_offsets":[0,16]})", "has rank 5"},
+      {R"({"dtype":"F32","shape":[-4],"data_offsets":[0,16]})", "shape must hold non-negative"},
+      {R"({"dtype":"F32","shape":[4],"data_offsets":[16,0]})", "are reversed"},
+      {R"({"dtype":"F32","shape":[4],"data_offsets":[0]})",
+       "\"data_offsets\" must be [begin, end]"},
+      {R"({"dtype":"F32","shape":[4],"data_offsets":[0.0,16.0]})",
+       "\"data_offsets\" must be [begin, end]"},
+      {R"({"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,16]})", "overflows"},
+      {R"([0, 16])", "entry must be a JSON object"},
+  };
+  for (const auto& [entry, wording] : cases) {
     CAPTURE(entry);
     const fs::path p = dir.write("entry.safetensors", one_tensor_file(entry, data));
     CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(p.string().c_str()),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(wording),
                          std::runtime_error);
   }
 }
@@ -959,6 +977,8 @@ TEST_CASE("safetensors: a missing file is rejected") {
   TempDir dir;
   const fs::path p = dir.path() / "nope.safetensors";
   CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(p.string().c_str()),
+                       std::runtime_error);
+  CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains("cannot open file"),
                        std::runtime_error);
   CHECK_THROWS_WITH_AS(load_safetensors(p), doctest::Contains(p.string().c_str()),
                        std::runtime_error);
@@ -1009,7 +1029,6 @@ TEST_CASE("load_checkpoint rejects an index that disagrees with its shards") {
   TempDir dir;
   const std::vector<float> v = {1.0f};
   dir.write("s1.safetensors", make_safetensors({{"a", "F32", {1}, bytes_of(v)}}));
-  dir.write("s2.safetensors", make_safetensors({{"a", "F32", {1}, bytes_of(v)}}));
 
   SUBCASE("a listed tensor missing from its shard") {
     dir.write("model.safetensors.index.json",
@@ -1018,9 +1037,18 @@ TEST_CASE("load_checkpoint rejects an index that disagrees with its shards") {
                          std::runtime_error);
   }
   SUBCASE("a tensor present in two shards") {
+    // s2 holds 'b', as the index says, and a second copy of 'a'. Every listed
+    // tensor is where the index puts it, so only the duplicate check can fire.
+    const fs::path s2 = dir.write(
+        "s2.safetensors",
+        make_safetensors({{"a", "F32", {1}, bytes_of(v)}, {"b", "F32", {1}, bytes_of(v)}}));
     dir.write("model.safetensors.index.json",
               R"({"weight_map": {"a": "s1.safetensors", "b": "s2.safetensors"}})");
-    CHECK_THROWS_AS(load_checkpoint(dir.path()), std::runtime_error);
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()),
+                         doctest::Contains("tensor 'a' is also in another shard"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(s2.string().c_str()),
+                         std::runtime_error);
   }
   SUBCASE("a shard that does not exist") {
     dir.write("model.safetensors.index.json", R"({"weight_map": {"a": "s3.safetensors"}})");
@@ -1031,14 +1059,21 @@ TEST_CASE("load_checkpoint rejects an index that disagrees with its shards") {
     const fs::path index = dir.write("model.safetensors.index.json", R"({"metadata": {}})");
     CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(index.string().c_str()),
                          std::runtime_error);
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains("\"weight_map\""),
+                         std::runtime_error);
   }
 }
 
 TEST_CASE("load_checkpoint on a directory with no checkpoint names the directory") {
   TempDir dir;
+  // Without the up-front check, opening the absent index would also throw a
+  // message holding the directory, so match the wording too.
+  const doctest::Contains neither("has neither model.safetensors nor");
   CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(dir.path().string().c_str()),
                        std::runtime_error);
-  CHECK_THROWS_AS(load_checkpoint(dir.path() / "does_not_exist"), std::runtime_error);
+  CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), neither, std::runtime_error);
+  CHECK_THROWS_WITH_AS(load_checkpoint(dir.path() / "does_not_exist"), neither,
+                       std::runtime_error);
 }
 
 // ===========================================================================
