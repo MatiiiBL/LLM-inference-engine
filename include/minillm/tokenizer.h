@@ -35,7 +35,9 @@ class Tokenizer {
   /// `dir/tokenizer_config.json`. Throws std::runtime_error like from_file.
   static Tokenizer from_dir(const std::filesystem::path& dir);
 
-  /// Text -> token ids.
+  /// Text -> token ids. Throws std::invalid_argument if `text` is not valid
+  /// UTF-8: the HF tokenizer only ever sees valid Unicode, so there is no
+  /// reference behaviour to reproduce for anything else.
   ///
   /// `add_special_tokens` follows the tokenizer.json post-processor: this
   /// model has none, so it adds nothing and both modes agree. The flag exists
@@ -45,8 +47,18 @@ class Tokenizer {
   /// matched as single tokens, as the HF fast tokenizer does for added tokens.
   std::vector<std::int32_t> encode(std::string_view text, bool add_special_tokens = false) const;
 
-  /// Token ids -> text. Inverse of encode for any UTF-8 input.
+  /// Token ids -> text: the tokens' bytes concatenated, with ill-formed UTF-8
+  /// replaced by U+FFFD, one per maximal invalid subpart (as Rust's
+  /// String::from_utf8_lossy does).
   /// With `skip_special_tokens`, ids marked special are dropped.
+  ///
+  /// decode(encode(text)) == text only if every byte of `text` has a token.
+  /// A vocab need not cover all 256 bytes, and encode drops a byte that has
+  /// no token, exactly as `tokenizers` does without unk_token or
+  /// byte_fallback. SmolLM2's vocab lacks 21 bytes; the ones valid UTF-8 can
+  /// contain are U+0004, U+0006, U+0013, U+0014, U+0016, U+001D and the lead
+  /// bytes F1 and F2 (code points U+40000..U+BFFFF), so text containing
+  /// those does not survive the round trip — in HF either.
   /// Throws std::out_of_range if an id is outside [0, vocab_size).
   std::string decode(std::span<const std::int32_t> ids, bool skip_special_tokens = false) const;
 
