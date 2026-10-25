@@ -315,29 +315,40 @@ TEST_CASE("ops::attention never reads past the causal prefix") {
 }
 
 TEST_CASE("ops::attention keeps the softmax stable for large logits") {
+  // Large scores are ill-conditioned in float: near 100 one ulp is ~1e-5, and
+  // softmax turns an absolute score error into the same relative weight
+  // error, so two correct kernels that merely sum a dot product in a
+  // different order disagree by ~1e-4. Every score here is therefore exact
+  // in any summation order — small-integer q and k, power-of-two scales —
+  // which leaves only the softmax itself to compare.
   const std::int64_t n_kv = 600;
-  const Tensor q = random_tensor({2, 9, 64}, 450);
-  const Tensor k = random_tensor({n_kv, 3, 64}, 451);
+  auto small_ints = [](const Shape& shape, std::uint64_t seed) {
+    Tensor t = random_tensor_uniform(shape, seed, -3.5f, 3.5f);
+    for (std::int64_t i = 0; i < t.numel(); ++i) t.f32()[i] = std::round(t.f32()[i]);
+    return t;
+  };
   const Tensor v = random_tensor({n_kv, 3, 64}, 452);
 
-  // Scores around +-100: exp() of an unshifted score overflows float.
-  check_against_ref(q, k, v, n_kv - 2, 4.0f, "scale 4");
+  // Scores up to ~+-100: exp() of an unshifted score overflows float.
+  check_against_ref(small_ints({2, 9, 64}, 450), small_ints({n_kv, 3, 64}, 451), v, n_kv - 2,
+                    0.25f, "scores up to ~100");
 
-  // Scores that grow with position, so the running maximum keeps rising and
-  // everything accumulated so far must be rescaled; and the mirror image,
-  // where the first key dominates and later ones underflow to zero.
+  // Scores 0.25 * j, rising with position, so the running max rises in every
+  // block and everything accumulated so far must be rescaled; and the mirror
+  // image, where the first key dominates and later ones underflow to zero.
+  // Only dimension 0 of each key is non-zero, so the dot product is exact.
   Tensor ones = Tensor::empty({1, 9, 64});
   for (std::int64_t i = 0; i < ones.numel(); ++i) ones.f32()[i] = 1.0f;
-  Tensor rising = Tensor::empty({n_kv, 3, 64});
-  Tensor falling = Tensor::empty({n_kv, 3, 64});
+  Tensor rising = Tensor::zeros({n_kv, 3, 64});
+  Tensor falling = Tensor::zeros({n_kv, 3, 64});
   for (std::int64_t j = 0; j < n_kv; ++j) {
-    for (std::int64_t i = 0; i < 3 * 64; ++i) {
-      rising.f32()[j * 3 * 64 + i] = 0.05f * static_cast<float>(j);
-      falling.f32()[j * 3 * 64 + i] = 0.05f * static_cast<float>(n_kv - j);
+    for (std::int64_t g = 0; g < 3; ++g) {
+      rising.f32()[rising.offset(j, g, 0)] = 0.25f * static_cast<float>(j);
+      falling.f32()[falling.offset(j, g, 0)] = 0.25f * static_cast<float>(n_kv - j);
     }
   }
-  check_against_ref(ones, rising, v, n_kv - 1, 0.125f, "rising scores");
-  check_against_ref(ones, falling, v, n_kv - 1, 0.125f, "falling scores");
+  check_against_ref(ones, rising, v, n_kv - 1, 1.0f, "rising scores");
+  check_against_ref(ones, falling, v, n_kv - 1, 1.0f, "falling scores");
 }
 
 TEST_CASE("ops::attention accepts an empty pass") {
