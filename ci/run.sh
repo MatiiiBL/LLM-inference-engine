@@ -137,14 +137,7 @@ build_preset() {
 # with no wildcard that could match a missing file's path. Delete an entry when
 # its module lands. The tokenizer has, so the CLI's "the tokenizer is still a
 # stub" is deliberately absent: if it shows up again, that is a regression.
-PENDING_SKIPS=(
-  # workflow 08-runtime: the thread pool and the arena
-  '^runtime: parallel_for and Arena tests pending workflow 08-runtime$'
-  # the forward pass, assembled after Wave 1
-  '^model: forward-pass tests pending the post-Wave-1 assembly$'
-  # the CLI's end-to-end runs, which stop at the first of those stubs they reach
-  '^cli end to end: the engine is incomplete — minillm: error: not implemented: [A-Za-z_:]+ \((assembled after Wave 1|workflow 08-runtime)\)$'
-)
+PENDING_SKIPS=()
 
 test_preset() {
   local preset=$1

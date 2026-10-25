@@ -42,15 +42,12 @@ namespace {
   throw std::invalid_argument("Model: " + message);
 }
 
-/// validate(), plus the two things the ops would otherwise only reject on
-/// the first forward(): RoPE needs an even head_dim and a positive theta.
+/// validate(), plus the one thing ops::rope would otherwise only reject on
+/// the first forward(): RoPE rotates pairs, so head_dim must be even.
 void check_config(const ModelConfig& cfg) {
   cfg.validate();
   if (cfg.head_dim % 2 != 0) {
     fail("head_dim must be even for RoPE, got " + std::to_string(cfg.head_dim));
-  }
-  if (!(cfg.rope_theta > 0.0f)) {
-    fail("rope_theta must be positive, got " + std::to_string(cfg.rope_theta));
   }
 }
 
