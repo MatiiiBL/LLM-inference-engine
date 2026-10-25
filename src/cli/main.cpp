@@ -28,6 +28,7 @@
 #include "minillm/config.h"
 #include "minillm/loader.h"
 #include "minillm/model.h"
+#include "minillm/runtime.h"
 #include "minillm/sampler.h"
 #include "minillm/tokenizer.h"
 #include "utf8_stream.h"
@@ -58,10 +59,9 @@ int run(const minillm::cli::Options& opts) {
   // Cheap checks first, so a typo never waits on a 500 MB weight load.
   cli::check_model_dir(opts.model_dir);
   opts.sampling.validate();
-  // opts.threads is parsed and range-checked but goes nowhere yet, as --help
-  // says: nothing in include/ lets the CLI hand a thread count to the kernels
-  // (Model takes none, the ops take no pool, and runtime.h has no
-  // process-wide pool).
+  // The kernels in minillm::ops share one process-wide pool; this sizes it.
+  // Every op's output is bitwise the same at any thread count.
+  set_num_threads(opts.threads);
 
   const Clock::time_point t_load = Clock::now();
   ModelConfig cfg = ModelConfig::from_json_file(opts.model_dir / "config.json");
@@ -83,11 +83,12 @@ int run(const minillm::cli::Options& opts) {
   Model model(std::move(cfg), load_checkpoint(opts.model_dir), n_prompt + opts.max_tokens);
   const ModelConfig& mc = model.config();
   std::fprintf(stderr,
-               "minillm: loaded %s (%s, %lld layers, hidden %lld, vocab %lld) in %.2f s\n",
+               "minillm: loaded %s (%s, %lld layers, hidden %lld, vocab %lld) in %.2f s; "
+               "%d thread(s)\n",
                opts.model_dir.string().c_str(), mc.model_type.c_str(),
                static_cast<long long>(mc.num_hidden_layers),
                static_cast<long long>(mc.hidden_size), static_cast<long long>(mc.vocab_size),
-               seconds_between(t_load, Clock::now()));
+               seconds_between(t_load, Clock::now()), num_threads());
   if (opts.print_ids) print_ids("prompt ids", prompt_ids);
 
   Sampler sampler(opts.sampling);

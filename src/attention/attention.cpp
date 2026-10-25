@@ -22,6 +22,9 @@
 //     the dot products out of 2-wide operations and cannot vectorize the
 //     reductions at all without -ffast-math, which this file does not need:
 //     every reassociation is written out explicitly.
+//   * Threads split the (query row, KV head) pairs. Each pair's output rows
+//     are computed start to finish by one thread, exactly as on one thread,
+//     so the result does not depend on the thread count.
 //
 // Causality is the loop bound, exactly as in the reference: query row t reads
 // keys [0, start_pos + t] and nothing past them.
@@ -35,14 +38,19 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
 
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 
 namespace minillm::ops {
 namespace {
+
+/// Smallest share of a call worth handing to another thread, in multiply-adds.
+constexpr std::int64_t kMinChunkMacs = std::int64_t{1} << 13;
 
 /// Keys per block. One block's scores for a tile sit on the stack.
 constexpr std::int64_t kKeyBlock = 128;
@@ -352,12 +360,18 @@ void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
   const float* pv = v_cache.f32();
   float* po = out.f32();
 
-  for (std::int64_t t = 0; t < n_tokens; ++t) {
-    // Query row t sits at absolute position start_pos + t and may look at key
-    // positions 0 .. start_pos + t inclusive.
-    const std::int64_t n_keys = start_pos + t + 1;
+  // Unit u is one (query row, KV head) pair: every query head of that KV
+  // head's group, for that row. Rows are numbered from the last, so the
+  // pairs with the most keys are claimed first and the cheap ones even out
+  // the end.
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
+    for (std::int64_t u = begin; u < end; ++u) {
+      const std::int64_t t = n_tokens - 1 - u / n_kv_heads;
+      const std::int64_t g = u % n_kv_heads;
+      // Query row t sits at absolute position start_pos + t and may look at key
+      // positions 0 .. start_pos + t inclusive.
+      const std::int64_t n_keys = start_pos + t + 1;
 
-    for (std::int64_t g = 0; g < n_kv_heads; ++g) {
       // Query heads g * group .. (g + 1) * group - 1 read KV head g.
       const float* k = pk + g * k_cache.stride(1);
       const float* v = pv + g * v_cache.stride(1);
@@ -375,7 +389,12 @@ void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
         h0 += tile;
       }
     }
-  }
+  };
+  // Multiply-adds per unit, for a row of average length: q·k and p·v.
+  const std::int64_t unit_macs =
+      std::max<std::int64_t>(1, 2 * group * head_dim * (start_pos + (n_tokens + 1) / 2));
+  kernel_parallel_for(n_tokens * n_kv_heads, (kMinChunkMacs + unit_macs - 1) / unit_macs,
+                      std::ref(run));
 }
 
 }  // namespace minillm::ops

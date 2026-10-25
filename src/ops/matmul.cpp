@@ -21,7 +21,9 @@
 // Lanes and accumulator sets reassociate the sum relative to ref::matmul's
 // source order; ops.h allows that and tol::kMatmul is sized for it.
 
+#include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -30,6 +32,7 @@
 #endif
 
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 
 namespace minillm::ops {
 namespace {
@@ -82,6 +85,10 @@ inline float vec_sum(Vec v) { return (v.lane[0] + v.lane[1]) + (v.lane[2] + v.la
 
 constexpr int kRows = 4;  // MR: rows of x per tile
 constexpr int kCols = 4;  // NR: rows of W per tile
+
+// Smallest share of a call worth handing to another thread, in multiply-adds.
+// A call with less than two of these runs inline.
+constexpr std::int64_t kMinChunkMacs = std::int64_t{1} << 13;
 
 // Independent accumulator sets along k. A tile needs ~16 accumulator chains
 // in flight to hide FMA latency; the full 4x4 tile has them, the narrower
@@ -172,10 +179,20 @@ void matmul(const Tensor& x, const Tensor& w, Tensor& out) {
   const float* pw = w.f32();
   float* po = out.f32();
 
-  std::int64_t j = 0;
-  for (; j + kCols <= n; j += kCols) panel<kCols>(px, pw + j * k, po + j, m, k, n);
-  // Leftover W rows one at a time; panel<1> still blocks over x's rows.
-  for (; j < n; ++j) panel<1>(px, pw + j * k, po + j, m, k, n);
+  // Threads split the output features into runs of whole panels: unit u is
+  // columns [u * kCols, (u + 1) * kCols), the last unit holds the n % kCols
+  // leftovers. Every column then goes through the same tile as on one
+  // thread, so the result does not depend on the thread count.
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
+    const std::int64_t j_end = std::min(end * kCols, n);
+    std::int64_t j = begin * kCols;
+    for (; j + kCols <= j_end; j += kCols) panel<kCols>(px, pw + j * k, po + j, m, k, n);
+    // Leftover W rows one at a time; panel<1> still blocks over x's rows.
+    for (; j < j_end; ++j) panel<1>(px, pw + j * k, po + j, m, k, n);
+  };
+  const std::int64_t unit_macs = std::max<std::int64_t>(1, m * k * kCols);
+  kernel_parallel_for((n + kCols - 1) / kCols, (kMinChunkMacs + unit_macs - 1) / unit_macs,
+                      std::ref(run));
 }
 
 }  // namespace minillm::ops

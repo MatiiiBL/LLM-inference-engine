@@ -7,10 +7,13 @@
 // f32x4.h). That reassociates the sum, which is why these are judged against
 // ref with tol::kReduction rather than tol::kElementwise.
 
+#include <algorithm>
 #include <cmath>
+#include <functional>
 
 #include "f32x4.h"
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 #include "validate.h"
 
 namespace minillm::ops {
@@ -23,6 +26,10 @@ using detail::kLanes;
 using detail::load;
 using detail::splat;
 using detail::store;
+
+/// Smallest share of an rmsnorm call worth handing to another thread, in
+/// floats. Whole rows are split, so each row's sum is one thread's.
+constexpr std::int64_t kRmsnormMinFloats = 8192;
 
 /// sum of p[j]^2 over [0, n). Lane l of accumulator a collects the elements
 /// at j = 16 i + 4 a + l; the four accumulators are combined pairwise, their
@@ -103,22 +110,26 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) {
 
   const float* pw = weight.f32();
 
-  for (std::int64_t i = 0; i < m; ++i) {
-    const float* px = x.f32() + i * k;
-    float* po = out.f32() + i * k;
+  const std::int64_t grain = (kRmsnormMinFloats + k - 1) / std::max<std::int64_t>(k, 1);
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
+    for (std::int64_t i = begin; i < end; ++i) {
+      const float* px = x.f32() + i * k;
+      float* po = out.f32() + i * k;
 
-    // Same float chain as ref and LlamaRMSNorm after the sum: mean, + eps,
-    // sqrt, reciprocal.
-    const float mean_sq = sum_of_squares(px, k) / static_cast<float>(k);
-    const float inv_rms = 1.0f / std::sqrt(mean_sq + eps);
+      // Same float chain as ref and LlamaRMSNorm after the sum: mean, + eps,
+      // sqrt, reciprocal.
+      const float mean_sq = sum_of_squares(px, k) / static_cast<float>(k);
+      const float inv_rms = 1.0f / std::sqrt(mean_sq + eps);
 
-    // (x * inv_rms) * w, in ref's order. Every vector is loaded before the
-    // store to the same addresses and never read again, so out may alias x.
-    const f32x4 vinv = splat(inv_rms);
-    std::int64_t j = detail::for_each_vector(
-        k, [&](std::int64_t at) { store(po + at, load(px + at) * vinv * load(pw + at)); });
-    for (; j < k; ++j) po[j] = px[j] * inv_rms * pw[j];
-  }
+      // (x * inv_rms) * w, in ref's order. Every vector is loaded before the
+      // store to the same addresses and never read again, so out may alias x.
+      const f32x4 vinv = splat(inv_rms);
+      std::int64_t j = detail::for_each_vector(
+          k, [&](std::int64_t at) { store(po + at, load(px + at) * vinv * load(pw + at)); });
+      for (; j < k; ++j) po[j] = px[j] * inv_rms * pw[j];
+    }
+  };
+  kernel_parallel_for(m, grain, std::ref(run));
 }
 
 void softmax(Tensor& x) {

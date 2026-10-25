@@ -27,6 +27,7 @@
 #include "common/allclose.h"
 #include "common/oracle.h"
 #include "common/random.h"
+#include "common/thread_invariant.h"
 #include "minillm/kv_cache.h"
 #include "minillm/ops.h"
 
@@ -44,6 +45,7 @@ Tensor nan_filled(const Shape& shape) {
   for (std::int64_t i = 0; i < t.numel(); ++i) p[i] = std::numeric_limits<float>::quiet_NaN();
   return t;
 }
+
 
 /// Runs ref:: and ops:: on the same inputs and compares the outputs.
 void check_against_ref(const Tensor& q, const Tensor& k, const Tensor& v, std::int64_t start_pos,
@@ -215,6 +217,42 @@ TEST_CASE("ops::attention agrees with ref::attention at the model's shapes") {
     ops::attention(q, k, v, c.start_pos, scale, actual);
     assert_allclose(actual, expected, tol::kAttention,
                     std::string("ops::attention vs ref ") + c.name);
+  }
+}
+
+TEST_CASE("ops::attention is bitwise identical at every thread count") {
+  // Threads split (query row, KV head) pairs; each pair's output is computed
+  // start to finish by one thread, exactly as on one.
+  struct Case {
+    const char* name;
+    std::int64_t n_tokens;
+    std::int64_t n_q_heads;
+    std::int64_t n_kv_heads;
+    std::int64_t start_pos;
+  };
+  const Case cases[] = {
+      {"prefill", 128, 9, 3, 0},
+      {"decode at 191", 1, 9, 3, 191},
+      {"1 token, 1 key", 1, 9, 3, 0},
+      {"7 tokens after 30", 7, 9, 3, 30},
+      {"multi-head, 7 tokens", 7, 4, 4, 5},
+      {"decode at 49151", 1, 9, 3, 49151},
+  };
+  const float scale = 1.0f / 8.0f;
+  for (const Case& c : cases) {
+    const std::string label = std::string("ops::attention ") + c.name;
+    const std::int64_t n_kv = c.start_pos + c.n_tokens;
+    const Tensor q = random_tensor({c.n_tokens, c.n_q_heads, 64}, 411);
+    const Tensor k = random_tensor({n_kv, c.n_kv_heads, 64}, 412);
+    const Tensor v = random_tensor({n_kv, c.n_kv_heads, 64}, 413);
+    const Tensor single = check_thread_invariant(label, [&] {
+      Tensor out = nan_filled(q.shape());
+      ops::attention(q, k, v, c.start_pos, scale, out);
+      return out;
+    });
+    Tensor expected = Tensor::zeros(q.shape());
+    ref::attention(q, k, v, c.start_pos, scale, expected);
+    assert_allclose(single, expected, tol::kAttention, label + " vs ref");
   }
 }
 

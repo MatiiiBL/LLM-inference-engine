@@ -137,6 +137,7 @@ CI caches `oracle/data/` + `models/` (key: `oracle/generate.py` +
 cmake --preset release && cmake --build --preset release
 ./build/release/bench/minillm_bench                   # from the repo root
 ./build/release/bench/minillm_bench --filter matmul   # a subset; see --help
+./build/release/bench/minillm_bench --threads 1,4,10  # kernel thread scaling
 ```
 
 Quote numbers from the `release` preset only. The binary refuses to run from a
@@ -172,7 +173,9 @@ runs it with:
 | `ops::`, `ref::` | median time per call over the samples (5 by default) |
 | `+/-` | half the spread of the samples: (max − min) / 2 / median |
 | `calls` | samples × calls per sample; fast ops are batched so each sample lasts ≥ 50 ms |
+| `thr` | the kernel thread count `ops::` ran with (`--threads`; `0`, the default, resolves to the hardware thread count) |
 | `speedup` | `ref::` / `ops::`, measured on interleaved pairs of samples, median over the pairs; > 1 means `ops::` is faster |
+| `scaling` | with several `--threads` counts: `ops::` at the first count / `ops::` at `thr`, over the same interleaved samples |
 
 Read every speedup together with its `+/-`. An op that has not been optimized
 yet forwards `ops::` to `ref::`, so its true speedup is exactly 1.00x. Whatever
@@ -183,11 +186,12 @@ noise floor has not been measured.
 **Machine-readable lines** close the run, one per measurement:
 
 ```
-BENCH {"name":"op.decode.matmul.q_proj.ops","value":187.9,"unit":"us","iterations":1360,"samples":5,"min":184.0,"max":191.4}
+BENCH {"name":"op.decode.matmul.q_proj.ops","threads":4,"value":187.9,"unit":"us","iterations":1360,"samples":5,"min":184.0,"max":191.4}
 ```
 
 | Field | Meaning |
 | --- | --- |
+| `threads` | the kernel thread count it was measured at: 1 for `.ref`, which never uses the pool; the largest `--threads` count for `memory.*` |
 | `value` | the median |
 | `iterations` | timed calls in total (timed runs, for `model.*`) |
 | `samples`, `min`, `max` | the spread; absent on peak RSS, which is a single reading |
@@ -198,6 +202,7 @@ Names follow these patterns:
 | --- | --- |
 | `op.<regime>.<op>.ops` / `.ref` | µs per call |
 | `op.<regime>.<op>.speedup` | ratio |
+| `op.<regime>.<op>.scaling` | ratio, only with several `--threads` counts |
 | `model.prefill`, `model.decode` | tok/s |
 | `memory.peak_rss.model` | MiB, after load + prefill + decode |
 | `memory.peak_rss.process` | MiB, whole run |

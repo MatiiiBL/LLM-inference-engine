@@ -9,6 +9,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -17,7 +18,9 @@
 #include "common/allclose.h"
 #include "common/oracle.h"
 #include "common/random.h"
+#include "common/thread_invariant.h"
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 
 using namespace minillm;
 using namespace minillm::test;
@@ -28,6 +31,7 @@ bool bitwise_equal(const Tensor& a, const Tensor& b) {
   return a.shape() == b.shape() &&
          std::memcmp(a.f32(), b.f32(), static_cast<std::size_t>(a.numel()) * sizeof(float)) == 0;
 }
+
 
 // The [cos | sin] row the contract defines for one position, computed here
 // independently of ops::rope: the float32 inv_freq chain from ops.h, a float32
@@ -351,5 +355,76 @@ TEST_CASE("ops::rope is safe to call concurrently") {
   for (int j = 0; j < n_threads; ++j) {
     CAPTURE(j);
     CHECK(mismatches[static_cast<std::size_t>(j)] == 0);
+  }
+}
+
+TEST_CASE("ops::rope is bitwise identical at every thread count") {
+  // Threads split the tokens; each token's rotation is computed exactly as
+  // on one thread, from the same cached or freshly computed row.
+  struct Case {
+    const char* name;
+    std::int64_t n_tokens;
+    std::int64_t n_q_heads;
+    std::int64_t n_kv_heads;  // 0: k is nullptr
+    std::int64_t start;
+  };
+  const Case cases[] = {
+      {"prefill", 128, 9, 3, 0},
+      {"decode", 1, 9, 3, 191},
+      {"7 tokens", 7, 9, 3, 30},
+      // Past position 16384 rows are computed per call, in each chunk's own
+      // scratch, so this covers both paths at every thread count.
+      {"49152 tokens, q only", 49152, 1, 0, 0},
+  };
+  const float theta = 100000.0f;
+  for (const Case& c : cases) {
+    const std::string label = std::string("ops::rope ") + c.name;
+    std::vector<std::int64_t> positions(static_cast<std::size_t>(c.n_tokens));
+    std::iota(positions.begin(), positions.end(), c.start);
+    const Tensor q_in = random_tensor({c.n_tokens, c.n_q_heads, 64}, 321);
+    const Tensor k_in =
+        c.n_kv_heads > 0 ? random_tensor({c.n_tokens, c.n_kv_heads, 64}, 322) : Tensor();
+    const std::int64_t q_size = q_in.numel();
+    const std::int64_t k_size = c.n_kv_heads > 0 ? k_in.numel() : 0;
+
+    // rope works in place: each run rotates fresh copies of q and k, laid
+    // out back to back in one tensor so a single comparison covers both.
+    const Tensor single = check_thread_invariant(label, [&] {
+      Tensor both = Tensor::empty({q_size + k_size});
+      std::memcpy(both.f32(), q_in.f32(), static_cast<std::size_t>(q_size) * sizeof(float));
+      Tensor q = Tensor::wrap(both.f32(), q_in.shape());
+      if (k_size == 0) {
+        ops::rope(q, nullptr, positions, theta);
+        return both;
+      }
+      std::memcpy(both.f32() + q_size, k_in.f32(),
+                  static_cast<std::size_t>(k_size) * sizeof(float));
+      Tensor k = Tensor::wrap(both.f32() + q_size, k_in.shape());
+      ops::rope(q, &k, positions, theta);
+      return both;
+    });
+
+    Tensor q_expected = q_in.copy_contiguous();
+    Tensor k_expected = k_size > 0 ? k_in.copy_contiguous() : Tensor();
+    ref::rope(q_expected, k_size > 0 ? &k_expected : nullptr, positions, theta);
+    const Tensor q_single = Tensor::wrap(const_cast<float*>(single.f32()), q_in.shape());
+    assert_allclose(q_single, q_expected, tol::kRope, label + " q vs ref");
+    if (k_size > 0) {
+      const Tensor k_single = Tensor::wrap(const_cast<float*>(single.f32()) + q_size, k_in.shape());
+      assert_allclose(k_single, k_expected, tol::kRope, label + " k vs ref");
+    }
+  }
+
+  // No heads at all: nothing to rotate, and nothing to divide the work by.
+  for (const int threads : kThreadCounts) {
+    CAPTURE(threads);
+    struct Restore {
+      int threads;
+      ~Restore() { set_num_threads(threads); }
+    } restore{num_threads()};
+    set_num_threads(threads);
+    Tensor q = Tensor::zeros({5, 0, 64});
+    const std::vector<std::int64_t> positions{0, 1, 2, 3, 4};
+    CHECK_NOTHROW(ops::rope(q, nullptr, positions, theta));
   }
 }

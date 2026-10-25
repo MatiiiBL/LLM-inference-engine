@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <new>
@@ -102,11 +103,15 @@ struct Cover {
   std::set<std::thread::id> threads;
 };
 
+using Body = std::function<void(Index, Index)>;
+using ParallelFor = std::function<void(Index n, Index grain, const Body& body)>;
+
 /// Runs parallel_for(n, grain) and checks the split it produced: every index
 /// in [0, n) covered exactly once, every chunk non-empty, and every chunk at
-/// least `grain` long unless it is the whole range.
-Cover check_cover(ThreadPool& pool, Index n, Index grain) {
-  CAPTURE(pool.size());
+/// least `grain` long unless it is the whole range. `size` is the most
+/// threads it may run on.
+Cover check_cover(const ParallelFor& parallel_for, int size, Index n, Index grain) {
+  CAPTURE(size);
   CAPTURE(n);
   CAPTURE(grain);
   const auto un = static_cast<std::size_t>(n);
@@ -116,7 +121,7 @@ Cover check_cover(ThreadPool& pool, Index n, Index grain) {
   std::vector<std::thread::id> chunk_thread(un);
   std::atomic<bool> out_of_range{false};  // only ever written on failure
 
-  pool.parallel_for(n, grain, [&](Index begin, Index end) {
+  parallel_for(n, grain, [&](Index begin, Index end) {
     if (begin < 0 || end > n || begin >= end) {
       out_of_range.store(true, std::memory_order_relaxed);
       return;
@@ -143,9 +148,38 @@ Cover check_cover(ThreadPool& pool, Index n, Index grain) {
     ++cover.chunks;
     pos = end;
   }
-  CHECK(cover.threads.size() <= static_cast<std::size_t>(pool.size()));
+  CHECK(cover.threads.size() <= static_cast<std::size_t>(size));
   return cover;
 }
+
+Cover check_cover(ThreadPool& pool, Index n, Index grain) {
+  return check_cover(
+      [&](Index n_, Index grain_, const Body& body) { pool.parallel_for(n_, grain_, body); },
+      pool.size(), n, grain);
+}
+
+/// check_cover for kernel_parallel_for at the current num_threads().
+Cover check_kernel_cover(Index n, Index grain) {
+  return check_cover(kernel_parallel_for, num_threads(), n, grain);
+}
+
+/// Sets the kernel thread count for one test and restores it afterwards,
+/// pass or fail.
+class KernelThreads {
+ public:
+  explicit KernelThreads(int n) : saved_(num_threads()) { set_num_threads(n); }
+  ~KernelThreads() { set_num_threads(saved_); }
+  KernelThreads(const KernelThreads&) = delete;
+  KernelThreads& operator=(const KernelThreads&) = delete;
+
+ private:
+  int saved_;
+};
+
+/// The counts the kernel tests sweep. 10 is the development machine's
+/// hardware_concurrency(); on a smaller machine it oversubscribes, which
+/// tests the split just as well.
+constexpr int kThreadCounts[] = {1, 2, 3, 4, 10};
 
 }  // namespace
 
@@ -740,13 +774,20 @@ TEST_CASE("Arena::tensor validates before allocating") {
   CHECK_THROWS_AS(arena.tensor(Shape{}), std::invalid_argument);
   CHECK_THROWS_AS(arena.tensor({2, -1}), std::invalid_argument);
   CHECK_THROWS_AS(arena.tensor({16, 16}), std::bad_alloc);  // 1024 bytes, 1014 free
-  // 2^62 elements: numel * 4 would wrap a 64-bit size_t to 0.
+  // 2^62 elements: a valid shape, but numel * 4 would wrap a 64-bit size_t to 0.
   CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 30, std::int64_t{1} << 30, 4}),
                   std::bad_alloc);
-  // 2^124 elements: even the element count overflows.
-  CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 62, std::int64_t{1} << 62}), std::bad_alloc);
+  // 2^124 elements: the element count overflows int64, so no tensor can have
+  // this shape (Tensor::wrap rejects it too).
+  CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 62, std::int64_t{1} << 62}),
+                  std::invalid_argument);
+  // Empty, but dimension 0 would need a stride of 2^124: rejected before the
+  // arena moves, not by Tensor::wrap after it has.
+  CHECK_THROWS_AS(arena.tensor({0, std::int64_t{1} << 62, std::int64_t{1} << 62}),
+                  std::invalid_argument);
   CHECK(arena.used() == 10);
-  // A zero extent makes the tensor empty however large the others are.
+  // A zero extent outside the large ones leaves every stride small: a valid
+  // empty tensor, however large the other extents are.
   CHECK(arena.tensor({std::int64_t{1} << 62, 0, std::int64_t{1} << 62}).numel() == 0);
 }
 
@@ -797,4 +838,271 @@ TEST_CASE("arena scratch can be filled by a thread pool") {
     CHECK(wrong == 0);
   }
   CHECK(arena.peak() == 256 * 64 * sizeof(float));
+}
+
+// ---------------------------------------------------------------------------
+// kernel_parallel_for and the process-wide pool
+// ---------------------------------------------------------------------------
+
+TEST_CASE("set_num_threads resolves n <= 0 to hardware_concurrency, and num_threads reports it") {
+  const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  KernelThreads guard(3);
+  CHECK(num_threads() == 3);
+  set_num_threads(0);
+  CHECK(num_threads() == hw);
+  set_num_threads(1);
+  CHECK(num_threads() == 1);
+  set_num_threads(-7);
+  CHECK(num_threads() == hw);
+  set_num_threads(5);
+  CHECK(num_threads() == 5);
+}
+
+TEST_CASE("kernel_parallel_for covers [0, n) exactly once at every thread count") {
+  const std::thread::id caller = std::this_thread::get_id();
+  for (const int threads : kThreadCounts) {
+    KernelThreads guard(threads);
+    for (const Index n : {1, 2, 7, 100, 1000, 49152}) {
+      for (const Index grain : {1, 3, 64}) {
+        const Cover cover = check_kernel_cover(n, grain);
+        if (threads == 1 || n / grain <= 1) {
+          // One thread, or less than two grains of work: inline, one chunk.
+          CHECK(cover.chunks == 1);
+          CHECK(cover.threads == std::set<std::thread::id>{caller});
+        } else {
+          CHECK(cover.chunks > 1);
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("set_num_threads starts and stops the pool's threads") {
+  std::thread([] {}).join();  // start any thread a sanitizer runtime starts lazily
+  KernelThreads guard(1);
+  const int base = settled_thread_count();
+  if (base < 0) {
+    note_skip("runtime: no OS thread count on this platform; kernel pool size checks skipped");
+    MESSAGE("SKIP: no OS thread count on this platform");
+    return;
+  }
+  for (const int threads : {4, 2, 10, 1, 3}) {
+    CAPTURE(threads);
+    set_num_threads(threads);
+    check_kernel_cover(1000, 1);
+    CHECK(settled_thread_count() == base + threads - 1);
+  }
+}
+
+TEST_CASE("kernel_parallel_for rejects a negative n and does nothing for n = 0") {
+  KernelThreads guard(4);
+  int calls = 0;
+  CHECK_THROWS_AS(kernel_parallel_for(-1, 1, [&](Index, Index) { ++calls; }),
+                  std::invalid_argument);
+  kernel_parallel_for(0, 1, [&](Index, Index) { ++calls; });
+  CHECK(calls == 0);
+}
+
+TEST_CASE("an exception leaves kernel_parallel_for usable, pooled or inline") {
+  for (const int threads : {1, 4}) {
+    CAPTURE(threads);
+    KernelThreads guard(threads);
+    CHECK_THROWS_AS(kernel_parallel_for(100, 1, [](Index, Index) { throw std::out_of_range("x"); }),
+                    std::out_of_range);
+    CHECK_THROWS_AS(kernel_parallel_for(5, 100, [](Index, Index) { throw 42; }), int);
+    // The pool is not left held: the next call can use it again.
+    check_kernel_cover(1000, 1);
+  }
+}
+
+TEST_CASE("a nested kernel_parallel_for runs inline on the thread that called it") {
+  KernelThreads guard(4);
+  constexpr Index outer = 16;
+  constexpr Index inner = 1000;
+  const auto un = static_cast<std::size_t>(outer);
+  std::vector<int> chunks(un, 0);
+  std::vector<Index> covered(un, 0);
+  std::vector<int> elsewhere(un, 0);
+  std::vector<int> still_in_body(un, 0);
+  ThreadPool other(2);
+  kernel_parallel_for(outer, 1, [&](Index begin, Index end) {
+    for (Index i = begin; i < end; ++i) {
+      const auto slot = static_cast<std::size_t>(i);
+      const std::thread::id me = std::this_thread::get_id();
+      kernel_parallel_for(inner, 1, [&](Index b, Index e) {
+        ++chunks[slot];
+        covered[slot] += e - b;
+        if (std::this_thread::get_id() != me) ++elsewhere[slot];
+      });
+      // The inline run must not have cleared "inside a body" on its way out.
+      try {
+        other.parallel_for(4, [](Index, Index) {});
+      } catch (const std::logic_error&) {
+        still_in_body[slot] = 1;
+      }
+    }
+  });
+  for (std::size_t i = 0; i < un; ++i) {
+    CAPTURE(i);
+    CHECK(chunks[i] == 1);
+    CHECK(covered[i] == inner);
+    CHECK(elsewhere[i] == 0);
+    CHECK(still_in_body[i] == 1);
+  }
+}
+
+TEST_CASE("kernel_parallel_for inside a ThreadPool body runs inline instead of throwing") {
+  // ops:: called from a caller's own pool: the kernel must not nest into the
+  // process-wide one.
+  KernelThreads guard(4);
+  ThreadPool pool(3);
+  std::vector<int> chunks(3, 0);
+  std::vector<Index> covered(3, 0);
+  pool.parallel_for(3, [&](Index begin, Index end) {
+    for (Index i = begin; i < end; ++i) {
+      const auto slot = static_cast<std::size_t>(i);
+      kernel_parallel_for(500, 1, [&](Index b, Index e) {
+        ++chunks[slot];
+        covered[slot] += e - b;
+      });
+    }
+  });
+  CHECK(chunks == std::vector<int>{1, 1, 1});
+  CHECK(covered == std::vector<Index>{500, 500, 500});
+}
+
+TEST_CASE("while the pool is busy, another thread's kernel_parallel_for runs inline") {
+  KernelThreads guard(4);
+  Index intruder_chunks = 0;
+  Index intruder_items = 0;
+  bool intruder_inline = true;
+  // The pool is held for as long as any chunk of this call runs.
+  kernel_parallel_for(4, 1, [&](Index begin, Index) {
+    if (begin != 0) return;
+    std::thread intruder([&] {
+      const std::thread::id me = std::this_thread::get_id();
+      kernel_parallel_for(1000, 1, [&](Index b, Index e) {
+        ++intruder_chunks;
+        intruder_items += e - b;
+        if (std::this_thread::get_id() != me) intruder_inline = false;
+      });
+    });
+    intruder.join();
+  });
+  CHECK(intruder_chunks == 1);
+  CHECK(intruder_items == 1000);
+  CHECK(intruder_inline);
+}
+
+TEST_CASE("concurrent kernel_parallel_for callers each cover their range exactly once") {
+  // Whichever caller gets the pool uses it; the others run inline. Either
+  // way every caller's range is covered once per call.
+  for (const int threads : {2, 4, 10}) {
+    CAPTURE(threads);
+    KernelThreads guard(threads);
+    constexpr int callers = 6;
+    constexpr int calls = 200;
+    constexpr Index n = 777;
+    std::vector<std::vector<int>> hits(callers, std::vector<int>(static_cast<std::size_t>(n), 0));
+    std::vector<std::thread> pool_users;
+    for (int c = 0; c < callers; ++c) {
+      pool_users.emplace_back([&hits, c] {
+        std::vector<int>& mine = hits[static_cast<std::size_t>(c)];
+        for (int call = 0; call < calls; ++call) {
+          kernel_parallel_for(n, 1, [&](Index begin, Index end) {
+            for (Index i = begin; i < end; ++i) ++mine[static_cast<std::size_t>(i)];
+          });
+        }
+      });
+    }
+    for (std::thread& t : pool_users) t.join();
+    int wrong = 0;
+    for (const std::vector<int>& h : hits) {
+      wrong += static_cast<int>(std::count_if(h.begin(), h.end(), [](int x) { return x != calls; }));
+    }
+    CHECK(wrong == 0);
+  }
+}
+
+TEST_CASE("set_num_threads waits for the running kernel, then resizes the pool") {
+  using clock = std::chrono::steady_clock;
+  KernelThreads guard(4);
+  std::atomic<bool> resizing{false};
+  bool kernel_finished = false;  // plain: only the pool's own ordering protects it
+  bool resizer_saw_finished = false;
+  std::thread resizer;
+  kernel_parallel_for(4, 1, [&](Index begin, Index) {
+    if (begin != 0) return;
+    resizer = std::thread([&] {
+      resizing.store(true);
+      set_num_threads(3);
+      resizer_saw_finished = kernel_finished;
+    });
+    const auto deadline = clock::now() + std::chrono::seconds(10);
+    while (!resizing.load() && clock::now() < deadline) std::this_thread::yield();
+    // Long enough for a set_num_threads that does not wait to have returned.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    kernel_finished = true;
+  });
+  resizer.join();
+  CHECK(resizer_saw_finished);
+  CHECK(num_threads() == 3);
+  check_kernel_cover(1000, 1);
+}
+
+TEST_CASE("set_num_threads racing running kernels leaves every call whole") {
+  KernelThreads guard(2);
+  constexpr int callers = 3;
+  constexpr Index n = 512;
+  std::atomic<bool> stop{false};
+  std::vector<std::vector<int>> hits(callers, std::vector<int>(static_cast<std::size_t>(n), 0));
+  std::vector<int> calls(callers, 0);
+  std::vector<std::thread> pool_users;
+  for (int c = 0; c < callers; ++c) {
+    pool_users.emplace_back([&, c] {
+      std::vector<int>& mine = hits[static_cast<std::size_t>(c)];
+      while (!stop.load()) {
+        kernel_parallel_for(n, 1, [&](Index begin, Index end) {
+          for (Index i = begin; i < end; ++i) ++mine[static_cast<std::size_t>(i)];
+        });
+        ++calls[static_cast<std::size_t>(c)];
+      }
+    });
+  }
+  for (int i = 0; i < 100; ++i) set_num_threads(kThreadCounts[i % 5]);
+  stop.store(true);
+  for (std::thread& t : pool_users) t.join();
+  for (int c = 0; c < callers; ++c) {
+    CAPTURE(c);
+    const std::vector<int>& h = hits[static_cast<std::size_t>(c)];
+    const int expected = calls[static_cast<std::size_t>(c)];
+    CHECK(std::count(h.begin(), h.end(), expected) == n);
+  }
+}
+
+TEST_CASE("set_num_threads from inside a kernel body is rejected") {
+  // The kernel holds the pool while it waits for the body, so the call could
+  // never return.
+  KernelThreads guard(4);
+  std::vector<int> rejected(4, 0);
+  kernel_parallel_for(4, 1, [&](Index begin, Index end) {
+    for (Index i = begin; i < end; ++i) {
+      try {
+        set_num_threads(2);
+      } catch (const std::logic_error&) {
+        rejected[static_cast<std::size_t>(i)] = 1;
+      }
+    }
+  });
+  CHECK(rejected == std::vector<int>{1, 1, 1, 1});
+  int inline_rejected = 0;
+  kernel_parallel_for(1, 1, [&](Index, Index) {
+    try {
+      set_num_threads(2);
+    } catch (const std::logic_error&) {
+      inline_rejected = 1;
+    }
+  });
+  CHECK(inline_rejected == 1);
+  CHECK(num_threads() == 4);
 }
