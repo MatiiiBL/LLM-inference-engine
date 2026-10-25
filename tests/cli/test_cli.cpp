@@ -30,6 +30,7 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cerrno>
 #include <cstdint>
 #include <cstring>
@@ -38,7 +39,6 @@
 #include <initializer_list>
 #include <iterator>
 #include <optional>
-#include <regex>
 #include <set>
 #include <span>
 #include <sstream>
@@ -213,13 +213,28 @@ std::optional<Tokenizer> load_tokenizer() {
 }
 
 /// "eos_token_id" from the checkpoint's config.json: the id the CLI stops on.
-/// A regex rather than a JSON parser, because this target links none.
+/// Found by hand rather than with a JSON parser, because this target links
+/// none, and not with std::regex, which GCC 13 warns about at -O2
+/// (-Wmaybe-uninitialized inside libstdc++'s regex compiler).
 std::int32_t config_eos_id() {
   const std::string json = read_file(checkpoint_dir() / "config.json");
-  static const std::regex re(R"re("eos_token_id"\s*:\s*(\d+))re");
-  std::smatch m;
-  REQUIRE_MESSAGE(std::regex_search(json, m, re), "no integer eos_token_id in config.json");
-  return static_cast<std::int32_t>(std::stol(m[1].str()));
+  constexpr std::string_view key = "\"eos_token_id\"";
+  std::size_t pos = json.find(key);
+  if (pos != std::string::npos) pos = json.find_first_not_of(" \t\r\n", pos + key.size());
+  if (pos != std::string::npos && json[pos] == ':') {
+    pos = json.find_first_not_of(" \t\r\n", pos + 1);
+  } else {
+    pos = std::string::npos;
+  }
+  std::int32_t id = -1;
+  bool found = false;
+  if (pos != std::string::npos && json[pos] != '-') {
+    const char* first = json.data() + pos;
+    const auto [ptr, ec] = std::from_chars(first, json.data() + json.size(), id);
+    found = ec == std::errc{} && ptr != first;
+  }
+  REQUIRE_MESSAGE(found, "no integer eos_token_id in config.json");
+  return id;
 }
 
 // ---------------------------------------------------------------------------
@@ -596,6 +611,11 @@ TEST_CASE("parse_args: boundary values are accepted") {
   CHECK(o.sampling.repetition_penalty == 0.5f);
   CHECK(o.sampling.seed == 0u);
   CHECK(parse({"--model", "m", "--prompt", "p", "--top-p", "1e-9"}).sampling.top_p == 1e-9f);
+  CHECK(parse({"--model", "m", "--prompt", "p", "--top-p", "5E-1"}).sampling.top_p == 0.5f);
+  CHECK(parse({"--model", "m", "--prompt", "p", "--temperature", "1.5e+0"}).sampling.temperature ==
+        1.5f);
+  CHECK(parse({"--model", "m", "--prompt", "p", "--temperature", ".5"}).sampling.temperature ==
+        0.5f);
 }
 
 TEST_CASE("parse_args: a repeated flag keeps its last value") {
@@ -656,6 +676,13 @@ TEST_CASE("parse_args: malformed or out-of-range values name the flag and the va
       {"--temperature", "inf", "a number >= 0"},
       {"--temperature", "1e999", "a number >= 0"},
       {"--temperature", "0.7x", "a number >= 0"},
+      {"--temperature", "", "a number >= 0"},
+      {"--temperature", "+0.5", "a number >= 0"},
+      {"--temperature", " 0.5", "a number >= 0"},
+      {"--temperature", "0.5 ", "a number >= 0"},
+      {"--temperature", "0x1p-1", "a number >= 0"},
+      {"--temperature", "infinity", "a number >= 0"},
+      {"--temperature", "1e-50", "a number >= 0"},
       {"--top-k", "-1", "an integer >= 0"},
       {"--top-k", "2.5", "an integer >= 0"},
       {"--top-p", "0", "a number in (0, 1]"},

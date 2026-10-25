@@ -7,9 +7,11 @@
 #ifndef MINILLM_SRC_CLI_ARGS_H
 #define MINILLM_SRC_CLI_ARGS_H
 
+#include <cerrno>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <optional>
 #include <span>
@@ -66,6 +68,21 @@ inline constexpr std::string_view kUsage =
 
 namespace detail {
 
+/// Parses all of `text` as a float, accepting what std::from_chars does: an
+/// optional '-', then decimal digits with an optional fraction and exponent.
+/// std::from_chars itself has no float overload in the libc++ that Xcode 16
+/// ships, so this goes through strtof, after rejecting the extra syntax strtof
+/// would take: leading whitespace, a leading '+', hex floats, inf and nan.
+inline bool parse_float(std::string_view text, float& value) {
+  if (text.empty() || text.front() == '+') return false;
+  if (text.find_first_not_of("0123456789.eE+-") != std::string_view::npos) return false;
+  const std::string s(text);
+  char* end = nullptr;
+  errno = 0;
+  value = std::strtof(s.c_str(), &end);
+  return end == s.c_str() + s.size() && errno != ERANGE;
+}
+
 /// Parses all of `text` as a T and checks it with `ok`. Anything else — junk,
 /// trailing characters, overflow, NaN or infinity, a value `ok` rejects — is
 /// a UsageError of the form "--flag must be <requirement>, got '<text>'".
@@ -73,11 +90,16 @@ template <class T, class Pred>
 T parse_number(std::string_view flag, std::string_view text, std::string_view requirement,
                Pred ok) {
   T value{};
-  const char* first = text.data();
-  const char* last = first + text.size();
-  const auto [ptr, ec] = std::from_chars(first, last, value);
-  bool valid = ec == std::errc{} && ptr == last;
-  if constexpr (std::is_floating_point_v<T>) valid = valid && std::isfinite(value);
+  bool valid = false;
+  if constexpr (std::is_floating_point_v<T>) {
+    static_assert(std::is_same_v<T, float>, "parse_float only handles float");
+    valid = parse_float(text, value) && std::isfinite(value);
+  } else {
+    const char* first = text.data();
+    const char* last = first + text.size();
+    const auto [ptr, ec] = std::from_chars(first, last, value);
+    valid = ec == std::errc{} && ptr == last;
+  }
   if (!valid || !ok(value)) {
     throw UsageError(std::string(flag) + " must be " + std::string(requirement) + ", got '" +
                      std::string(text) + "'");
