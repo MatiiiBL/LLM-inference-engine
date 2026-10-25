@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 
 #include "f32x4.h"
 #include "minillm/ops.h"
@@ -110,7 +111,7 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) {
   const float* pw = weight.f32();
 
   const std::int64_t grain = (kRmsnormMinFloats + k - 1) / std::max<std::int64_t>(k, 1);
-  kernel_parallel_for(m, grain, [&](std::int64_t begin, std::int64_t end) {
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
     for (std::int64_t i = begin; i < end; ++i) {
       const float* px = x.f32() + i * k;
       float* po = out.f32() + i * k;
@@ -127,7 +128,8 @@ void rmsnorm(const Tensor& x, const Tensor& weight, float eps, Tensor& out) {
           k, [&](std::int64_t at) { store(po + at, load(px + at) * vinv * load(pw + at)); });
       for (; j < k; ++j) po[j] = px[j] * inv_rms * pw[j];
     }
-  });
+  };
+  kernel_parallel_for(m, grain, std::ref(run));
 }
 
 void softmax(Tensor& x) {

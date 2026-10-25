@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -40,9 +41,10 @@ constexpr std::int64_t kAddMinFloats = 16384;
 template <class Fn>
 void parallel_units(std::int64_t n, std::int64_t min_floats, const Fn& fn) {
   const std::int64_t grain = (min_floats + kUnit - 1) / kUnit;
-  kernel_parallel_for((n + kUnit - 1) / kUnit, grain, [&](std::int64_t begin, std::int64_t end) {
+  const auto run = [&](std::int64_t begin, std::int64_t end) {
     fn(begin * kUnit, std::min(end * kUnit, n));
-  });
+  };
+  kernel_parallel_for((n + kUnit - 1) / kUnit, grain, std::ref(run));
 }
 
 }  // namespace

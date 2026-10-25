@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string>
 
@@ -190,7 +191,8 @@ void matmul(const Tensor& x, const Tensor& w, Tensor& out) {
     for (; j < j_end; ++j) panel<1>(px, pw + j * k, po + j, m, k, n);
   };
   const std::int64_t unit_macs = std::max<std::int64_t>(1, m * k * kCols);
-  kernel_parallel_for((n + kCols - 1) / kCols, (kMinChunkMacs + unit_macs - 1) / unit_macs, run);
+  kernel_parallel_for((n + kCols - 1) / kCols, (kMinChunkMacs + unit_macs - 1) / unit_macs,
+                      std::ref(run));
 }
 
 }  // namespace minillm::ops

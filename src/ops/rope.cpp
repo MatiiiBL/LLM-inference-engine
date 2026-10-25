@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -263,7 +264,7 @@ void rope(Tensor& q, Tensor* k, std::span<const std::int64_t> positions, float t
   };
   const std::int64_t token_floats = std::max<std::int64_t>(1, (n_q_heads + n_kv_heads) * head_dim);
   kernel_parallel_for(static_cast<std::int64_t>(positions.size()),
-                      (kMinChunkFloats + token_floats - 1) / token_floats, run);
+                      (kMinChunkFloats + token_floats - 1) / token_floats, std::ref(run));
 }
 
 }  // namespace minillm::ops
