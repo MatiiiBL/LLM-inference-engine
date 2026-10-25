@@ -17,6 +17,7 @@
 #include <fstream>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -38,6 +39,39 @@ static_assert(std::endian::native == std::endian::little, "minillm assumes a lit
 
 [[noreturn]] void fail(const fs::path& file, const std::string& message) {
   throw std::runtime_error("safetensors: " + file.string() + ": " + message);
+}
+
+/// The longest header the safetensors reference loader accepts. Holding to it
+/// means a corrupt length cannot make this loader read a whole multi-gigabyte
+/// file into one string.
+constexpr std::uint64_t kMaxHeaderLen = 100'000'000;
+
+/// Parses `input` as JSON, rejecting a key that appears twice in one object,
+/// at any depth. nlohmann keeps the last of two equal keys and drops the
+/// other without a word, so in a safetensors header one tensor's entry would
+/// silently replace another's. `on_duplicate(top, key)` must throw; `top` is
+/// the root-level key the repeat sits under, empty when the repeat is a
+/// root-level key itself.
+template <class Json, class Input, class OnDuplicate>
+Json parse_unique_keys(Input&& input, const OnDuplicate& on_duplicate) {
+  std::vector<std::set<std::string>> open;  // keys seen so far, per open object
+  std::string top;                          // the root object's latest key
+  return Json::parse(std::forward<Input>(input),
+                     [&](int depth, nlohmann::json::parse_event_t event, Json& parsed) {
+                       using Event = nlohmann::json::parse_event_t;
+                       if (event == Event::object_start) {
+                         open.emplace_back();
+                       } else if (event == Event::object_end) {
+                         open.pop_back();
+                       } else if (event == Event::key) {
+                         const auto& key = parsed.template get_ref<const std::string&>();
+                         if (!open.back().insert(key).second) {
+                           on_duplicate(depth == 1 ? std::string() : top, key);
+                         }
+                         if (depth == 1) top = key;
+                       }
+                       return true;
+                     });
 }
 
 /// An open .safetensors file whose header has been parsed and checked.
@@ -73,9 +107,13 @@ TensorInfo parse_entry(const fs::path& file, const std::string& name, const orde
     bad("shape " + shape->dump() + " has rank " + std::to_string(shape->size()) +
         "; minillm supports rank 1.." + std::to_string(kMaxDims));
   }
+  // Multiplied from the innermost dimension out, so that the partial
+  // products are the tensor's strides: Tensor rejects a shape whose strides
+  // overflow even when a zero extent makes it empty, and this has to reject
+  // the same shapes, with a message naming the file and the tensor.
   std::int64_t dims[kMaxDims] = {};
   std::uint64_t numel = 1;
-  for (std::size_t i = 0; i < shape->size(); ++i) {
+  for (std::size_t i = shape->size(); i-- > 0;) {
     const ordered_json& d = (*shape)[i];
     if (!d.is_number_unsigned() || d.get<std::uint64_t>() > kMaxExtent) {
       bad("shape must hold non-negative integers, got " + shape->dump());
@@ -100,10 +138,13 @@ TensorInfo parse_entry(const fs::path& file, const std::string& name, const orde
         std::to_string(data_size) + " bytes)");
   }
   const std::uint64_t esize = dtype_size(info.dtype);
-  if (numel > std::numeric_limits<std::uint64_t>::max() / esize || end - begin != numel * esize) {
+  std::uint64_t needed = 0;
+  const bool too_many = __builtin_mul_overflow(numel, esize, &needed);
+  if (too_many || end - begin != needed) {
     bad("data_offsets " + offsets->dump() + " span " + std::to_string(end - begin) +
         " bytes, but " + std::string(dtype_name(info.dtype)) + info.shape.to_string() + " needs " +
-        std::to_string(numel * esize));
+        (too_many ? "more than " + std::to_string(std::numeric_limits<std::uint64_t>::max())
+                  : std::to_string(needed)));
   }
   info.data_begin = static_cast<std::size_t>(begin);
   info.data_end = static_cast<std::size_t>(end);
@@ -127,6 +168,10 @@ SafetensorsFile open_safetensors(const fs::path& file) {
   if (!f.stream) fail(file, "cannot read the header length");
   std::uint64_t header_len = 0;
   for (int i = 7; i >= 0; --i) header_len = (header_len << 8) | len_bytes[i];
+  if (header_len > kMaxHeaderLen) {
+    fail(file, "the header length is " + std::to_string(header_len) +
+                   " bytes, more than the safetensors limit of " + std::to_string(kMaxHeaderLen));
+  }
   if (header_len > file_size - 8) {
     fail(file, "truncated: the header length is " + std::to_string(header_len) +
                    " bytes, but only " + std::to_string(file_size - 8) + " follow it");
@@ -138,7 +183,12 @@ SafetensorsFile open_safetensors(const fs::path& file) {
 
   ordered_json root;
   try {
-    root = ordered_json::parse(header);
+    root = parse_unique_keys<ordered_json>(header, [&](const std::string& top,
+                                                       const std::string& key) {
+      if (top.empty()) fail(file, "the header has two entries named '" + key + "'");
+      fail(file, (top == "__metadata__" ? "\"__metadata__\"" : "tensor '" + top + "'") +
+                     ": the key \"" + key + "\" appears twice");
+    });
   } catch (const ordered_json::exception& e) {
     fail(file, std::string("header is not valid JSON: ") + e.what());
   }
@@ -147,7 +197,15 @@ SafetensorsFile open_safetensors(const fs::path& file) {
   f.data_start = 8 + header_len;
   const std::uint64_t data_size = file_size - f.data_start;
   for (const auto& item : root.items()) {
-    if (item.key() == "__metadata__") continue;
+    if (item.key() == "__metadata__") {
+      // Free-form, and skipped, but the format makes it a string -> string map.
+      const ordered_json& meta = item.value();
+      const auto is_string = [](const ordered_json& v) { return v.is_string(); };
+      if (!meta.is_object() || !std::all_of(meta.begin(), meta.end(), is_string)) {
+        fail(file, "\"__metadata__\" must map strings to strings, got " + meta.dump());
+      }
+      continue;
+    }
     f.tensors.push_back(parse_entry(file, item.key(), item.value(), data_size));
   }
 
@@ -155,18 +213,39 @@ SafetensorsFile open_safetensors(const fs::path& file) {
   std::stable_sort(f.tensors.begin(), f.tensors.end(), [](const TensorInfo& a, const TensorInfo& b) {
     return a.data_begin != b.data_begin ? a.data_begin < b.data_begin : a.data_end < b.data_end;
   });
-  // Sorted by begin, a range overlaps an earlier one iff it starts before the
-  // previous non-empty range ends (everything before that already passed).
+  // The ranges must tile the data section, as the format (and its reference
+  // loader) requires: in offset order each starts exactly where the one
+  // before it ended, the first at 0, and the last ends where the file does.
+  // That rules out overlaps and bytes that belong to no tensor. An empty
+  // tensor is a zero-length tile, so it, too, has to sit on a boundary.
+  std::uint64_t end = 0;  // where the ranges so far end
   const TensorInfo* prev = nullptr;
   for (const TensorInfo& t : f.tensors) {
-    if (t.data_begin == t.data_end) continue;
-    if (prev != nullptr && t.data_begin < prev->data_end) {
+    // An empty `prev` ends where it starts, at or before t.data_begin, so
+    // reaching back past `end` means `prev` is a real range.
+    if (t.data_begin < end) {
       fail(file, "tensors '" + prev->name + "' [" + std::to_string(prev->data_begin) + ", " +
                      std::to_string(prev->data_end) + ") and '" + t.name + "' [" +
                      std::to_string(t.data_begin) + ", " + std::to_string(t.data_end) +
                      ") overlap");
     }
+    if (t.data_begin > end) {
+      fail(file, "bytes [" + std::to_string(end) + ", " + std::to_string(t.data_begin) +
+                     ") of the data section belong to no tensor: " +
+                     (prev == nullptr ? "the first, '" + t.name + "',"
+                                      : "'" + prev->name + "' ends at " + std::to_string(end) +
+                                            " and '" + t.name + "'") +
+                     " starts at " + std::to_string(t.data_begin));
+    }
+    end = t.data_end;
     prev = &t;
+  }
+  if (end != data_size) {
+    fail(file, "bytes [" + std::to_string(end) + ", " + std::to_string(data_size) +
+                   ") of the data section belong to no tensor: " +
+                   (prev == nullptr ? std::string("the header lists none")
+                                    : "the last, '" + prev->name + "', ends at " +
+                                          std::to_string(end)));
   }
   return f;
 }
@@ -276,7 +355,11 @@ Weights load_checkpoint(const std::filesystem::path& model_dir) {
     std::ifstream in(index_path, std::ios::binary);
     if (!in) fail(index_path, "cannot open file");
     try {
-      index = nlohmann::json::parse(in);
+      index = parse_unique_keys<nlohmann::json>(in, [&](const std::string& top,
+                                                        const std::string& key) {
+        fail(index_path, (top.empty() ? std::string() : "\"" + top + "\": ") + "the key \"" +
+                             key + "\" appears twice");
+      });
     } catch (const nlohmann::json::exception& e) {
       fail(index_path, std::string("not valid JSON: ") + e.what());
     }
@@ -291,7 +374,16 @@ Weights load_checkpoint(const std::filesystem::path& model_dir) {
     if (!item.value().is_string()) {
       fail(index_path, "weight_map entry for '" + item.key() + "' must be a shard file name");
     }
-    names_by_shard[item.value().get<std::string>()].push_back(item.key());
+    const std::string& shard = item.value().get_ref<const std::string&>();
+    // model_dir / shard would let an absolute path, or a ".." step, load a
+    // file from anywhere at all.
+    const fs::path relative(shard);
+    const auto is_up = [](const fs::path& part) { return part == ".."; };
+    if (relative.has_root_path() || std::any_of(relative.begin(), relative.end(), is_up)) {
+      fail(index_path, "weight_map entry for '" + item.key() + "' names the shard '" + shard +
+                           "', which is not inside " + model_dir.string());
+    }
+    names_by_shard[shard].push_back(item.key());
   }
 
   Weights weights;
@@ -304,8 +396,20 @@ Weights load_checkpoint(const std::filesystem::path& model_dir) {
                              "' in this shard, but it is not there");
       }
     }
+    // Every tensor in the shard must be one the index puts there. As each
+    // name maps to a single shard, this also rules out a tensor present in
+    // two shards.
     for (const std::string& name : part.names()) {
-      if (weights.has(name)) fail(shard_path, "tensor '" + name + "' is also in another shard");
+      const auto entry = map->find(name);
+      if (entry == map->end()) {
+        fail(shard_path, "tensor '" + name + "' is in this shard, but " +
+                             index_path.filename().string() + " does not list it");
+      }
+      if (entry->get_ref<const std::string&>() != shard) {
+        fail(shard_path, "tensor '" + name + "' is in this shard, but " +
+                             index_path.filename().string() + " places it in '" +
+                             entry->get_ref<const std::string&>() + "'");
+      }
       weights.insert(name, part.get(name));  // a handle copy: shares the storage
     }
   }
