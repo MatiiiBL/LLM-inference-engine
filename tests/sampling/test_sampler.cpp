@@ -152,6 +152,9 @@ TEST_CASE("SamplingParams::validate rejects out-of-range knobs") {
     CHECK_THROWS_AS(p.validate(), std::invalid_argument);
     CHECK_THROWS_AS(Sampler{p}, std::invalid_argument);
   };
+  rejects([](SamplingParams& p) { p.temperature = kNaN; });
+  rejects([](SamplingParams& p) { p.temperature = kInf; });
+  rejects([](SamplingParams& p) { p.temperature = -kInf; });
   rejects([](SamplingParams& p) { p.top_k = -1; });
   rejects([](SamplingParams& p) { p.top_p = 0.0f; });
   rejects([](SamplingParams& p) { p.top_p = -0.5f; });
@@ -159,6 +162,7 @@ TEST_CASE("SamplingParams::validate rejects out-of-range knobs") {
   rejects([](SamplingParams& p) { p.repetition_penalty = 0.0f; });
   rejects([](SamplingParams& p) { p.repetition_penalty = -1.2f; });
   rejects([](SamplingParams& p) { p.repetition_penalty = kNaN; });
+  rejects([](SamplingParams& p) { p.repetition_penalty = kInf; });
 
   // The disabling values and the far ends of the valid range are all fine.
   SamplingParams p;
@@ -170,6 +174,26 @@ TEST_CASE("SamplingParams::validate rejects out-of-range knobs") {
   p.top_p = 1e-9f;
   p.top_k = std::numeric_limits<std::int64_t>::max();
   CHECK_NOTHROW(p.validate());
+}
+
+TEST_CASE("non-finite params throw instead of quietly returning token 0") {
+  // validate() used to accept each of these, and sample() then returned
+  // token 0 where every finite value gives another answer.
+  const auto throws = [](const SamplingParams& p, std::vector<float> row,
+                         std::vector<std::int32_t> history) {
+    CHECK_THROWS_AS(Sampler(p).sample(row, history), std::invalid_argument);
+  };
+  // NaN temperature: every logit became NaN, then -inf, and the first one
+  // won, though token 0 is impossible.
+  throws(with_temperature(kNaN), {-kInf, 0.0f, 1.0f}, {});
+  // Infinite temperature: inf / inf = NaN took the infinite logit, which
+  // otherwise takes all the mass, out of play.
+  throws(with_temperature(kInf), {1.0f, kInf}, {});
+  // Infinite penalty: the penalized zero became 0 * inf = NaN, which greedy
+  // argmax never picks.
+  SamplingParams penalized;
+  penalized.repetition_penalty = kInf;
+  throws(penalized, {-1.0f, 0.0f}, {1});
 }
 
 TEST_CASE("SamplingParams::to_string names every knob") {
@@ -224,7 +248,10 @@ TEST_CASE("temperature <= 0 is argmax, ties included") {
 }
 
 TEST_CASE("top_k = 1 is greedy regardless of temperature") {
-  for (const float temperature : {0.01f, 1.0f, 10.0f, 1e4f}) {
+  // denorm_min overflows almost every logit to +-inf, and the largest must
+  // still win the tie at +inf.
+  const float tiny = std::numeric_limits<float>::denorm_min();
+  for (const float temperature : {tiny, 0.01f, 1.0f, 10.0f, 1e4f}) {
     SamplingParams p = with_temperature(temperature);
     p.top_k = 1;
     Sampler sampler(p);
@@ -234,6 +261,11 @@ TEST_CASE("top_k = 1 is greedy regardless of temperature") {
       }
     }
   }
+  // Logits around 30 at a subnormal temperature: all three overflow to +inf.
+  SamplingParams p = with_temperature(1e-38f);
+  p.top_k = 1;
+  Sampler sampler(p);
+  CHECK(sample_copy(sampler, {29.0f, 30.0f, 28.5f}) == 1);
 }
 
 // --- determinism ------------------------------------------------------------
