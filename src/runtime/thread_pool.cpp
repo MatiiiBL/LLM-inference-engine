@@ -30,10 +30,14 @@
 // unfinished chunk the job cannot complete, so the fields cannot change
 // under it. Whichever job a claim lands in, the fields it then reads are
 // that job's: a worker woken late for one job may well help with the next.
-// A claim that comes back empty touches nothing else. The two sleep
-// handshakes — ticket / sleeping, and done / caller_sleeping — are seq_cst,
-// so of a sleeper and its waker at least one sees the other's store: no
-// wakeup is lost.
+// A claim that comes back empty touches nothing else. Everything a chunk
+// does — its body, storing the first exception, destroying any other — comes
+// before its fetch_add on `done`. Those increments are all read-modify-writes,
+// so the caller's load that sees `done` reach the chunk count synchronizes
+// with every one of them, and sees all of it. The two sleep handshakes —
+// ticket / sleeping, and done / caller_sleeping — are seq_cst, so of a
+// sleeper and its waker at least one sees the other's store: no wakeup is
+// lost.
 
 #include <algorithm>
 #include <atomic>
@@ -156,9 +160,10 @@ struct ThreadPool::Impl {
 
   // Stops and joins the workers. Lives here rather than in ~ThreadPool so a
   // constructor that fails halfway through starting threads still joins the
-  // ones it did start.
+  // ones it did start. Only started workers are sent a stop ticket, so a
+  // constructor that failed to allocate the slots has no slot to touch.
   ~Impl() {
-    for (int w = 0; w + 1 < n_threads; ++w) give_ticket(slots[w], kStop);
+    for (std::size_t w = 0; w < workers.size(); ++w) give_ticket(slots[w], kStop);
     for (std::thread& t : workers) t.join();
   }
 
@@ -195,9 +200,14 @@ struct ThreadPool::Impl {
       // until the done.fetch_add below. Read everything needed before it.
       const std::int64_t total = chunks;
       const std::int64_t c = total - left;
-      std::exception_ptr e =
-          run_chunk(*body, chunk_begin(n, total, c), chunk_begin(n, total, c + 1));
-      if (e && !failed.exchange(true, std::memory_order_relaxed)) error = std::move(e);
+      {
+        std::exception_ptr e =
+            run_chunk(*body, chunk_begin(n, total, c), chunk_begin(n, total, c + 1));
+        if (e && !failed.exchange(true, std::memory_order_relaxed)) error = std::move(e);
+        // An exception that lost to another chunk's is destroyed here. Its
+        // destructor may touch anything the caller owns, so it has to be
+        // over before the chunk counts as done and parallel_for can return.
+      }
       if (done.fetch_add(1) + 1 == total && caller_sleeping.load()) {
         { std::lock_guard<std::mutex> lock(done_mu); }
         done_cv.notify_one();

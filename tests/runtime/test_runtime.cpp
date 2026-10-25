@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <new>
 #include <set>
 #include <stdexcept>
@@ -249,6 +250,13 @@ TEST_CASE("a pool of size 1 starts no threads and runs everything inline") {
 }
 
 TEST_CASE("threads are started once, in the constructor, and reused") {
+  // Thread ids cannot show this on their own: the OS may give a joined
+  // thread's id to the next thread started, so a pool that started and
+  // joined a thread in every call would still show no more than size() ids.
+  // So every call also asks the OS how many threads the process has, from
+  // inside the bodies while all size() items are running at once, and that
+  // must be the count right after construction.
+  using clock = std::chrono::steady_clock;
   std::thread([] {}).join();  // start any thread a sanitizer runtime starts lazily
   for (const int threads : {2, 3, 8}) {
     CAPTURE(threads);
@@ -258,20 +266,30 @@ TEST_CASE("threads are started once, in the constructor, and reused") {
 
     std::set<std::thread::id> seen;
     std::vector<std::thread::id> slot(static_cast<std::size_t>(threads));
+    std::vector<int> during(static_cast<std::size_t>(threads));
+    int miscounted = 0;  // samples taken during a call that differ from `started`
     for (int call = 0; call < 200; ++call) {
+      std::atomic<int> arrived{0};
       pool.parallel_for(threads, [&](Index begin, Index end) {
         for (Index i = begin; i < end; ++i) {
           slot[static_cast<std::size_t>(i)] = std::this_thread::get_id();
+          // Sample only once every item has started, so that every thread
+          // the call runs on is alive, and running, at that moment.
+          arrived.fetch_add(1);
+          const auto deadline = clock::now() + std::chrono::seconds(10);
+          while (arrived.load() < threads && clock::now() < deadline) std::this_thread::yield();
+          during[static_cast<std::size_t>(i)] = os_thread_count();
         }
       });
       seen.insert(slot.begin(), slot.end());
+      miscounted += static_cast<int>(threads - std::count(during.begin(), during.end(), started));
     }
-    // Bounded by size(): the same threads every time. (Chunks are claimed,
-    // so which of them ran any given call — the caller included — varies.)
+    // Bounded by size(): the same threads every time, as far as ids can tell.
     CHECK(seen.size() <= static_cast<std::size_t>(threads));
 
     if (before >= 0) {
       CHECK(started == before + threads - 1);
+      CHECK(miscounted == 0);
       CHECK(settled_thread_count() == started);
     }
   }
@@ -334,6 +352,54 @@ TEST_CASE("when several chunks throw, exactly one exception is rethrown") {
   const std::set<std::string> any{"chunk 0", "chunk 1", "chunk 2", "chunk 3"};
   CHECK(any.count(what) == 1);
   check_cover(pool, 1000, 1);
+}
+
+TEST_CASE("dropped exceptions are destroyed before parallel_for returns") {
+  // A dropped exception is destroyed on the thread that ran its chunk. As
+  // soon as parallel_for returns the caller may use, or free, whatever that
+  // destructor touches, so it has to be over by then. Here it marks a slot
+  // in a buffer the caller checks and frees right away: a destructor that
+  // runs late leaves a slot unmarked, and is a data race under TSan and a
+  // use-after-free under ASan.
+  using clock = std::chrono::steady_clock;
+  constexpr int threads = 4;
+  const std::thread::id caller = std::this_thread::get_id();
+  struct Marker {
+    int* slot;
+    std::thread::id caller;
+    ~Marker() {
+      // Slow off the calling thread, so that a destructor that starts after
+      // its chunk was counted as finished is still running when the caller
+      // looks.
+      if (std::this_thread::get_id() != caller) {
+        std::this_thread::sleep_for(std::chrono::microseconds(500));
+      }
+      *slot = 1;
+    }
+  };
+
+  ThreadPool pool(threads);
+  int unmarked = 0;
+  for (int call = 0; call < 100; ++call) {
+    auto destroyed = std::make_unique<int[]>(threads);  // all 0
+    std::atomic<int> arrived{0};
+    try {
+      pool.parallel_for(threads, [&](Index begin, Index) {
+        // Each chunk waits for the others to start, so each runs on its own
+        // thread and at least two of the exceptions are dropped on workers.
+        arrived.fetch_add(1);
+        const auto deadline = clock::now() + std::chrono::seconds(10);
+        while (arrived.load() < threads && clock::now() < deadline) std::this_thread::yield();
+        throw Marker{&destroyed[static_cast<std::size_t>(begin)], caller};
+      });
+    } catch (const Marker&) {
+      // The rethrown one is destroyed here, on the calling thread.
+    }
+    unmarked +=
+        static_cast<int>(threads - std::count(destroyed.get(), destroyed.get() + threads, 1));
+    destroyed.reset();
+  }
+  CHECK(unmarked == 0);
 }
 
 TEST_CASE("exceptions of any type propagate, inline or not") {
@@ -659,11 +725,17 @@ TEST_CASE("Arena::tensor validates before allocating") {
   // 2^62 elements: numel * 4 would wrap a 64-bit size_t to 0.
   CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 30, std::int64_t{1} << 30, 4}),
                   std::bad_alloc);
+  // 2^124 elements: even the element count overflows.
+  CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 62, std::int64_t{1} << 62}), std::bad_alloc);
   CHECK(arena.used() == 10);
+  // A zero extent makes the tensor empty however large the others are.
+  CHECK(arena.tensor({std::int64_t{1} << 62, 0, std::int64_t{1} << 62}).numel() == 0);
 }
 
-TEST_CASE("Arena memory is poisoned after reset (ASan builds)") {
+// Only an ASan build poisons arena memory, so only an ASan build has this
+// test. Elsewhere there is nothing to check, and so nothing skipped.
 #ifdef MINILLM_TEST_ASAN
+TEST_CASE("Arena memory is poisoned after reset (ASan builds)") {
   Arena arena(4096);
   auto* p = static_cast<unsigned char*>(arena.allocate(64));
   CHECK_FALSE(__asan_address_is_poisoned(p));
@@ -683,11 +755,8 @@ TEST_CASE("Arena memory is poisoned after reset (ASan builds)") {
   auto* q = static_cast<unsigned char*>(arena.allocate(64));
   CHECK(q == p);
   CHECK_FALSE(__asan_address_is_poisoned(q));
-#else
-  note_skip("runtime: arena poisoning is only checked in an ASan build (the asan preset)");
-  MESSAGE("SKIP: arena poisoning is only checked in an ASan build");
-#endif
 }
+#endif
 
 TEST_CASE("arena scratch can be filled by a thread pool") {
   // How the engine uses the two together: one arena per pass, owned by the

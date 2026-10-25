@@ -2,9 +2,12 @@
 //
 // One block reserved up front and a byte offset into it. allocate() pads the
 // offset up to the requested alignment and bumps it; reset() sets it back to
-// zero. The block itself is aligned to kBaseAlign, so the padding — and with
-// it used() and peak() — depends only on the sequence of requests, never on
-// where the system allocator happened to put the block.
+// zero. The block itself is aligned to kBaseAlign, so as long as no request
+// asks for more than that, the padding — and with it used() and peak() —
+// depends only on the sequence of requests, never on where the system
+// allocator happened to put the block. A request aligned more strictly pads
+// up to the next such boundary in memory, and how far that is does depend
+// on where the block landed.
 //
 // Under AddressSanitizer everything not currently handed out is poisoned, so
 // reading a view after reset() or running off the end of an allocation is
@@ -125,17 +128,25 @@ Tensor Arena::tensor(const Shape& shape, DType dtype) {
     throw std::invalid_argument("Arena::tensor: rank must be 1.." + std::to_string(kMaxDims) +
                                 ", got 0");
   }
+  bool empty = false;
   for (int i = 0; i < shape.ndim(); ++i) {
     if (shape[i] < 0) {
       throw std::invalid_argument("Arena::tensor: negative extent in shape " + shape.to_string());
     }
+    empty = empty || shape[i] == 0;
   }
-  // Checked before multiplying, so numel * esize cannot wrap.
-  const auto numel = static_cast<std::size_t>(shape.numel());
-  if (numel > impl_->capacity / esize) {
-    impl_->exhausted(std::string("tensor ") + dtype_name(dtype) + shape.to_string());
+  // The byte count is multiplied out here, checking every step, rather than
+  // taken from shape.numel(), which does not check: a shape too large even to
+  // count is one more request the arena cannot satisfy. A zero extent makes
+  // the tensor empty, however large the others are.
+  std::size_t bytes = empty ? 0 : esize;
+  for (int i = 0; i < shape.ndim() && !empty; ++i) {
+    if (__builtin_mul_overflow(bytes, static_cast<std::size_t>(shape[i]), &bytes) ||
+        bytes > impl_->capacity) {
+      impl_->exhausted(std::string("tensor ") + dtype_name(dtype) + shape.to_string());
+    }
   }
-  return Tensor::wrap(allocate(numel * esize), shape, dtype);
+  return Tensor::wrap(allocate(bytes), shape, dtype);
 }
 
 void Arena::reset() {
