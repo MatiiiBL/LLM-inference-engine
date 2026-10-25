@@ -1,0 +1,11 @@
+# Oracle generator dependencies.
+#
+# Lower bounds, not pins: the generator adapts to the installed transformers
+# (the RoPE import path and signatures moved between releases) and records the
+# versions it actually used in oracle/data/manifest.json. If a golden file ever
+# looks wrong, check that field first.
+torch>=2.2
+transformers>=4.40
+huggingface_hub>=0.23
+safetensors>=0.4
+numpy>=1.24

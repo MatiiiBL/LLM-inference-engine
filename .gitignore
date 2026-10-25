@@ -1,0 +1,33 @@
+# Build trees (one per preset)
+/build/
+compile_commands.json
+
+# Generated golden data — reproducible with `python oracle/generate.py`,
+# far too large to commit.
+/oracle/data/
+
+# Downloaded checkpoints
+/models/*
+!/models/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+/.venv/
+/oracle/.venv/
+
+# Personal Claude Code config (worktree.symlinkDirectories, so agent
+# worktrees can see the local-only docs/ below)
+/.claude/settings.local.json
+
+# Local-only: the workflow briefs and architecture notes are not shared.
+# Agent worktrees get them via worktree.symlinkDirectories, NOT via git —
+# untracked files never appear in a new worktree on their own.
+docs/
+
+# Editors / OS
+.vscode/
+.idea/
+.cache/
+.DS_Store
+*.swp
