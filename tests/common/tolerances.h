@@ -100,7 +100,7 @@ inline constexpr Tolerance kProjection{1e-4, 1e-5};
 /// Measured on the model/ prompts (release; asan gives the same numbers):
 ///   p0,  5 tokens: max abs 2.0e-2 (state 29, an element of 3212), max rel
 ///                  0.12; worst element uses 12% of this bound (state 11)
-///   p1,  6 tokens: max abs 1.2e-2 (state 29), max rel 0.24; 14% (state 30)
+///   p1,  6 tokens: max abs 1.2e-2 (state 29), max rel 0.24; 14% (state 10)
 ///   p2, 15 tokens: max abs 6.8e-3 (state 29), max rel 0.46; 34% (state 29,
 ///                  an error of 2.1e-3 on an element of 1.5 in row 0)
 /// The max rels come from elements near zero. The error does not grow with
