@@ -314,12 +314,21 @@ double time_sample(const std::function<void()>& fn, std::int64_t calls) {
 }
 
 /// One of several functions timed against each other: `call` is what is
-/// timed, `setup` runs untimed before each of its samples (it selects the
-/// kernel thread count).
+/// timed, `setup` runs untimed before each of its samples. It selects the
+/// kernel thread count, and returns true if that resized the pool.
 struct Contender {
-  std::function<void()> setup;
+  std::function<bool()> setup;
   std::function<void()> call;
 };
+
+/// A setup that runs `ops::` at `threads` kernel threads.
+std::function<bool()> use_threads(int threads) {
+  return [threads] {
+    const bool resized = num_threads() != threads;
+    set_num_threads(threads);
+    return resized;
+  };
+}
 
 /// Seconds per call of each contender, one value per round.
 using Rounds = std::vector<std::vector<double>>;
@@ -340,8 +349,8 @@ std::vector<Timing> time_round_robin(const std::vector<Contender>& contenders, c
   rounds.assign(contenders.size(), {});
   for (int s = 0; s < opt.samples; ++s) {
     for (std::size_t i = 0; i < contenders.size(); ++i) {
-      contenders[i].setup();
-      contenders[i].call();  // a resized pool's threads have not run yet
+      // A resized pool's threads have not run anything yet.
+      if (contenders[i].setup()) contenders[i].call();
       rounds[i].push_back(time_sample(contenders[i].call, calls[i]));
     }
   }
@@ -644,9 +653,9 @@ int run_op_benches(const ModelConfig& cfg, const Options& opt, Report& report) {
   std::fflush(stdout);
   for (const OpBench& b : benches) {
     std::vector<Contender> contenders;
-    contenders.push_back({[] {}, [&] { b.run(kRef); }});
+    contenders.push_back({[] { return false; }, [&] { b.run(kRef); }});
     for (const int threads : opt.threads) {
-      contenders.push_back({[threads] { set_num_threads(threads); }, [&] { b.run(kOps); }});
+      contenders.push_back({use_threads(threads), [&] { b.run(kOps); }});
     }
     Rounds rounds;
     const std::vector<Timing> t = time_round_robin(contenders, opt, rounds);
