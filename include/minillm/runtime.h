@@ -109,7 +109,8 @@ class Arena {
 /// Number of threads the optimized kernels in minillm::ops may use, counting
 /// the calling thread. n <= 0 means std::thread::hardware_concurrency() (at
 /// least 1); 1 runs every kernel inline. Blocks until no kernel is running,
-/// then resizes the process-wide pool. Default: 0.
+/// then resizes the process-wide pool. Default: 0. Throws std::logic_error if
+/// called from inside a parallel_for body.
 void set_num_threads(int n);
 
 /// The resolved setting: always >= 1.

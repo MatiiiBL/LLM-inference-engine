@@ -14,12 +14,10 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -29,9 +27,9 @@
 #include "common/allclose.h"
 #include "common/oracle.h"
 #include "common/random.h"
+#include "common/thread_invariant.h"
 #include "minillm/kv_cache.h"
 #include "minillm/ops.h"
-#include "minillm/runtime.h"
 
 using namespace minillm;
 using namespace minillm::test;
@@ -46,44 +44,6 @@ Tensor nan_filled(const Shape& shape) {
   float* p = t.f32();
   for (std::int64_t i = 0; i < t.numel(); ++i) p[i] = std::numeric_limits<float>::quiet_NaN();
   return t;
-}
-
-/// The kernel thread counts the threaded path is checked at. 10 is the
-/// development machine's hardware_concurrency(); on a smaller machine it
-/// oversubscribes, which exercises the split just as well.
-constexpr int kThreadCounts[] = {1, 2, 3, 4, 10};
-
-/// Calls run() at threads = 1, then at every other count in kThreadCounts,
-/// and checks that each result is bitwise identical to the 1-thread one,
-/// which it returns. Restores the thread count, pass or fail.
-Tensor check_thread_invariant(const std::string& label, const std::function<Tensor()>& run) {
-  struct Restore {
-    int threads;
-    ~Restore() { set_num_threads(threads); }
-  } restore{num_threads()};
-  const auto exact = [](float v) {
-    char buf[32];
-    std::snprintf(buf, sizeof buf, "%.9g", static_cast<double>(v));
-    return std::string(buf);
-  };
-  set_num_threads(1);
-  Tensor single = run();
-  for (const int threads : kThreadCounts) {
-    if (threads == 1) continue;
-    set_num_threads(threads);
-    const Tensor multi = run();
-    REQUIRE(multi.shape() == single.shape());
-    const float* a = multi.f32();
-    const float* b = single.f32();
-    for (std::int64_t i = 0; i < single.numel(); ++i) {
-      if (std::memcmp(&a[i], &b[i], sizeof(float)) != 0) {
-        FAIL_CHECK(label << ": threads = " << threads << " differs from threads = 1 at index "
-                         << i << ": " << exact(a[i]) << " vs " << exact(b[i]));
-        break;
-      }
-    }
-  }
-  return single;
 }
 
 
