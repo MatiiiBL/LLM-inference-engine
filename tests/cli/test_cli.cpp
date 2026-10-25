@@ -46,6 +46,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "../../src/cli/args.h"
@@ -550,26 +551,33 @@ struct EndToEnd {
   std::array<RunResult, 3> oracle;  ///< kOraclePrompts, as many tokens as the oracle, --ignore-eos
   RunResult stop_at_eos;            ///< kOraclePrompts[1] again, stopping at eos
   RunResult multibyte;              ///< kMultiBytePrompt
-  /// kOraclePrompts[0] again, at each of kThreadCounts; `oracle` runs at the default.
-  std::array<RunResult, 2> threads;
+  RunResult threaded;               ///< kOraclePrompts[0] again, at threaded_count()
 };
 
-constexpr std::array<int, 2> kThreadCounts = {1, 4};
-
 std::vector<std::string> greedy_args(std::string_view prompt, std::size_t max_tokens,
-                                     bool ignore_eos) {
+                                     bool ignore_eos, int threads) {
   std::vector<std::string> args = {"--model",       checkpoint_dir().string(),
                                    "--prompt",      std::string(prompt),
                                    "--max-tokens",  std::to_string(max_tokens),
                                    "--temperature", "0",
+                                   "--threads",     std::to_string(threads),
                                    "--print-ids"};
   if (ignore_eos) args.emplace_back("--ignore-eos");
   return args;
 }
 
-/// Runs every end-to-end invocation the first time a test asks for one, all
-/// at once in parallel: each is a full model load plus a few dozen decode
-/// steps, and they are independent.
+/// The --threads of the one multi-threaded run: several threads, but never
+/// more than the machine has, so that run has the cores to itself.
+int threaded_count() {
+  return static_cast<int>(std::min(4u, std::max(2u, std::thread::hardware_concurrency())));
+}
+
+/// Runs every end-to-end invocation the first time a test asks for one. Each
+/// is a full model load plus a few dozen decode steps, and they are
+/// independent, so they run all at once in parallel, one kernel thread each:
+/// several processes that each spread every op over all the cores would
+/// mostly wait for one another's threads to be scheduled. Then, alone, one
+/// run with several kernel threads.
 const EndToEnd& end_to_end() {
   static const EndToEnd e2e = [] {
     EndToEnd r;
@@ -606,24 +614,20 @@ const EndToEnd& end_to_end() {
     // The oracle never stops early, so --ignore-eos to match it token for token.
     std::vector<Child> children;
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) {
-      children.push_back(spawn(cli_exe(), greedy_args(kOraclePrompts[i], n_oracle[i], true)));
+      children.push_back(spawn(cli_exe(), greedy_args(kOraclePrompts[i], n_oracle[i], true, 1)));
     }
-    children.push_back(spawn(cli_exe(), greedy_args(kOraclePrompts[1], n_oracle[1], false)));
-    children.push_back(spawn(cli_exe(), greedy_args(kMultiBytePrompt, kMultiByteTokens, false)));
-    for (const int threads : kThreadCounts) {
-      std::vector<std::string> args = greedy_args(kOraclePrompts[0], n_oracle[0], true);
-      args.insert(args.end(), {"--threads", std::to_string(threads)});
-      children.push_back(spawn(cli_exe(), args));
-    }
+    children.push_back(spawn(cli_exe(), greedy_args(kOraclePrompts[1], n_oracle[1], false, 1)));
+    children.push_back(
+        spawn(cli_exe(), greedy_args(kMultiBytePrompt, kMultiByteTokens, false, 1)));
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) r.oracle[i] = wait_for(children[i]);
     r.stop_at_eos = wait_for(children[3]);
     r.multibyte = wait_for(children[4]);
-    for (std::size_t i = 0; i < kThreadCounts.size(); ++i) r.threads[i] = wait_for(children[5 + i]);
+    r.threaded = run_cli(greedy_args(kOraclePrompts[0], n_oracle[0], true, threaded_count()));
 
     // Until every module the binary uses is implemented, it stops at the
     // first stub it reaches and says so.
     for (const RunResult* run : {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos,
-                                 &r.multibyte, &r.threads[0], &r.threads[1]}) {
+                                 &r.multibyte, &r.threaded}) {
       if (run->exit_code != 0 && contains(run->err, "not implemented")) {
         r.skip_reason =
             "the engine is incomplete — " + line_containing(run->err, "not implemented");
@@ -1402,15 +1406,18 @@ TEST_CASE("end to end: --threads sizes the pool and leaves greedy output unchang
   const EndToEnd* e2e = e2e_or_skip();
   if (!e2e) return;
   const std::vector<std::int32_t> oracle = oracle_npy("model/p0_greedy_ids.npy").as_i32_narrowing();
-  for (std::size_t i = 0; i < kThreadCounts.size(); ++i) {
-    const std::string threads = std::to_string(kThreadCounts[i]);
-    const RunResult& run = e2e->threads[i];
+  struct Run {
+    const RunResult* run;
+    int threads;
+  };
+  for (const Run& r : {Run{&e2e->oracle[0], 1}, Run{&e2e->threaded, threaded_count()}}) {
+    const std::string threads = std::to_string(r.threads);
     CAPTURE(threads);
     // The load banner reports num_threads(), which only set_num_threads changes.
-    CHECK(contains(line_containing(run.err, "minillm: loaded "), "; " + threads + " thread(s)"));
-    assert_equal(generated_ids(run), oracle, "prompt 0 greedy ids at --threads " + threads);
-    CHECK(run.out == e2e->oracle[0].out);
+    CHECK(contains(line_containing(r.run->err, "minillm: loaded "), "; " + threads + " thread(s)"));
+    assert_equal(generated_ids(*r.run), oracle, "prompt 0 greedy ids at --threads " + threads);
   }
+  CHECK(e2e->threaded.out == e2e->oracle[0].out);
 }
 
 TEST_CASE("end to end: generation stops at eos, which is neither printed nor counted") {
