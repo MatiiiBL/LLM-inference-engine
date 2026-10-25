@@ -125,11 +125,16 @@ double uniform01(std::mt19937_64& rng) {
 }  // namespace
 
 void SamplingParams::validate() const {
+  // A NaN temperature makes every logit NaN; an infinite one or an infinite
+  // penalty can still make one (inf / inf, 0 * inf).
+  if (!std::isfinite(temperature)) {
+    fail("temperature must be finite, got " + format_float(temperature));
+  }
   if (top_k < 0) fail("top_k must be >= 0, got " + std::to_string(top_k));
-  // Negated comparisons so that NaN is rejected too.
+  // Negated comparison so that NaN is rejected too.
   if (!(top_p > 0.0f)) fail("top_p must be > 0, got " + format_float(top_p));
-  if (!(repetition_penalty > 0.0f)) {
-    fail("repetition_penalty must be > 0, got " + format_float(repetition_penalty));
+  if (!std::isfinite(repetition_penalty) || repetition_penalty <= 0.0f) {
+    fail("repetition_penalty must be finite and > 0, got " + format_float(repetition_penalty));
   }
 }
 
@@ -157,10 +162,15 @@ std::int32_t Sampler::sample(std::span<float> logits, std::span<const std::int32
   }
   if (params_.temperature <= 0.0f) return argmax(logits);
 
-  // 2. Temperature. A NaN logit becomes -inf, an impossible token, so that
-  // every ordering below is a strict total order.
+  // 2. Temperature, finite and > 0 here: the constructor validated params_.
+  // A NaN logit becomes -inf, an impossible token, so that every ordering
+  // below is a strict total order. Top-1 cannot depend on the temperature,
+  // but dividing by a tiny one can overflow distinct logits into a tie at
+  // +inf that the lowest id would win, so top_k = 1 leaves the logits as
+  // they are.
+  const float temperature = params_.top_k == 1 ? 1.0f : params_.temperature;
   for (float& v : logits) {
-    v /= params_.temperature;
+    v /= temperature;
     if (std::isnan(v)) v = kNegInf;
   }
 
