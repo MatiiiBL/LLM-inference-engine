@@ -71,14 +71,20 @@ constexpr std::uint64_t kStop = std::numeric_limits<std::uint64_t>::max();
 // True while this thread is running a parallel_for body, on any pool. A
 // nested parallel_for would either deadlock (a worker waiting on itself) or
 // publish a second job over the one in flight, so it is rejected outright.
+// A nested kernel_parallel_for runs inline instead.
 thread_local bool t_in_body = false;
 
+// Restores the previous value rather than clearing it: kernel_parallel_for
+// runs nested bodies inline, inside the outer body's scope.
 class BodyScope {
  public:
-  BodyScope() { t_in_body = true; }
-  ~BodyScope() { t_in_body = false; }
+  BodyScope() : outer_(t_in_body) { t_in_body = true; }
+  ~BodyScope() { t_in_body = outer_; }
   BodyScope(const BodyScope&) = delete;
   BodyScope& operator=(const BodyScope&) = delete;
+
+ private:
+  bool outer_;
 };
 
 /// Start of chunk `i` when [0, n) is cut into `chunks` contiguous pieces whose
@@ -303,5 +309,91 @@ void ThreadPool::parallel_for(std::int64_t n, std::int64_t grain, const Body& bo
 }
 
 void ThreadPool::parallel_for(std::int64_t n, const Body& body) { parallel_for(n, 1, body); }
+
+// ---------------------------------------------------------------------------
+// The process-wide pool behind kernel_parallel_for
+//
+// ThreadPool::parallel_for may be entered by one thread at a time and never
+// from inside a body, while ops.h promises that ops are safe to call
+// concurrently. A mutex bridges the two: a kernel try-locks it and, if it is
+// taken — another kernel holds the pool, or set_num_threads is swapping it —
+// runs its whole range inline. Kernels never wait for one another, so they
+// cannot deadlock, and set_num_threads, which does lock it, waits only for
+// the one kernel that holds it.
+//
+// A call from inside a body runs inline without touching the mutex at all:
+// on the thread that holds it, try_lock would be undefined behaviour.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+int resolve_threads(int n) {
+  if (n > 0) return n;
+  return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+}
+
+struct KernelPool {
+  std::mutex mu;  // held by the kernel using `pool`, or by set_num_threads
+  std::unique_ptr<ThreadPool> pool;  // under `mu`; null until first needed, or at 1 thread
+  std::atomic<int> threads{resolve_threads(0)};  // written under `mu`
+};
+
+// Never destroyed, so a kernel called from another static's destructor still
+// finds it. Its workers are blocked on a condition variable at exit.
+KernelPool& kernel_pool() {
+  static KernelPool* const kp = new KernelPool;
+  return *kp;
+}
+
+void run_inline(std::int64_t n, const Body& body) {
+  BodyScope scope;
+  body(0, n);
+}
+
+}  // namespace
+
+void set_num_threads(int n) {
+  if (t_in_body) {
+    // The kernel this body belongs to holds the mutex and is waiting on the
+    // body: locking it here could never succeed.
+    throw std::logic_error("set_num_threads: called from inside a parallel_for body");
+  }
+  const int threads = resolve_threads(n);
+  KernelPool& kp = kernel_pool();
+  const std::lock_guard<std::mutex> lock(kp.mu);
+  if (threads == kp.threads.load(std::memory_order_relaxed)) return;
+  kp.pool.reset();
+  if (threads > 1) kp.pool = std::make_unique<ThreadPool>(threads);
+  kp.threads.store(threads, std::memory_order_relaxed);
+}
+
+int num_threads() { return kernel_pool().threads.load(std::memory_order_relaxed); }
+
+void kernel_parallel_for(std::int64_t n, std::int64_t grain, const Body& body) {
+  if (n < 0) {
+    throw std::invalid_argument("kernel_parallel_for: n must be >= 0, got " + std::to_string(n));
+  }
+  if (n == 0) return;
+  KernelPool& kp = kernel_pool();
+  // What ThreadPool::parallel_for would run inline anyway, decided here so
+  // that small calls never touch the mutex.
+  if (t_in_body || n / std::max<std::int64_t>(grain, 1) <= 1 ||
+      kp.threads.load(std::memory_order_relaxed) == 1) {
+    run_inline(n, body);
+    return;
+  }
+  std::unique_lock<std::mutex> lock(kp.mu, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    run_inline(n, body);
+    return;
+  }
+  const int threads = kp.threads.load(std::memory_order_relaxed);
+  if (threads == 1) {
+    run_inline(n, body);
+    return;
+  }
+  if (kp.pool == nullptr) kp.pool = std::make_unique<ThreadPool>(threads);
+  kp.pool->parallel_for(n, grain, body);
+}
 
 }  // namespace minillm

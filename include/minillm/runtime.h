@@ -106,6 +106,21 @@ class Arena {
   std::unique_ptr<Impl> impl_;
 };
 
+/// Number of threads the optimized kernels in minillm::ops may use, counting
+/// the calling thread. n <= 0 means std::thread::hardware_concurrency() (at
+/// least 1); 1 runs every kernel inline. Blocks until no kernel is running,
+/// then resizes the process-wide pool. Default: 0.
+void set_num_threads(int n);
+
+/// The resolved setting: always >= 1.
+int num_threads();
+
+/// ThreadPool::parallel_for on the process-wide pool, for kernels. Safe to
+/// call from any thread, concurrently, and from inside a body: if the pool is
+/// busy, the whole range runs inline on the calling thread instead.
+void kernel_parallel_for(std::int64_t n, std::int64_t grain,
+                         const std::function<void(std::int64_t begin, std::int64_t end)>& body);
+
 }  // namespace minillm
 
 #endif  // MINILLM_RUNTIME_H

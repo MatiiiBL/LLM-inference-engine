@@ -9,11 +9,13 @@
 //     the speedup of each optimization is visible and attributable
 //   * prefill and decode tokens/s for the whole model
 //   * peak resident memory
+// each at one or more kernel thread counts (--threads), so the scaling of the
+// threaded kernels is measured the same way as their speedup over ref::.
 //
 // Each measurement prints a row of a human-readable table as it finishes, and
 // the run ends with one machine-readable line per measurement:
 //
-//   BENCH {"name":"op.prefill.matmul.q_proj.ops","value":812.4,"unit":"us",...}
+//   BENCH {"name":"op.prefill.matmul.q_proj.ops","threads":4,"value":812.4,"unit":"us",...}
 //
 // The README section "Reading the benchmark output" explains both.
 //
@@ -47,6 +49,7 @@
 #include "minillm/config.h"
 #include "minillm/model.h"
 #include "minillm/ops.h"
+#include "minillm/runtime.h"
 #include "minillm/tensor.h"
 
 // Numbers from a sanitizer build are meaningless, and quoting them is worse
@@ -70,6 +73,9 @@ using Clock = std::chrono::steady_clock;
 
 constexpr int kExitError = 1;
 constexpr int kExitNoModel = 2;
+
+/// --threads beyond this is a typo, not an experiment.
+constexpr std::int64_t kMaxThreads = 1024;
 
 /// Why this binary's numbers would be meaningless, or nullptr for a release
 /// build.
@@ -105,6 +111,8 @@ struct Options {
   double warmup_s = 0.05;
   std::int64_t prompt_tokens = 128;
   std::int64_t decode_tokens = 64;
+  /// Kernel thread counts, resolved by set_num_threads, without duplicates.
+  std::vector<int> threads;
   bool allow_debug_build = false;
 };
 
@@ -125,6 +133,9 @@ options:
   --min-time-ms MS      minimum duration of one op sample (default: 50)
   --prompt-tokens N     prefill length (default: 128)
   --decode-tokens N     tokens generated after the prompt (default: 64)
+  --threads N[,N...]    kernel thread counts; 0 is the engine's default. With
+                        several, every measurement is taken at each count,
+                        samples interleaved (default: 0)
   --allow-debug-build   run even from a sanitizer or unoptimized build, to
                         smoke-test this program; its numbers are meaningless
   -h, --help            this text
@@ -166,11 +177,33 @@ std::optional<int> parse_options(int argc, char** argv, Options& opt) {
       opt.prompt_tokens = parse_int(arg, value(), 1);
     } else if (arg == "--decode-tokens") {
       opt.decode_tokens = parse_int(arg, value(), 1);
+    } else if (arg == "--threads") {
+      opt.threads.clear();
+      std::string_view list = value();
+      for (;;) {
+        const std::size_t comma = list.find(',');
+        const std::string item(list.substr(0, comma));
+        const std::int64_t n = parse_int(arg, item.c_str(), 0);
+        if (n > kMaxThreads) {
+          throw std::invalid_argument(std::string(arg) + " allows at most " +
+                                      std::to_string(kMaxThreads) + " threads, got " + item);
+        }
+        set_num_threads(static_cast<int>(n));
+        if (std::find(opt.threads.begin(), opt.threads.end(), num_threads()) == opt.threads.end()) {
+          opt.threads.push_back(num_threads());
+        }
+        if (comma == std::string_view::npos) break;
+        list.remove_prefix(comma + 1);
+      }
     } else if (arg == "--allow-debug-build") {
       opt.allow_debug_build = true;
     } else {
       throw std::invalid_argument("unknown option '" + std::string(arg) + "' (see --help)");
     }
+  }
+  if (opt.threads.empty()) {
+    set_num_threads(0);
+    opt.threads.push_back(num_threads());
   }
   return std::nullopt;
 }
@@ -280,37 +313,54 @@ double time_sample(const std::function<void()>& fn, std::int64_t calls) {
   return seconds_since(start) / static_cast<double>(calls);
 }
 
-/// Two functions timed against each other.
-struct Comparison {
-  Timing a;
-  Timing b;
-  Stats speedup;  ///< b / a for each interleaved pair of samples
+/// One of several functions timed against each other: `call` is what is
+/// timed, `setup` runs untimed before each of its samples (it selects the
+/// kernel thread count).
+struct Contender {
+  std::function<void()> setup;
+  std::function<void()> call;
 };
 
-/// Times two functions with their samples interleaved, a b a b ..., and takes
-/// the speedup pair by pair, so that drift in the machine's state — clock
-/// frequency, thermals, a background process — lands on both sides of each
-/// ratio instead of skewing the comparison. Timed back to back instead, two
-/// identical functions differ by up to ~20% on a busy machine.
-Comparison time_interleaved(const std::function<void()>& a, const std::function<void()>& b,
-                            const Options& opt) {
-  const std::int64_t calls_a = calibrate(a, opt);
-  const std::int64_t calls_b = calibrate(b, opt);
-  std::vector<double> per_call_a;
-  std::vector<double> per_call_b;
-  std::vector<double> ratio;
-  for (int s = 0; s < opt.samples; ++s) {
-    per_call_a.push_back(time_sample(a, calls_a));
-    per_call_b.push_back(time_sample(b, calls_b));
-    ratio.push_back(per_call_b.back() / per_call_a.back());
+/// Seconds per call of each contender, one value per round.
+using Rounds = std::vector<std::vector<double>>;
+
+/// Times the contenders with their samples interleaved, a b c a b c ..., so
+/// that drift in the machine's state — clock frequency, thermals, a
+/// background process — lands on every contender of a round instead of
+/// skewing the comparison. Ratios are then taken within each round (see
+/// ratio_stats). Timed back to back instead, two identical functions differ
+/// by up to ~20% on a busy machine.
+std::vector<Timing> time_round_robin(const std::vector<Contender>& contenders, const Options& opt,
+                                     Rounds& rounds) {
+  std::vector<std::int64_t> calls;
+  for (const Contender& c : contenders) {
+    c.setup();
+    calls.push_back(calibrate(c.call, opt));
   }
-  return {Timing{Stats(std::move(per_call_a)), calls_a}, Timing{Stats(std::move(per_call_b)), calls_b},
-          Stats(std::move(ratio))};
+  rounds.assign(contenders.size(), {});
+  for (int s = 0; s < opt.samples; ++s) {
+    for (std::size_t i = 0; i < contenders.size(); ++i) {
+      contenders[i].setup();
+      contenders[i].call();  // a resized pool's threads have not run yet
+      rounds[i].push_back(time_sample(contenders[i].call, calls[i]));
+    }
+  }
+  std::vector<Timing> timings;
+  for (std::size_t i = 0; i < contenders.size(); ++i) timings.push_back({Stats(rounds[i]), calls[i]});
+  return timings;
+}
+
+/// num / den for each round: > 1 means `den` was faster.
+Stats ratio_stats(const std::vector<double>& num, const std::vector<double>& den) {
+  std::vector<double> ratio;
+  for (std::size_t s = 0; s < num.size(); ++s) ratio.push_back(num[s] / den[s]);
+  return Stats(std::move(ratio));
 }
 
 /// One result, as printed on a machine-readable line.
 struct Measurement {
   std::string name;
+  int threads = 1;  ///< kernel thread count it was measured at
   double value = 0.0;
   std::string unit;
   std::int64_t iterations = 0;
@@ -327,13 +377,18 @@ class Report {
   void add(Measurement m) { results_.push_back(std::move(m)); }
 
   /// A value that is not sampled, such as peak RSS.
-  void add_value(std::string name, double value, std::string unit, std::int64_t iterations) {
-    add({std::move(name), value, std::move(unit), iterations, 0, 0.0, 0.0});
+  void add_value(std::string name, int threads, double value, std::string unit,
+                 std::int64_t iterations) {
+    add({std::move(name), threads, value, std::move(unit), iterations, 0, 0.0, 0.0});
   }
 
-  void add_time(std::string name, const Timing& t) {
-    add({std::move(name), t.per_call.median() * 1e6, "us", t.iterations(), t.per_call.count(),
-         t.per_call.min() * 1e6, t.per_call.max() * 1e6});
+  void add_time(std::string name, int threads, const Timing& t) {
+    add({std::move(name), threads, t.per_call.median() * 1e6, "us", t.iterations(),
+         t.per_call.count(), t.per_call.min() * 1e6, t.per_call.max() * 1e6});
+  }
+
+  void add_ratio(std::string name, int threads, const Stats& r) {
+    add({std::move(name), threads, r.median(), "x", r.count(), r.count(), r.min(), r.max()});
   }
 
   void skip(std::string what, std::string why) {
@@ -344,8 +399,9 @@ class Report {
 
   void print_machine_lines() const {
     for (const Measurement& m : results_) {
-      std::string line = "BENCH {\"name\":\"" + m.name + "\"" + strprintf(",\"value\":%.6g", m.value) +
-                         ",\"unit\":\"" + m.unit + "\",\"iterations\":" + std::to_string(m.iterations);
+      std::string line = "BENCH {\"name\":\"" + m.name + "\",\"threads\":" + std::to_string(m.threads) +
+                         strprintf(",\"value\":%.6g", m.value) + ",\"unit\":\"" + m.unit +
+                         "\",\"iterations\":" + std::to_string(m.iterations);
       if (m.samples > 0) {
         line += ",\"samples\":" + std::to_string(m.samples) +
                 strprintf(",\"min\":%.6g,\"max\":%.6g", m.min, m.max);
@@ -570,25 +626,50 @@ int run_op_benches(const ModelConfig& cfg, const Options& opt, Report& report) {
   std::erase_if(benches, [&](const OpBench& b) { return !selected(opt, "op." + b.name); });
   if (benches.empty()) return 0;
 
+  // ref:: never uses the kernel threads; it is timed once per op, in the
+  // same rounds as ops:: at every thread count.
+  const bool scaling = opt.threads.size() > 1;
   std::printf("\n== ops:: vs ref:: — median time per call, +/- = (max - min) / 2 / median, "
-              "speedup = median of ref/ops over interleaved sample pairs ==\n\n");
-  std::printf("%-26s %-26s %10s %6s %9s  %10s %6s %9s  %8s %6s\n", "op", "shape", "ops::", "+/-",
-              "calls", "ref::", "+/-", "calls", "speedup", "+/-");
+              "speedup = median of ref/ops over interleaved samples");
+  if (scaling) {
+    std::printf(", scaling = the same for ops:: at %d thread(s) / ops:: at thr", opt.threads.front());
+  }
+  std::printf(" ==\n\n");
+  std::printf("%-26s %-26s %3s %10s %6s %9s  %10s %6s %9s  %8s %6s", "op", "shape", "thr", "ops::",
+              "+/-", "calls", "ref::", "+/-", "calls", "speedup", "+/-");
+  if (scaling) std::printf("  %8s %6s", "scaling", "+/-");
+  std::printf("\n");
   std::fflush(stdout);
   for (const OpBench& b : benches) {
-    const Comparison c = time_interleaved([&] { b.run(kOps); }, [&] { b.run(kRef); }, opt);
-    std::printf("%-26s %-26s %10s %5.1f%% %9s  %10s %5.1f%% %9s  %7.2fx %5.1f%%\n", b.name.c_str(),
-                b.shape.c_str(), human_time(c.a.per_call.median()).c_str(),
-                c.a.per_call.spread() * 100.0, c.a.calls().c_str(),
-                human_time(c.b.per_call.median()).c_str(), c.b.per_call.spread() * 100.0,
-                c.b.calls().c_str(), c.speedup.median(), c.speedup.spread() * 100.0);
-    std::fflush(stdout);
+    std::vector<Contender> contenders;
+    contenders.push_back({[] {}, [&] { b.run(kRef); }});
+    for (const int threads : opt.threads) {
+      contenders.push_back({[threads] { set_num_threads(threads); }, [&] { b.run(kOps); }});
+    }
+    Rounds rounds;
+    const std::vector<Timing> t = time_round_robin(contenders, opt, rounds);
 
     const std::string name = "op." + b.name;
-    report.add_time(name + ".ops", c.a);
-    report.add_time(name + ".ref", c.b);
-    report.add({name + ".speedup", c.speedup.median(), "x", c.speedup.count(), c.speedup.count(),
-                c.speedup.min(), c.speedup.max()});
+    report.add_time(name + ".ref", 1, t[0]);
+    for (std::size_t i = 1; i < t.size(); ++i) {
+      const int threads = opt.threads[i - 1];
+      const Stats speedup = ratio_stats(rounds[0], rounds[i]);
+      std::printf("%-26s %-26s %3d %10s %5.1f%% %9s  %10s %5.1f%% %9s  %7.2fx %5.1f%%",
+                  b.name.c_str(), b.shape.c_str(), threads,
+                  human_time(t[i].per_call.median()).c_str(), t[i].per_call.spread() * 100.0,
+                  t[i].calls().c_str(), human_time(t[0].per_call.median()).c_str(),
+                  t[0].per_call.spread() * 100.0, t[0].calls().c_str(), speedup.median(),
+                  speedup.spread() * 100.0);
+      report.add_time(name + ".ops", threads, t[i]);
+      report.add_ratio(name + ".speedup", threads, speedup);
+      if (scaling && i > 1) {
+        const Stats scale = ratio_stats(rounds[1], rounds[i]);
+        std::printf("  %7.2fx %5.1f%%", scale.median(), scale.spread() * 100.0);
+        report.add_ratio(name + ".scaling", threads, scale);
+      }
+      std::printf("\n");
+    }
+    std::fflush(stdout);
   }
   return static_cast<int>(benches.size());
 }
@@ -650,38 +731,52 @@ int run_model_benches(const Options& opt, Report& report) {
               static_cast<long long>(opt.prompt_tokens));
   std::fflush(stdout);
 
+  // With several thread counts, the runs are interleaved across them, one
+  // run at each count per round, as the op samples are.
+  const std::size_t n_counts = opt.threads.size();
   double prefill_s = 0.0;
   double decode_s = 0.0;
-  run(prefill_s, decode_s);  // warm-up
-  std::vector<double> prefill_tps;
-  std::vector<double> decode_tps;
-  for (int s = 0; s < opt.samples; ++s) {
-    run(prefill_s, decode_s);
-    prefill_tps.push_back(static_cast<double>(opt.prompt_tokens) / prefill_s);
-    decode_tps.push_back(static_cast<double>(opt.decode_tokens) / decode_s);
+  for (const int threads : opt.threads) {
+    set_num_threads(threads);
+    run(prefill_s, decode_s);  // warm-up
   }
-  const Stats prefill(std::move(prefill_tps));
-  const Stats decode(std::move(decode_tps));
+  std::vector<std::vector<double>> prefill_tps(n_counts);
+  std::vector<std::vector<double>> decode_tps(n_counts);
+  for (int s = 0; s < opt.samples; ++s) {
+    for (std::size_t i = 0; i < n_counts; ++i) {
+      set_num_threads(opt.threads[i]);
+      run(prefill_s, decode_s);
+      prefill_tps[i].push_back(static_cast<double>(opt.prompt_tokens) / prefill_s);
+      decode_tps[i].push_back(static_cast<double>(opt.decode_tokens) / decode_s);
+    }
+  }
   const double rss = peak_rss_mib();
 
-  std::printf("%-26s %14s %6s %14s %14s %5s\n", "", "median", "+/-", "min", "max", "runs");
-  auto row = [&](const std::string& label, const Stats& st) {
-    std::printf("%-26s %8.1f tok/s %5.1f%% %8.1f tok/s %8.1f tok/s %5d\n", label.c_str(), st.median(),
-                st.spread() * 100.0, st.min(), st.max(), st.count());
+  std::printf("%-26s %3s %14s %6s %14s %14s %5s\n", "", "thr", "median", "+/-", "min", "max", "runs");
+  auto row = [&](const std::string& label, int threads, const Stats& st) {
+    std::printf("%-26s %3d %8.1f tok/s %5.1f%% %8.1f tok/s %8.1f tok/s %5d\n", label.c_str(), threads,
+                st.median(), st.spread() * 100.0, st.min(), st.max(), st.count());
   };
-  if (want_prefill) {
-    row("prefill (" + std::to_string(opt.prompt_tokens) + " tokens)", prefill);
-    report.add({"model.prefill", prefill.median(), "tok/s", opt.samples, prefill.count(), prefill.min(),
-                prefill.max()});
+  for (std::size_t i = 0; i < n_counts; ++i) {
+    const int threads = opt.threads[i];
+    const Stats prefill(prefill_tps[i]);
+    const Stats decode(decode_tps[i]);
+    if (want_prefill) {
+      row("prefill (" + std::to_string(opt.prompt_tokens) + " tokens)", threads, prefill);
+      report.add({"model.prefill", threads, prefill.median(), "tok/s", opt.samples, prefill.count(),
+                  prefill.min(), prefill.max()});
+    }
+    if (want_decode) {
+      row("decode (" + std::to_string(opt.decode_tokens) + " tokens)", threads, decode);
+      report.add({"model.decode", threads, decode.median(), "tok/s", opt.samples, decode.count(),
+                  decode.min(), decode.max()});
+    }
   }
-  if (want_decode) {
-    row("decode (" + std::to_string(opt.decode_tokens) + " tokens)", decode);
-    report.add({"model.decode", decode.median(), "tok/s", opt.samples, decode.count(), decode.min(),
-                decode.max()});
-  }
+  // Peak RSS covers the runs at every count; it is filed under the largest.
+  const int most = *std::max_element(opt.threads.begin(), opt.threads.end());
   std::printf("%-26s %8.1f MiB  (load + prefill + decode)\n", "peak RSS", rss);
   std::fflush(stdout);
-  report.add_value("memory.peak_rss.model", rss, "MiB", 1);
+  report.add_value("memory.peak_rss.model", most, rss, "MiB", 1);
   return matched;
 }
 
@@ -693,6 +788,9 @@ int run(const Options& opt) {
   std::printf("minillm_bench — %s, %s, %u hardware threads\n",
               kBuildProblem ? kBuildProblem : "release build", kCompiler,
               std::thread::hardware_concurrency());
+  std::string counts;
+  for (const int threads : opt.threads) counts += (counts.empty() ? "" : ", ") + std::to_string(threads);
+  std::printf("threads kernels run on %s thread(s) (--threads)\n", counts.c_str());
   std::printf("model   %s: %lld layers, hidden %lld, mlp %lld, heads %lld/%lld x %lld, vocab %lld\n",
               opt.model_dir.string().c_str(), static_cast<long long>(cfg.num_hidden_layers),
               static_cast<long long>(cfg.hidden_size), static_cast<long long>(cfg.intermediate_size),
@@ -721,7 +819,8 @@ int run(const Options& opt) {
 
   const double rss = peak_rss_mib();
   std::printf("\npeak RSS of the whole run: %.1f MiB\n", rss);
-  report.add_value("memory.peak_rss.process", rss, "MiB", 1);
+  report.add_value("memory.peak_rss.process", *std::max_element(opt.threads.begin(), opt.threads.end()),
+                   rss, "MiB", 1);
 
   report.print_summary();
   report.print_machine_lines();
