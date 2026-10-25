@@ -5,7 +5,10 @@
 //
 //   minillm::ref — the naive scalar fp32 reference (src/ops_ref/). Obviously
 //                  correct, never optimized, NEVER CHANGED. It is the in-repo
-//                  oracle: every optimized kernel is tested against it.
+//                  oracle: every optimized kernel is tested against it. It
+//                  takes F32 only: where an ops:: function also accepts a Q8_0
+//                  argument, the reference for that case is the same ref::
+//                  function applied to convert_to_f32 of it (loader.h).
 //   minillm::ops — what the engine calls. In Phase 0 each function forwards to
 //                  minillm::ref; later each one is replaced by a fast version.
 //
@@ -38,9 +41,12 @@ namespace minillm::ops {
 
 /// Embedding lookup: out[i, :] = table[ids[i], :]
 ///
-///   table  [vocab_size, hidden_size]  F32
+///   table  [vocab_size, hidden_size]  F32 or Q8_0
 ///   ids    [n_tokens]                 token ids, each in [0, vocab_size)
 ///   out    [n_tokens, hidden_size]    F32, fully overwritten
+///
+/// A Q8_0 table's rows are dequantized (each element q * d, computed in
+/// float): bit for bit ref::embedding(convert_to_f32(table), ids, out).
 ///
 /// Throws std::out_of_range if any id is outside [0, vocab_size).
 void embedding(const Tensor& table, std::span<const std::int32_t> ids, Tensor& out);
@@ -48,9 +54,9 @@ void embedding(const Tensor& table, std::span<const std::int32_t> ids, Tensor& o
 /// Matrix multiply against a transposed weight: out = x · Wᵀ
 ///
 ///   x    [m, k]  F32
-///   w    [n, k]  F32 — Linear weights are stored [out_features, in_features],
-///                      exactly as in the HF checkpoint. Row j of w is the
-///                      weight vector for output feature j.
+///   w    [n, k]  F32 or Q8_0 — Linear weights are stored [out_features,
+///                      in_features], exactly as in the HF checkpoint. Row j
+///                      of w is the weight vector for output feature j.
 ///   out  [m, n]  F32, fully overwritten
 ///
 ///   out[i, j] = sum over p in [0, k) of x[i, p] * w[j, p]
@@ -60,6 +66,11 @@ void embedding(const Tensor& table, std::span<const std::int32_t> ids, Tensor& o
 /// Accumulation is in float. The reference accumulates in source order
 /// (p ascending); optimized versions may reassociate, which is why matmul
 /// tolerances are looser than elementwise ones (see tests/common/tolerances.h).
+///
+/// A Q8_0 w stands for exactly the F32 matrix convert_to_f32(w), whose
+/// elements are q * d computed in float. The result is that matmul,
+/// reassociated: within tol::kMatmul of ref::matmul(x, convert_to_f32(w)).
+/// Activations are never quantized.
 void matmul(const Tensor& x, const Tensor& w, Tensor& out);
 
 /// Root-mean-square layer norm, row-wise over the last dimension:
@@ -169,7 +180,8 @@ namespace minillm::ref {
 
 // The reference implementations. Signatures are identical to minillm::ops
 // above, and so is the documented behaviour — see there for shapes, aliasing
-// rules and formulas. These are naive scalar loops and are never optimized:
+// rules and formulas — except that every argument must be F32: a Q8_0 one
+// throws std::invalid_argument. These are naive scalar loops and are never optimized:
 // they are the oracle the fast kernels are compared against.
 
 void embedding(const Tensor& table, std::span<const std::int32_t> ids, Tensor& out);

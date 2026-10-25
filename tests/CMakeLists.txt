@@ -53,13 +53,15 @@ minillm_add_test(tokenizer
   SOURCES tokenizer/test_tokenizer.cpp
   LIBS minillm_tokenizer)
 
+# norm (which tests ops::embedding) and matmul also link the loader: the
+# reference for a Q8_0 weight is ref:: on convert_to_f32 of it.
 minillm_add_test(norm
   SOURCES norm/test_norm.cpp
-  LIBS minillm_ops)
+  LIBS minillm_ops minillm_loader)
 
 minillm_add_test(matmul
   SOURCES matmul/test_matmul.cpp
-  LIBS minillm_ops)
+  LIBS minillm_ops minillm_loader)
 
 minillm_add_test(rope
   SOURCES rope/test_rope.cpp

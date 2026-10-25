@@ -15,6 +15,7 @@
 #include "f32x4.h"
 #include "minillm/ops.h"
 #include "minillm/runtime.h"
+#include "q8_0.h"
 #include "validate.h"
 
 namespace minillm::ops {
@@ -50,6 +51,10 @@ void parallel_units(std::int64_t n, std::int64_t min_floats, const Fn& fn) {
 }  // namespace
 
 void embedding(const Tensor& table, std::span<const std::int32_t> ids, Tensor& out) {
+  if (table.dtype() == DType::Q8_0) {
+    detail::embedding_q8_0(table, ids, out);
+    return;
+  }
   detail::require_f32_contiguous_rank("embedding", "table", table, 2);
   detail::require_f32_contiguous_rank("embedding", "out", out, 2);
 

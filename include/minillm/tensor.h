@@ -9,7 +9,8 @@
 //   * Rank is 1..4. Rank 0 means "no tensor" (default-constructed, is_empty()).
 //     Scalars are not modelled; use shape {1}.
 //   * All compute happens in F32. BF16/F16 exist only so the loader can read
-//     checkpoint bytes before converting; Q8_0 is reserved and unimplemented.
+//     checkpoint bytes before converting. Q8_0 stores quantized weights (see
+//     BlockQ8_0); ops.h says which op arguments accept it.
 //   * Deliberately absent: broadcasting, autograd, arithmetic operator
 //     overloading, lazy evaluation, device/stream abstraction, type erasure
 //     beyond the dtype tag. Ops are free functions in ops.h.
@@ -30,19 +31,44 @@
 
 namespace minillm {
 
-/// Element types. F32 is the only type ops operate on.
+/// Element types. F32 is the compute type; ops.h names the few arguments that
+/// also accept Q8_0.
 enum class DType : int {
   F32 = 0,   ///< IEEE-754 binary32, the compute type.
   BF16 = 1,  ///< bfloat16, as stored in HF safetensors checkpoints.
   F16 = 2,   ///< IEEE-754 binary16, accepted by the loader.
-  Q8_0 = 3,  ///< Reserved for a future quantized path. Not implemented.
+  Q8_0 = 3,  ///< Blocks of 32 elements along the last dimension; see BlockQ8_0.
 };
 
 /// Maximum tensor rank.
 inline constexpr int kMaxDims = 4;
 
-/// Size of one element in bytes. Throws std::invalid_argument for Q8_0.
+/// Elements per Q8_0 block.
+inline constexpr std::int64_t kQ8_0Block = 32;
+
+/// One Q8_0 block: element j is qs[j] * f16_to_f32(d). 34 bytes, alignment 2,
+/// byte-compatible with llama.cpp's block_q8_0.
+///
+/// A Q8_0 tensor is an array of these, row-major over its logical shape. Its
+/// Shape and strides count elements, as for every dtype, and its last
+/// dimension is a multiple of kQ8_0Block, so every row starts on a block:
+/// element offset e lives in block e / 32. Kernels read the blocks through
+/// data_as<BlockQ8_0>().
+struct BlockQ8_0 {
+  std::uint16_t d;             ///< scale, IEEE binary16 bits
+  std::int8_t qs[kQ8_0Block];  ///< in [-127, 127]
+};
+static_assert(sizeof(BlockQ8_0) == 34 && alignof(BlockQ8_0) == 2);
+
+/// Size of one element in bytes. Throws std::invalid_argument for Q8_0, which
+/// has no per-element size; use dtype_nbytes.
 std::size_t dtype_size(DType dt);
+
+/// Bytes that `numel` elements of `dt` occupy: numel * dtype_size(dt), or
+/// numel / 32 * 34 for Q8_0. Throws std::invalid_argument if numel is
+/// negative, is not a multiple of the block (32 for Q8_0), or the byte count
+/// does not fit int64.
+std::size_t dtype_nbytes(DType dt, std::int64_t numel);
 
 /// Lowercase name of the dtype ("f32", "bf16", "f16", "q8_0").
 const char* dtype_name(DType dt);
@@ -102,6 +128,42 @@ inline float f16_to_f32(std::uint16_t v) {
   return out;
 }
 
+/// f32 -> f16, round-to-nearest-even. Overflow gives +-inf; NaN stays NaN
+/// (0x7e00 with the input's sign). f16_to_f32 inverts it exactly on every
+/// non-NaN f16. The Q8_0 quantizer rounds its scales with this.
+inline std::uint16_t f32_to_f16(float v) {
+  constexpr std::uint32_t kF32Infinity = 255u << 23;
+  constexpr std::uint32_t kF16Max = (127u + 16u) << 23;  // 2^16: rounds to inf
+  constexpr std::uint32_t kDenormMagic = ((127u - 15u) + (23u - 10u) + 1u) << 23;
+  std::uint32_t u;
+  std::memcpy(&u, &v, sizeof(u));
+  const std::uint32_t sign = u & 0x80000000u;
+  u ^= sign;
+  std::uint32_t o;
+  if (u >= kF16Max) {
+    o = u > kF32Infinity ? 0x7e00u : 0x7c00u;  // NaN stays NaN, the rest overflows
+  } else if (u < (113u << 23)) {
+    // f16 subnormal or zero: adding 0.5 (as kDenormMagic) makes the float
+    // adder round the mantissa at f16's subnormal step, to nearest even.
+    float r;
+    std::memcpy(&r, &u, sizeof(r));
+    float magic;
+    std::memcpy(&magic, &kDenormMagic, sizeof(magic));
+    r += magic;
+    std::uint32_t rbits;
+    std::memcpy(&rbits, &r, sizeof(rbits));
+    o = rbits - kDenormMagic;
+  } else {
+    // Normal f16: rebias the exponent (wrapping on purpose) and round the 13
+    // dropped mantissa bits to nearest even.
+    const std::uint32_t mant_odd = (u >> 13) & 1u;
+    u += static_cast<std::uint32_t>(15 - 127) << 23;
+    u += 0xfffu + mant_odd;
+    o = u >> 13;
+  }
+  return static_cast<std::uint16_t>(o | (sign >> 16));
+}
+
 /// A rank and up to kMaxDims extents. Row-major, outermost dim first.
 /// operator[] and operator== are structural accessors only; Shape has no
 /// arithmetic.
@@ -143,13 +205,17 @@ class Shape {
 /// strides, the element count and the byte count) must fit int64. `zeros`,
 /// `empty`, `wrap` and `reshape` throw std::invalid_argument for a shape too
 /// large to represent, before allocating or addressing any memory.
+///
+/// Q8_0 rule: the last dimension must be a multiple of kQ8_0Block. `zeros`,
+/// `empty`, `wrap` and `reshape` throw std::invalid_argument otherwise, and
+/// `slice` refuses any cut that could split a block (see there).
 class Tensor {
  public:
   /// An empty handle: rank 0, null data.
   Tensor() = default;
 
-  /// Owning allocation, zero-filled. `dtype` must not be Q8_0. Throws
-  /// std::invalid_argument for a shape over the size limit above.
+  /// Owning allocation, zero-filled. Throws std::invalid_argument for a shape
+  /// over the size limit above, or one breaking the Q8_0 rule.
   static Tensor zeros(const Shape& shape, DType dtype = DType::F32);
   /// Owning allocation, uninitialized. Throws like zeros().
   static Tensor empty(const Shape& shape, DType dtype = DType::F32);
@@ -157,7 +223,8 @@ class Tensor {
   /// keep `data` alive for as long as the Tensor or any of its views is used.
   /// For const memory, const_cast at the call site; Tensor does not track
   /// constness and ops writing to a view built from const memory is UB.
-  /// Throws std::invalid_argument for a shape over the size limit above.
+  /// Throws std::invalid_argument for a shape over the size limit above, or
+  /// one breaking the Q8_0 rule.
   static Tensor wrap(void* data, const Shape& shape, DType dtype = DType::F32);
 
   const Shape& shape() const { return shape_; }
@@ -166,6 +233,8 @@ class Tensor {
   std::int64_t dim(int i) const { return shape_[i]; }
   std::int64_t numel() const { return shape_.numel(); }
   DType dtype() const { return dtype_; }
+  /// Bytes of element data: dtype_nbytes(dtype(), numel()). 0 when empty.
+  std::size_t nbytes() const;
 
   /// Strides in elements. Entries at index >= ndim() are unspecified.
   const std::array<std::int64_t, kMaxDims>& strides() const { return strides_; }
@@ -205,14 +274,16 @@ class Tensor {
   }
 
   /// View with a different shape, same element count. Requires is_contiguous()
-  /// and a `shape` within the size limit above; throws std::invalid_argument
-  /// otherwise.
+  /// and a `shape` within the size limit above (for Q8_0, also its rule);
+  /// throws std::invalid_argument otherwise.
   Tensor reshape(const Shape& shape) const;
 
   /// View of `count` entries along dimension `dim`, starting at `start`. Rank
   /// is preserved. Slicing dimension 0 of a contiguous tensor stays
   /// contiguous; slicing any other dimension generally does not.
-  /// Throws std::out_of_range if the range is out of bounds.
+  /// Throws std::out_of_range if the range is out of bounds. For Q8_0 only
+  /// dimension 0 of a tensor of rank >= 2 may be sliced, so a block never
+  /// straddles two views; any other dimension throws std::invalid_argument.
   Tensor slice(int dim, std::int64_t start, std::int64_t count) const;
 
   /// View of index `index` along dimension 0, with that dimension dropped

@@ -35,6 +35,7 @@ add_library(minillm_ops STATIC
   ops/elementwise.cpp
   ops/norm.cpp
   ops/matmul.cpp
+  ops/q8_0.cpp
   ops/rope.cpp)
 target_link_libraries(minillm_ops PUBLIC minillm_ops_ref minillm_runtime)
 
@@ -47,6 +48,7 @@ target_link_libraries(minillm_attention PUBLIC minillm_ops)
 # --- loader: config.json + safetensors -> fp32 tensors (workflow 01) -------
 add_library(minillm_loader STATIC
   loader/config.cpp
+  loader/quantize.cpp
   loader/safetensors.cpp)
 target_link_libraries(minillm_loader PUBLIC minillm_tensor PRIVATE nlohmann_json::nlohmann_json)
 

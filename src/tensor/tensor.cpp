@@ -26,7 +26,8 @@ std::array<std::int64_t, kMaxDims> packed_strides(const Shape& shape) {
 
 /// Rejects any shape a `dtype` tensor cannot have, and returns its byte count.
 ///
-/// Besides the rank and the sign of each extent, every product a tensor of
+/// Besides the rank, the sign of each extent and Q8_0's last-dimension rule,
+/// every product a tensor of
 /// this shape will ever form has to fit in int64: its packed strides, its
 /// element count and its size in bytes. Multiplying the extents from the
 /// innermost out forms exactly the strides packed_strides() does, then the
@@ -43,6 +44,11 @@ std::size_t check_shape(const Shape& shape, DType dtype) {
       throw std::invalid_argument("Tensor: negative extent in shape " + shape.to_string());
     }
   }
+  if (dtype == DType::Q8_0 && shape[shape.ndim() - 1] % kQ8_0Block != 0) {
+    throw std::invalid_argument("Tensor: q8_0" + shape.to_string() +
+                                " needs a last dimension that is a multiple of " +
+                                std::to_string(kQ8_0Block));
+  }
   std::int64_t count = 1;
   for (int i = shape.ndim() - 1; i >= 0; --i) {
     if (__builtin_mul_overflow(count, shape[i], &count)) {
@@ -50,14 +56,24 @@ std::size_t check_shape(const Shape& shape, DType dtype) {
                                   " is too large: its strides or element count overflow int64");
     }
   }
-  const auto esize = static_cast<std::int64_t>(dtype_size(dtype));  // rejects Q8_0
-  std::int64_t bytes = 0;
-  if (__builtin_mul_overflow(count, esize, &bytes)) {
+  // count is a whole number of blocks for Q8_0, so this cannot throw for it
+  // except on overflow.
+  try {
+    return dtype_nbytes(dtype, count);
+  } catch (const std::invalid_argument&) {
     throw std::invalid_argument("Tensor: " + std::string(dtype_name(dtype)) + shape.to_string() +
-                                " is too large: " + std::to_string(count) + " elements of " +
-                                std::to_string(esize) + " bytes overflow int64");
+                                " is too large: " + std::to_string(count) +
+                                " elements overflow int64 bytes");
   }
-  return static_cast<std::size_t>(bytes);
+}
+
+/// Q8_0 views must never split a block; see Tensor::slice.
+void check_q8_0_slice(const Tensor& t, int dim) {
+  if (t.dtype() == DType::Q8_0 && (dim != 0 || t.ndim() < 2)) {
+    throw std::invalid_argument("Tensor::slice: " + t.to_string() + " is q8_0; only dimension 0 " +
+                                "of a tensor of rank >= 2 may be sliced, got dimension " +
+                                std::to_string(dim));
+  }
 }
 
 }  // namespace
@@ -72,7 +88,32 @@ std::size_t dtype_size(DType dt) {
     case DType::Q8_0:
       break;
   }
-  throw std::invalid_argument("dtype_size: Q8_0 is reserved and not implemented");
+  throw std::invalid_argument("dtype_size: q8_0 has no per-element size; use dtype_nbytes");
+}
+
+std::size_t dtype_nbytes(DType dt, std::int64_t numel) {
+  if (numel < 0) {
+    throw std::invalid_argument("dtype_nbytes: negative element count " + std::to_string(numel));
+  }
+  std::int64_t units = numel;
+  std::int64_t unit_bytes = 0;
+  if (dt == DType::Q8_0) {
+    if (numel % kQ8_0Block != 0) {
+      throw std::invalid_argument("dtype_nbytes: " + std::to_string(numel) +
+                                  " q8_0 elements are not a whole number of " +
+                                  std::to_string(kQ8_0Block) + "-element blocks");
+    }
+    units = numel / kQ8_0Block;
+    unit_bytes = static_cast<std::int64_t>(sizeof(BlockQ8_0));
+  } else {
+    unit_bytes = static_cast<std::int64_t>(dtype_size(dt));
+  }
+  std::int64_t bytes = 0;
+  if (__builtin_mul_overflow(units, unit_bytes, &bytes)) {
+    throw std::invalid_argument("dtype_nbytes: " + std::to_string(numel) + " " + dtype_name(dt) +
+                                " elements overflow int64 bytes");
+  }
+  return static_cast<std::size_t>(bytes);
 }
 
 const char* dtype_name(DType dt) {
@@ -195,9 +236,7 @@ Tensor Tensor::empty(const Shape& shape, DType dtype) {
 
 Tensor Tensor::zeros(const Shape& shape, DType dtype) {
   Tensor t = empty(shape, dtype);
-  // empty() has checked that this product fits.
-  const std::size_t bytes = static_cast<std::size_t>(shape.numel()) * dtype_size(dtype);
-  std::memset(t.data_, 0, bytes);
+  std::memset(t.data_, 0, t.nbytes());
   return t;
 }
 
@@ -213,6 +252,8 @@ Tensor Tensor::wrap(void* data, const Shape& shape, DType dtype) {
   t.dtype_ = dtype;
   return t;
 }
+
+std::size_t Tensor::nbytes() const { return dtype_nbytes(dtype_, numel()); }
 
 std::int64_t Tensor::stride(int i) const {
   if (i < 0 || i >= shape_.ndim()) {
@@ -275,15 +316,16 @@ Tensor Tensor::slice(int dim, std::int64_t start, std::int64_t count) const {
                             std::to_string(start) + " out of range for dimension " +
                             std::to_string(dim) + " of " + to_string());
   }
+  check_q8_0_slice(*this, dim);
   Tensor t = *this;
   t.shape_[dim] = count;
   // An empty tensor addresses nothing, and its strides can step far past the
   // end of its buffer, which may be zero bytes long, so its views keep its
-  // pointer.
+  // pointer. For Q8_0 the element offset is a whole number of blocks:
+  // dimension 0's stride is a multiple of the last extent.
   if (numel() != 0) {
     t.data_ = static_cast<std::byte*>(data_) +
-              static_cast<std::size_t>(start * strides_[static_cast<std::size_t>(dim)]) *
-                  dtype_size(dtype_);
+              dtype_nbytes(dtype_, start * strides_[static_cast<std::size_t>(dim)]);
   }
   return t;
 }
@@ -301,8 +343,7 @@ Tensor Tensor::row(std::int64_t index) const {
 
   Tensor t;
   t.storage_ = storage_;
-  t.data_ = static_cast<std::byte*>(data_) +
-            static_cast<std::size_t>(index * strides_[0]) * dtype_size(dtype_);
+  t.data_ = static_cast<std::byte*>(data_) + dtype_nbytes(dtype_, index * strides_[0]);
   t.shape_ = Shape(dims, shape_.ndim() - 1);
   for (int i = 1; i < shape_.ndim(); ++i) {
     t.strides_[static_cast<std::size_t>(i - 1)] = strides_[static_cast<std::size_t>(i)];
@@ -317,6 +358,15 @@ Tensor Tensor::row(std::int64_t index) const {
 Tensor Tensor::copy_contiguous() const {
   if (is_empty()) return Tensor();
   Tensor out = empty(shape_, dtype_);
+  if (dtype_ == DType::Q8_0) {
+    // Every Q8_0 view (whole tensor, row, or a slice of dimension 0) is
+    // contiguous, so its blocks are one run of bytes.
+    if (!is_contiguous()) {
+      throw std::invalid_argument("Tensor::copy_contiguous: strided q8_0 view " + to_string());
+    }
+    std::memcpy(out.data_, data_, nbytes());
+    return out;
+  }
   const std::size_t esz = dtype_size(dtype_);
   const auto* src = static_cast<const std::byte*>(data_);
   auto* dst = static_cast<std::byte*>(out.data_);
