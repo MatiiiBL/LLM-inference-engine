@@ -31,14 +31,12 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <functional>
 #include <initializer_list>
 #include <numeric>
 #include <optional>
 #include <random>
 #include <span>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -385,74 +383,6 @@ bool is_not_implemented(const std::logic_error& e) {
 }
 
 // ---------------------------------------------------------------------------
-// Model config
-// ---------------------------------------------------------------------------
-
-/// The value of a top-level numeric key in a flat JSON document, if present.
-std::optional<double> json_number(const std::string& doc, std::string_view key) {
-  const std::string quoted = "\"" + std::string(key) + "\"";
-  std::size_t pos = doc.find(quoted);
-  if (pos == std::string::npos) return std::nullopt;
-  pos = doc.find_first_not_of(" \t\r\n", pos + quoted.size());
-  if (pos == std::string::npos || doc[pos] != ':') return std::nullopt;
-  const char* begin = doc.c_str() + pos + 1;
-  char* end = nullptr;
-  const double v = std::strtod(begin, &end);
-  if (end == begin) return std::nullopt;
-  return v;
-}
-
-/// TEMPORARY, until workflow 01 implements ModelConfig::from_json_file: reads
-/// just the numeric fields the op shapes need straight out of config.json, so
-/// the op benchmarks work while the loader is still a stub. Nothing is
-/// hardcoded; once the real parser exists this path is never taken and should
-/// be deleted.
-ModelConfig scrape_config(const fs::path& file) {
-  std::ifstream in(file);
-  if (!in) throw std::runtime_error("cannot read " + file.string());
-  std::stringstream buf;
-  buf << in.rdbuf();
-  const std::string doc = buf.str();
-
-  auto require = [&](std::string_view key) {
-    const std::optional<double> v = json_number(doc, key);
-    if (!v || *v <= 0) {
-      throw std::runtime_error(file.string() + ": missing or non-positive \"" + std::string(key) + "\"");
-    }
-    return *v;
-  };
-  auto require_int = [&](std::string_view key) { return static_cast<std::int64_t>(require(key)); };
-
-  ModelConfig cfg;
-  cfg.vocab_size = require_int("vocab_size");
-  cfg.hidden_size = require_int("hidden_size");
-  cfg.intermediate_size = require_int("intermediate_size");
-  cfg.num_hidden_layers = require_int("num_hidden_layers");
-  cfg.num_attention_heads = require_int("num_attention_heads");
-  cfg.num_key_value_heads = require_int("num_key_value_heads");
-  cfg.max_position_embeddings = require_int("max_position_embeddings");
-  cfg.rms_norm_eps = static_cast<float>(require("rms_norm_eps"));
-  cfg.rope_theta = static_cast<float>(require("rope_theta"));
-  cfg.head_dim = json_number(doc, "head_dim")
-                     ? require_int("head_dim")
-                     : cfg.hidden_size / cfg.num_attention_heads;
-  if (cfg.num_attention_heads % cfg.num_key_value_heads != 0 || cfg.head_dim % 2 != 0) {
-    throw std::runtime_error(file.string() + ": unsupported head layout");
-  }
-  return cfg;
-}
-
-ModelConfig load_config(const fs::path& file, std::vector<std::string>& notes) {
-  try {
-    return ModelConfig::from_json_file(file);
-  } catch (const std::logic_error& e) {
-    if (!is_not_implemented(e)) throw;
-    notes.push_back(std::string(e.what()) + "; read the op shapes straight from config.json instead");
-    return scrape_config(file);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Op benchmarks: ops:: against ref::
 // ---------------------------------------------------------------------------
 
@@ -758,8 +688,7 @@ int run_model_benches(const Options& opt, Report& report) {
 // ---------------------------------------------------------------------------
 
 int run(const Options& opt) {
-  std::vector<std::string> notes;
-  const ModelConfig cfg = load_config(opt.model_dir / "config.json", notes);
+  const ModelConfig cfg = ModelConfig::from_json_file(opt.model_dir / "config.json");
 
   std::printf("minillm_bench — %s, %s, %u hardware threads\n",
               kBuildProblem ? kBuildProblem : "release build", kCompiler,
@@ -775,7 +704,6 @@ int run(const Options& opt) {
               static_cast<long long>(opt.prompt_tokens + opt.decode_tokens));
   std::printf("timing  %d samples per measurement after a warm-up; op samples last >= %.0f ms\n",
               opt.samples, opt.min_sample_s * 1000.0);
-  for (const std::string& n : notes) std::printf("note    %s\n", n.c_str());
   if (kBuildProblem) {
     std::printf("\n*** NOT A RELEASE BUILD (%s): these numbers are meaningless. ***\n", kBuildProblem);
   }
