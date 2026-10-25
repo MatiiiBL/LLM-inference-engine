@@ -774,13 +774,20 @@ TEST_CASE("Arena::tensor validates before allocating") {
   CHECK_THROWS_AS(arena.tensor(Shape{}), std::invalid_argument);
   CHECK_THROWS_AS(arena.tensor({2, -1}), std::invalid_argument);
   CHECK_THROWS_AS(arena.tensor({16, 16}), std::bad_alloc);  // 1024 bytes, 1014 free
-  // 2^62 elements: numel * 4 would wrap a 64-bit size_t to 0.
+  // 2^62 elements: a valid shape, but numel * 4 would wrap a 64-bit size_t to 0.
   CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 30, std::int64_t{1} << 30, 4}),
                   std::bad_alloc);
-  // 2^124 elements: even the element count overflows.
-  CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 62, std::int64_t{1} << 62}), std::bad_alloc);
+  // 2^124 elements: the element count overflows int64, so no tensor can have
+  // this shape (Tensor::wrap rejects it too).
+  CHECK_THROWS_AS(arena.tensor({std::int64_t{1} << 62, std::int64_t{1} << 62}),
+                  std::invalid_argument);
+  // Empty, but dimension 0 would need a stride of 2^124: rejected before the
+  // arena moves, not by Tensor::wrap after it has.
+  CHECK_THROWS_AS(arena.tensor({0, std::int64_t{1} << 62, std::int64_t{1} << 62}),
+                  std::invalid_argument);
   CHECK(arena.used() == 10);
-  // A zero extent makes the tensor empty however large the others are.
+  // A zero extent outside the large ones leaves every stride small: a valid
+  // empty tensor, however large the other extents are.
   CHECK(arena.tensor({std::int64_t{1} << 62, 0, std::int64_t{1} << 62}).numel() == 0);
 }
 

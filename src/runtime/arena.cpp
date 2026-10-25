@@ -135,10 +135,22 @@ Tensor Arena::tensor(const Shape& shape, DType dtype) {
     }
     empty = empty || shape[i] == 0;
   }
-  // The byte count is multiplied out here, checking every step, rather than
-  // taken from shape.numel(), which does not check: a shape too large even to
-  // count is one more request the arena cannot satisfy. A zero extent makes
-  // the tensor empty, however large the others are.
+  // Tensor::wrap rejects a shape whose packed strides or element count
+  // overflow int64, empty or not. Multiplying the extents from the innermost
+  // out forms exactly those products, as Tensor's own check does: a zero
+  // extent zeroes everything outside it, so {2^62, 0, 2^62} is a valid empty
+  // tensor and {0, 2^62, 2^62}, which needs a stride of 2^124, is not.
+  std::int64_t count = 1;
+  for (int i = shape.ndim() - 1; i >= 0; --i) {
+    if (__builtin_mul_overflow(count, shape[i], &count)) {
+      throw std::invalid_argument("Arena::tensor: shape " + shape.to_string() +
+                                  " is too large: its strides or element count overflow int64");
+    }
+  }
+  // The byte count is multiplied out here, checking every step: a shape that
+  // is valid but too large to hold is one more request the arena cannot
+  // satisfy. A zero extent makes the tensor empty, however large the others
+  // are.
   std::size_t bytes = empty ? 0 : esize;
   for (int i = 0; i < shape.ndim() && !empty; ++i) {
     if (__builtin_mul_overflow(bytes, static_cast<std::size_t>(shape[i]), &bytes) ||
