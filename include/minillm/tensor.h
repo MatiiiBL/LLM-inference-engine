@@ -117,6 +117,8 @@ class Shape {
   std::int64_t& operator[](int i);
 
   /// Product of the extents; 0 for rank 0 (a rank-0 Shape means "no shape").
+  /// Throws std::overflow_error if the product does not fit int64. A shape
+  /// with an extent of 0 has numel() 0, however large its other extents.
   std::int64_t numel() const;
 
   bool operator==(const Shape& other) const;
@@ -136,19 +138,26 @@ class Shape {
 /// someone else owns. Copies share storage, and any view produced by
 /// `reshape`/`slice`/`row` keeps the originating buffer alive. `owns_data()`
 /// reports whether this handle holds a reference to such a buffer.
+///
+/// Size limit: every product a tensor forms from its shape (the packed
+/// strides, the element count and the byte count) must fit int64. `zeros`,
+/// `empty`, `wrap` and `reshape` throw std::invalid_argument for a shape too
+/// large to represent, before allocating or addressing any memory.
 class Tensor {
  public:
   /// An empty handle: rank 0, null data.
   Tensor() = default;
 
-  /// Owning allocation, zero-filled. `dtype` must not be Q8_0.
+  /// Owning allocation, zero-filled. `dtype` must not be Q8_0. Throws
+  /// std::invalid_argument for a shape over the size limit above.
   static Tensor zeros(const Shape& shape, DType dtype = DType::F32);
-  /// Owning allocation, uninitialized.
+  /// Owning allocation, uninitialized. Throws like zeros().
   static Tensor empty(const Shape& shape, DType dtype = DType::F32);
   /// Non-owning, contiguous view over caller-owned memory. The caller must
   /// keep `data` alive for as long as the Tensor or any of its views is used.
   /// For const memory, const_cast at the call site; Tensor does not track
   /// constness and ops writing to a view built from const memory is UB.
+  /// Throws std::invalid_argument for a shape over the size limit above.
   static Tensor wrap(void* data, const Shape& shape, DType dtype = DType::F32);
 
   const Shape& shape() const { return shape_; }
@@ -195,8 +204,9 @@ class Tensor {
     return i0 * strides_[0] + i1 * strides_[1] + i2 * strides_[2] + i3 * strides_[3];
   }
 
-  /// View with a different shape, same element count. Requires is_contiguous().
-  /// Throws std::invalid_argument otherwise.
+  /// View with a different shape, same element count. Requires is_contiguous()
+  /// and a `shape` within the size limit above; throws std::invalid_argument
+  /// otherwise.
   Tensor reshape(const Shape& shape) const;
 
   /// View of `count` entries along dimension `dim`, starting at `start`. Rank
