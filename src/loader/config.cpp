@@ -204,6 +204,13 @@ void ModelConfig::validate() const {
     fail("num_attention_heads (" + std::to_string(num_attention_heads) +
          ") is not divisible by num_key_value_heads (" + std::to_string(num_key_value_heads) + ")");
   }
+  // q_dim() and kv_dim() multiply unchecked, so both products must fit here.
+  // kv_dim() <= q_dim(), since num_key_value_heads <= num_attention_heads.
+  std::int64_t q_width = 0;
+  if (__builtin_mul_overflow(num_attention_heads, head_dim, &q_width)) {
+    fail("num_attention_heads (" + std::to_string(num_attention_heads) + ") * head_dim (" +
+         std::to_string(head_dim) + ") overflows int64");
+  }
   // Not in the header's list, but a zero, negative or NaN eps/theta computes
   // garbage just as surely as a zero dimension does.
   if (!(std::isfinite(rms_norm_eps) && rms_norm_eps > 0.0f)) {

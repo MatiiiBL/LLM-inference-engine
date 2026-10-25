@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -248,10 +249,11 @@ TEST_CASE("temperature <= 0 is argmax, ties included") {
 }
 
 TEST_CASE("top_k = 1 is greedy regardless of temperature") {
-  // denorm_min overflows almost every logit to +-inf, and the largest must
-  // still win the tie at +inf.
+  // denorm_min and FLT_MAX are the extremes: dividing by the one overflows
+  // almost every logit to +-inf, and by the other underflows them to 0.
   const float tiny = std::numeric_limits<float>::denorm_min();
-  for (const float temperature : {tiny, 0.01f, 1.0f, 10.0f, 1e4f}) {
+  const float huge = std::numeric_limits<float>::max();
+  for (const float temperature : {tiny, 0.01f, 1.0f, 10.0f, 1e4f, huge}) {
     SamplingParams p = with_temperature(temperature);
     p.top_k = 1;
     Sampler sampler(p);
@@ -266,6 +268,74 @@ TEST_CASE("top_k = 1 is greedy regardless of temperature") {
   p.top_k = 1;
   Sampler sampler(p);
   CHECK(sample_copy(sampler, {29.0f, 30.0f, 28.5f}) == 1);
+  // One ulp below the max, divided by FLT_MAX: -2^-24 / FLT_MAX rounds to -0,
+  // which ties with the max at 0 unless top-1 skips the division.
+  p.temperature = huge;
+  Sampler flat(p);
+  CHECK(sample_copy(flat, {std::nextafter(1.0f, 0.0f), 1.0f}) == 1);
+}
+
+TEST_CASE("as the temperature goes to 0+, every draw is the argmax") {
+  // Once (runner-up - max) / temperature is below about -104, exp rounds
+  // every weight but the largest to exactly 0, so from that temperature down
+  // the draw is the argmax whatever the seed. Each temperature is checked
+  // with every filter, many seeds, and several draws per seed.
+  constexpr float kFltMin = std::numeric_limits<float>::min();
+  std::vector<std::vector<float>> rows;
+  for (std::uint64_t seed = 0; seed < 3; ++seed) rows.push_back(random_row(1000, seed));
+  // Dividing these by a tiny temperature overflows many logits to +inf.
+  rows.push_back({29.0f, 30.0f, 28.5f});
+  for (const float scale : {100.0f, 1e30f}) {
+    std::vector<float> row = random_row(1000, 10);
+    for (float& v : row) v = v * scale + scale / 2;
+    rows.push_back(row);
+  }
+  // All negative, and a runner-up one ulp below the max.
+  std::vector<float> close = random_row(1000, 11);
+  for (float& v : close) v = -1000.0f - std::abs(v);
+  close[500] = -1.0f;
+  close[600] = std::nextafter(-1.0f, -2.0f);
+  rows.push_back(close);
+
+  std::vector<SamplingParams> configs;
+  for (const std::int64_t top_k : {0, 2, 50}) {
+    for (const float top_p : {1.0f, 0.9f}) {
+      SamplingParams p;
+      p.top_k = top_k;
+      p.top_p = top_p;
+      configs.push_back(p);
+    }
+  }
+
+  for (const std::vector<float>& row : rows) {
+    std::vector<float> sorted = row;
+    std::sort(sorted.begin(), sorted.end(), std::greater<>());
+    REQUIRE(sorted[0] > sorted[1]);  // a unique maximum
+    const std::int32_t expected = first_argmax(row);
+
+    std::vector<float> temperatures;
+    for (float t = (sorted[0] - sorted[1]) / 128.0f; t > kFltMin; t /= 16.0f) {
+      temperatures.push_back(t);
+    }
+    temperatures.push_back(kFltMin);
+    temperatures.push_back(std::numeric_limits<float>::denorm_min());
+
+    for (const float temperature : temperatures) {
+      for (SamplingParams p : configs) {
+        p.temperature = temperature;
+        for (std::uint64_t seed = 0; seed < 8; ++seed) {
+          p.seed = seed;
+          Sampler sampler(p);
+          for (int draw = 0; draw < 4; ++draw) {
+            CAPTURE(row.size());
+            CAPTURE(temperature);
+            CAPTURE(p.to_string());
+            REQUIRE(sample_copy(sampler, row) == expected);
+          }
+        }
+      }
+    }
+  }
 }
 
 // --- determinism ------------------------------------------------------------
@@ -585,8 +655,11 @@ TEST_CASE("NaN and infinite logits never break a draw") {
   SamplingParams p = with_temperature(1.0f);
   // A NaN is an impossible token.
   CHECK(drawn(draw_counts(p, {kNaN, 1.0f, kNaN, 0.5f}, 500)) == std::set<std::int32_t>{1, 3});
-  // Nothing is possible: the lowest id, like argmax.
+  // Nothing is possible: the lowest id, like argmax. A NaN counts as -inf.
   CHECK(drawn(draw_counts(p, std::vector<float>(8, -kInf), 10)) == std::set<std::int32_t>{0});
+  Sampler nothing(p);
+  CHECK(sample_copy(nothing, {kNaN, -kInf, kNaN}) == 0);
+  CHECK(sample_copy(nothing, std::vector<float>(4, kNaN)) == 0);
   // An infinite logit takes all the mass; the first one wins.
   CHECK(drawn(draw_counts(p, {1.0f, kInf, 2.0f, kInf}, 10)) == std::set<std::int32_t>{1});
   // -inf tokens are never drawn, whatever the filters.

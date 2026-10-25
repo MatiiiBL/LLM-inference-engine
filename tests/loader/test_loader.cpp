@@ -692,6 +692,22 @@ TEST_CASE("validate() rejects non-positive dimensions") {
                   std::runtime_error);
 }
 
+TEST_CASE("validate() rejects a head count and head_dim whose product overflows") {
+  // q_dim() = num_attention_heads * head_dim, unchecked in config.h.
+  constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+  ModelConfig c = valid_config();  // 9 query heads, 3 KV heads
+  c.head_dim = kMax / 9 + 1;
+  CHECK_THROWS_WITH_AS(c.validate(), doctest::Contains("num_attention_heads (9) * head_dim"),
+                       std::runtime_error);
+  c.head_dim = kMax / 9;  // the largest that fits: q_dim() and kv_dim() are exact
+  CHECK_NOTHROW(c.validate());
+  CHECK(c.q_dim() == kMax / 9 * 9);
+  // Through the parser: 4 heads of 2^61 is 2^63.
+  CHECK_THROWS_WITH_AS(
+      ModelConfig::from_json_string(config_json({{"head_dim", "2305843009213693952"}})),
+      doctest::Contains("overflows int64"), std::runtime_error);
+}
+
 TEST_CASE("validate() rejects a non-positive or non-finite rms_norm_eps or rope_theta") {
   for (const float bad : {0.0f, -1e-5f, std::numeric_limits<float>::quiet_NaN(),
                           std::numeric_limits<float>::infinity()}) {
@@ -931,6 +947,132 @@ TEST_CASE("safetensors: overlapping data ranges are rejected") {
                        std::runtime_error);
 }
 
+TEST_CASE("safetensors: the data ranges must tile the data section") {
+  TempDir dir;
+  const auto f32 = [](const char* name, int begin, int end) {
+    return "\"" + std::string(name) + "\":{\"dtype\":\"F32\",\"shape\":[" +
+           std::to_string((end - begin) / 4) + "],\"data_offsets\":[" + std::to_string(begin) +
+           "," + std::to_string(end) + "]}";
+  };
+  // Each file is valid except for the bytes no tensor claims.
+  const struct {
+    const char* label;
+    std::string header;
+    std::size_t data_size;
+    const char* wording;
+  } cases[] = {
+      {"a gap between two tensors", "{" + f32("a", 0, 4) + "," + f32("b", 8, 12) + "}", 12,
+       "bytes [4, 8) of the data section belong to no tensor: 'a' ends at 4 and 'b' starts at 8"},
+      {"a gap before the first", "{" + f32("a", 4, 8) + "}", 8,
+       "bytes [0, 4) of the data section belong to no tensor: the first, 'a', starts at 4"},
+      {"unused bytes after the last", "{" + f32("a", 0, 4) + "}", 8,
+       "bytes [4, 8) of the data section belong to no tensor: the last, 'a', ends at 4"},
+      {"data and no tensors", R"({"__metadata__":{"format":"pt"}})", 4,
+       "bytes [0, 4) of the data section belong to no tensor: the header lists none"},
+      // A zero-length range inside another is a tile out of place.
+      {"an empty tensor inside another", "{" + f32("a", 0, 8) + "," + f32("e", 4, 4) + "}", 8,
+       "tensors 'a' [0, 8) and 'e' [4, 4) overlap"},
+  };
+  for (const auto& c : cases) {
+    CAPTURE(c.label);
+    const fs::path p =
+        dir.write("tiling.safetensors", safetensors_file(c.header, std::string(c.data_size, 'x')));
+    CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(p.string().c_str()),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(c.wording),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(load_safetensors(p), doctest::Contains(c.wording), std::runtime_error);
+  }
+
+  // Empty tensors on the boundaries, at either end and between two tensors,
+  // break nothing; nor does a header with no tensors and no data.
+  const fs::path ok = dir.write(
+      "ok.safetensors",
+      safetensors_file("{" + f32("e0", 0, 0) + "," + f32("a", 0, 4) + "," + f32("e1", 4, 4) + "," +
+                           f32("b", 4, 8) + "," + f32("e2", 8, 8) + "}",
+                       std::string(8, '\0')));
+  CHECK(load_safetensors(ok).size() == 5);
+  const fs::path none = dir.write("none.safetensors", safetensors_file("{}", ""));
+  CHECK(load_safetensors(none).size() == 0);
+}
+
+TEST_CASE("safetensors: a repeated key is rejected, not silently resolved") {
+  TempDir dir;
+  // In each header, nlohmann would keep the last of the two keys and produce
+  // a valid file, so only the duplicate check can reject it.
+  const std::pair<std::string_view, const char*> cases[] = {
+      // One four-byte tensor described twice, as f32[1] and as bf16[2].
+      {R"({"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},)"
+       R"("w":{"dtype":"BF16","shape":[2],"data_offsets":[0,4]}})",
+       "the header has two entries named 'w'"},
+      {R"({"w":{"dtype":"F32","dtype":"BF16","shape":[2],"data_offsets":[0,4]}})",
+       "tensor 'w': the key \"dtype\" appears twice"},
+      {R"({"__metadata__":{"format":"pt","format":"np"},)"
+       R"("w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
+       "\"__metadata__\": the key \"format\" appears twice"},
+  };
+  for (const auto& [header, wording] : cases) {
+    CAPTURE(header);
+    const fs::path p = dir.write("dup.safetensors", safetensors_file(header, std::string(4, 'x')));
+    CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(p.string().c_str()),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(read_safetensors_header(p), doctest::Contains(wording),
+                         std::runtime_error);
+  }
+}
+
+TEST_CASE("safetensors: __metadata__ must map strings to strings") {
+  TempDir dir;
+  for (const std::string_view metadata : {R"("pt")", R"({"format":1})", R"([])", "null"}) {
+    CAPTURE(metadata);
+    const fs::path p = dir.write(
+        "meta.safetensors",
+        safetensors_file(R"({"__metadata__":)" + std::string(metadata) +
+                             R"(,"w":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}})",
+                         std::string(4, 'x')));
+    CHECK_THROWS_WITH_AS(read_safetensors_header(p),
+                         doctest::Contains("\"__metadata__\" must map strings to strings"),
+                         std::runtime_error);
+  }
+}
+
+TEST_CASE("safetensors: a header longer than the format allows is rejected unread") {
+  TempDir dir;
+  // Both claim far more header than the file holds; only the length limit
+  // tells them apart, so match its wording.
+  std::string bytes = safetensors_file("{}", "");
+  const auto with_length = [&](std::uint64_t n) {
+    for (int i = 0; i < 8; ++i) {
+      bytes[static_cast<std::size_t>(i)] = static_cast<char>(n >> (8 * i));
+    }
+    return dir.write("big.safetensors", bytes);
+  };
+  const fs::path over = with_length(100'000'001);
+  CHECK_THROWS_WITH_AS(read_safetensors_header(over),
+                       doctest::Contains("100000001 bytes, more than the safetensors limit of "
+                                         "100000000"),
+                       std::runtime_error);
+  CHECK_THROWS_WITH_AS(read_safetensors_header(over), doctest::Contains(over.string().c_str()),
+                       std::runtime_error);
+  // The limit itself is allowed, so this file is merely truncated.
+  CHECK_THROWS_WITH_AS(read_safetensors_header(with_length(100'000'000)),
+                       doctest::Contains("but only 2 follow it"), std::runtime_error);
+}
+
+TEST_CASE("safetensors: an empty tensor may have huge outer extents") {
+  // The mirror image of the [0, 2^62, 2^62] entry rejected above: a zero
+  // extent innermost zeroes every stride, so this tensor is valid.
+  TempDir dir;
+  const fs::path p = dir.write(
+      "huge_empty.safetensors",
+      one_tensor_file(R"({"dtype":"F32","shape":[4611686018427387904,4611686018427387904,0],)"
+                      R"("data_offsets":[0,0]})",
+                      ""));
+  const Weights w = load_safetensors(p);
+  CHECK(w.get("w").shape() == Shape{std::int64_t{1} << 62, std::int64_t{1} << 62, 0});
+  CHECK(w.get("w").numel() == 0);
+}
+
 TEST_CASE("safetensors: a byte range that disagrees with dtype x shape is rejected") {
   TempDir dir;
   // bf16[4] is 8 bytes, not 16.
@@ -961,6 +1103,15 @@ TEST_CASE("safetensors: malformed header entries are rejected") {
       {R"({"dtype":"F32","shape":[4],"data_offsets":[0.0,16.0]})",
        "\"data_offsets\" must be [begin, end]"},
       {R"({"dtype":"F32","shape":[4294967296,4294967296],"data_offsets":[0,16]})", "overflows"},
+      // Empty, but dimension 0 would need a stride of 2^124, which Tensor
+      // rejects; multiplied left to right, the zero hides the overflow.
+      {R"({"dtype":"F32","shape":[0,4611686018427387904,4611686018427387904],)"
+       R"("data_offsets":[0,16]})",
+       "overflows"},
+      // 2^62 f32 elements need 2^64 bytes, which a 64-bit product wraps to
+      // 0, exactly what [0, 0] spans.
+      {R"({"dtype":"F32","shape":[4611686018427387904],"data_offsets":[0,0]})",
+       "needs more than 18446744073709551615"},
       {R"([0, 16])", "entry must be a JSON object"},
   };
   for (const auto& [entry, wording] : cases) {
@@ -1038,16 +1189,45 @@ TEST_CASE("load_checkpoint rejects an index that disagrees with its shards") {
   }
   SUBCASE("a tensor present in two shards") {
     // s2 holds 'b', as the index says, and a second copy of 'a'. Every listed
-    // tensor is where the index puts it, so only the duplicate check can fire.
+    // tensor is where the index puts it, so only the check that each tensor
+    // sits in the shard the index names can fire.
     const fs::path s2 = dir.write(
         "s2.safetensors",
         make_safetensors({{"a", "F32", {1}, bytes_of(v)}, {"b", "F32", {1}, bytes_of(v)}}));
     dir.write("model.safetensors.index.json",
               R"({"weight_map": {"a": "s1.safetensors", "b": "s2.safetensors"}})");
     CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()),
-                         doctest::Contains("tensor 'a' is also in another shard"),
+                         doctest::Contains("tensor 'a' is in this shard, but "
+                                           "model.safetensors.index.json places it in "
+                                           "'s1.safetensors'"),
                          std::runtime_error);
     CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(s2.string().c_str()),
+                         std::runtime_error);
+  }
+  SUBCASE("a tensor the index does not list") {
+    // Every listed tensor is in its shard; 'c' is extra.
+    const fs::path s2 = dir.write(
+        "s2.safetensors",
+        make_safetensors({{"b", "F32", {1}, bytes_of(v)}, {"c", "F32", {1}, bytes_of(v)}}));
+    dir.write("model.safetensors.index.json",
+              R"({"weight_map": {"a": "s1.safetensors", "b": "s2.safetensors"}})");
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()),
+                         doctest::Contains("tensor 'c' is in this shard, but "
+                                           "model.safetensors.index.json does not list it"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(s2.string().c_str()),
+                         std::runtime_error);
+  }
+  SUBCASE("a tensor listed twice") {
+    // nlohmann would keep one of the two entries, and both say the same, so
+    // only the duplicate-key check can reject this index.
+    const fs::path index = dir.write("model.safetensors.index.json",
+                                     R"({"weight_map": {"a": "s1.safetensors", )"
+                                     R"("a": "s1.safetensors"}})");
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()),
+                         doctest::Contains("\"weight_map\": the key \"a\" appears twice"),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(index.string().c_str()),
                          std::runtime_error);
   }
   SUBCASE("a shard that does not exist") {
@@ -1062,6 +1242,31 @@ TEST_CASE("load_checkpoint rejects an index that disagrees with its shards") {
     CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains("\"weight_map\""),
                          std::runtime_error);
   }
+}
+
+TEST_CASE("load_checkpoint only reads shards inside the model directory") {
+  TempDir dir;
+  TempDir elsewhere;  // a sibling of dir under the system temp dir
+  const std::vector<float> v = {1.0f};
+  const fs::path outside = elsewhere.write("s1.safetensors",
+                                           make_safetensors({{"a", "F32", {1}, bytes_of(v)}}));
+  // Each of these names a valid shard, which loads if the path is followed.
+  for (const std::string& shard :
+       {outside.string(), "../" + elsewhere.path().filename().string() + "/s1.safetensors"}) {
+    CAPTURE(shard);
+    const fs::path index = dir.write("model.safetensors.index.json",
+                                     R"({"weight_map": {"a": ")" + shard + R"("}})");
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()),
+                         doctest::Contains(("names the shard '" + shard + "'").c_str()),
+                         std::runtime_error);
+    CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(index.string().c_str()),
+                         std::runtime_error);
+  }
+  // A subdirectory stays inside, and is fine.
+  fs::create_directory(dir.path() / "shards");
+  dir.write("shards/s1.safetensors", make_safetensors({{"a", "F32", {1}, bytes_of(v)}}));
+  dir.write("model.safetensors.index.json", R"({"weight_map": {"a": "shards/s1.safetensors"}})");
+  CHECK(load_checkpoint(dir.path()).get("a").f32()[0] == 1.0f);
 }
 
 TEST_CASE("load_checkpoint on a directory with no checkpoint names the directory") {

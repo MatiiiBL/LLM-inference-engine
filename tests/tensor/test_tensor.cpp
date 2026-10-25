@@ -216,3 +216,98 @@ TEST_CASE("to_string describes the tensor") {
   CHECK(Tensor::wrap(data.data(), {2, 3}).to_string() == "f32[2, 3] (view)");
   CHECK(Tensor::zeros({4, 3}).slice(1, 0, 2).to_string() == "f32[4, 2] (strided 3, 1)");
 }
+
+// Every shape below is chosen so that the check under test is the only thing
+// that can reject it: without the check, the unchecked int64 arithmetic wraps
+// (or, under UBSan, aborts) and the call quietly succeeds.
+
+namespace {
+constexpr std::int64_t kTwoTo(int n) { return std::int64_t{1} << n; }
+}  // namespace
+
+TEST_CASE("Shape::numel throws instead of overflowing") {
+  CHECK_THROWS_AS((Shape{kTwoTo(32), kTwoTo(32)}.numel()), std::overflow_error);  // wraps to 0
+  CHECK_THROWS_AS((Shape{kTwoTo(62), 2}.numel()), std::overflow_error);           // 2^63
+  CHECK(Shape{std::numeric_limits<std::int64_t>::max(), 1}.numel() ==
+        std::numeric_limits<std::int64_t>::max());
+  // A zero extent makes the count 0, wherever it sits: multiplying left to
+  // right would overflow before reaching it.
+  CHECK(Shape{kTwoTo(62), kTwoTo(62), 0}.numel() == 0);
+  CHECK(Shape{0, kTwoTo(62), kTwoTo(62)}.numel() == 0);
+}
+
+TEST_CASE("the factories reject a shape whose element count overflows") {
+  // 2^64 elements: an unchecked product wraps to 0, and zeros() would hand
+  // back a zero-byte buffer claiming 2^64 elements.
+  const Shape huge{kTwoTo(32), kTwoTo(32)};
+  const doctest::Contains names_shape("[4294967296, 4294967296]");
+  CHECK_THROWS_WITH_AS(Tensor::zeros(huge), names_shape, std::invalid_argument);
+  CHECK_THROWS_WITH_AS(Tensor::empty(huge, DType::BF16), names_shape, std::invalid_argument);
+  float x = 0.0f;
+  CHECK_THROWS_WITH_AS(Tensor::wrap(&x, huge), names_shape, std::invalid_argument);
+  // The same overflow in the outer dimensions of a rank-4 shape.
+  CHECK_THROWS_AS(Tensor::zeros({kTwoTo(40), kTwoTo(40), 1, 1}), std::invalid_argument);
+}
+
+TEST_CASE("an empty shape is valid only if its strides fit") {
+  // A zero extent empties the tensor, and zeroes every stride outside it.
+  // These two are valid; Arena::tensor relies on the first.
+  const Tensor a = Tensor::zeros({kTwoTo(62), 0, kTwoTo(62)});
+  CHECK(a.numel() == 0);
+  CHECK(a.stride(0) == 0);
+  CHECK(a.stride(1) == kTwoTo(62));
+  CHECK(a.is_contiguous());
+  const Tensor b = Tensor::zeros({kTwoTo(62), kTwoTo(62), 0});
+  CHECK(b.numel() == 0);
+  CHECK(b.stride(0) == 0);
+  // Here dimension 0 would need a stride of 2^124.
+  const Shape unrepresentable{0, kTwoTo(62), kTwoTo(62)};
+  CHECK_THROWS_WITH_AS(Tensor::zeros(unrepresentable), doctest::Contains("strides"),
+                       std::invalid_argument);
+  CHECK_THROWS_AS(Tensor::wrap(nullptr, unrepresentable), std::invalid_argument);
+}
+
+TEST_CASE("the factories reject a shape whose byte count overflows") {
+  // 2^62 f32 elements count fine but take 2^64 bytes, which an unchecked
+  // size_t product wraps to 0.
+  CHECK_THROWS_WITH_AS(Tensor::zeros({kTwoTo(31), kTwoTo(31)}),
+                       doctest::Contains("f32[2147483648, 2147483648]"), std::invalid_argument);
+  // The limit is the largest byte count int64 (and ptrdiff_t) can hold, so
+  // every byte offset into a tensor fits a signed integer too.
+  float x = 0.0f;
+  CHECK_THROWS_AS(Tensor::wrap(&x, {kTwoTo(61)}), std::invalid_argument);         // 2^63 bytes
+  CHECK_THROWS_AS(Tensor::wrap(&x, {kTwoTo(62)}, DType::BF16), std::invalid_argument);
+  CHECK_NOTHROW(Tensor::wrap(&x, {kTwoTo(61) - 1}));  // 2^63 - 4 bytes: no allocation, fits
+  CHECK_NOTHROW(Tensor::wrap(&x, {kTwoTo(62) - 1}, DType::BF16));
+}
+
+TEST_CASE("reshape rejects a shape whose element count only matches after wrapping") {
+  // 11 * 1676976733973595602 = 2^64 + 6, which an unchecked int64 product
+  // wraps to exactly the 6 elements this tensor has.
+  const Tensor t = Tensor::zeros({2, 3});
+  CHECK_THROWS_WITH_AS(t.reshape({11, 1676976733973595602}), doctest::Contains("too large"),
+                       std::invalid_argument);
+  // 2^64 wraps to 0, the element count of an empty tensor.
+  CHECK_THROWS_WITH_AS(Tensor::zeros({0}).reshape({kTwoTo(32), kTwoTo(32)}),
+                       doctest::Contains("too large"), std::invalid_argument);
+}
+
+TEST_CASE("slice rejects a range whose end overflows") {
+  const Tensor t = Tensor::zeros({4});
+  constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+  // start + count overflows; wrapped, it is negative and passes "<= 4".
+  CHECK_THROWS_AS(t.slice(0, 1, kMax), std::out_of_range);
+  CHECK_THROWS_AS(t.slice(0, kMax, 1), std::out_of_range);
+  CHECK_THROWS_WITH_AS(t.slice(0, 2, kMax), doctest::Contains("from 2"), std::out_of_range);
+  CHECK(t.slice(0, 4, 0).numel() == 0);  // an empty range at the very end is fine
+}
+
+TEST_CASE("slicing an empty tensor does not move its pointer") {
+  // The buffer is zero bytes long, so any step past its start points outside
+  // it. Here the step is 2 elements, past the end of nothing.
+  const Tensor e = Tensor::zeros({0, 4});
+  CHECK(e.slice(1, 2, 2).data() == e.data());
+  // And here (2^61 - 1) * 2 elements of 4 bytes wraps a 64-bit address.
+  const Tensor big = Tensor::zeros({0, kTwoTo(61), 2});
+  CHECK(big.slice(1, kTwoTo(61) - 1, 1).data() == big.data());
+}
