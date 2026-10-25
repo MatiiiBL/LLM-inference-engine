@@ -13,6 +13,8 @@ include/minillm/   the frozen interfaces — nine headers, no implementation
 src/ops_ref/       naive scalar reference ops (the in-repo oracle)
 src/ops/           the optimized kernels
 oracle/            generate.py: the PyTorch golden data
+bench/             minillm_bench: ops:: vs ref::, prefill/decode tok/s, peak RSS
+ci/                run.sh: the whole CI pipeline as one local command
 docs/              ARCHITECTURE.md and one file per workflow
 ```
 
@@ -94,6 +96,115 @@ override the defaults.
 After generating, re-run `ctest --preset asan`: the skip summary printed at the
 end of each test binary should be empty.
 
+## CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and
+pull request, on Linux (GCC) and macOS (AppleClang). Each of its steps is a
+stage of [`ci/run.sh`](ci/run.sh), so the same pipeline runs locally from a
+clean clone with one command:
+
+```sh
+ci/run.sh              # oracle -> asan -> tsan -> bench
+ci/run.sh asan         # or any subset of stages, in the order given
+```
+
+A run fails on:
+
+- **Any warning** while building `asan`, `tsan` or `release`. Compiler warnings
+  become errors through `CMAKE_COMPILE_WARNING_AS_ERROR`, which stays set in
+  that build tree afterwards, so an incremental build cannot hide one. The
+  build log is also grepped for linker and CMake warnings.
+- A failing test under ASan+UBSan or under TSan.
+- **Any skipped oracle check.** With the oracle in place there are none, so a
+  skip means the oracle is missing or broken. That should be a red run, not a
+  suspiciously fast green one. Skips that are pending another workflow's
+  module are listed but not counted. `MINILLM_ALLOW_ORACLE_SKIPS=1` turns the
+  failure into a report.
+- The benchmark exiting non-zero.
+
+A second job, `fresh clone, no oracle`, runs the three commands from
+[Build and test](#build-and-test) verbatim, with no oracle and no caches. It
+checks that the oracle checks skip there instead of failing.
+
+CI caches `oracle/data/` + `models/` (key: `oracle/generate.py` +
+`oracle/requirements.txt`), the FetchContent sources in `.cache/fetchcontent/`
+(key: the pinned URLs and hashes in `CMakeLists.txt`), and ccache.
+
+## Benchmarks
+
+```sh
+cmake --preset release && cmake --build --preset release
+./build/release/bench/minillm_bench                   # from the repo root
+./build/release/bench/minillm_bench --filter matmul   # a subset; see --help
+```
+
+Quote numbers from the `release` preset only. The binary refuses to run from a
+sanitizer or unoptimized build. It reads the checkpoint from
+`models/SmolLM2-135M/` (the oracle generator downloads it) and exits with
+status 2 if that is missing.
+
+### Reading the benchmark output
+
+**Whole model** comes first: prefill and decode throughput in tokens/s, then
+peak RSS.
+
+- *Prefill* is one forward pass over a 128-token synthetic prompt, starting
+  from an empty cache.
+- *Decode* is the 64 greedy one-token steps that follow it.
+
+The two have different bottlenecks. Prefill is compute-bound on matmul. Decode
+is memory-bound: every token streams all the weights once. Until the forward
+pass is assembled after Wave 1, this section prints `SKIP` with the
+not-implemented message instead.
+
+**ops:: vs ref::** has one row per op, at the shape the forward pass actually
+runs it with:
+
+- `prefill.*`: 128 rows.
+- `decode.*`: 1 row, attending over 192 positions.
+- `last_token.*`: the LM head and argmax, which run once per pass.
+
+`kv_proj` and `gate_up` each stand for two matmuls of that shape per layer.
+
+| Column | Meaning |
+| --- | --- |
+| `ops::`, `ref::` | median time per call over the samples (5 by default) |
+| `+/-` | half the spread of the samples: (max − min) / 2 / median |
+| `calls` | samples × calls per sample; fast ops are batched so each sample lasts ≥ 50 ms |
+| `speedup` | `ref::` / `ops::`, measured on interleaved pairs of samples, median over the pairs; > 1 means `ops::` is faster |
+
+Read every speedup together with its `+/-`. An op that has not been optimized
+yet forwards `ops::` to `ref::`, so its true speedup is exactly 1.00x. Whatever
+its row shows is therefore the noise floor: about ±1% on a quiet machine, and a
+lot more while other jobs are running. An optimization that does not clear the
+noise floor has not been measured.
+
+**Machine-readable lines** close the run, one per measurement:
+
+```
+BENCH {"name":"op.decode.matmul.q_proj.ops","value":187.9,"unit":"us","iterations":1360,"samples":5,"min":184.0,"max":191.4}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `value` | the median |
+| `iterations` | timed calls in total (timed runs, for `model.*`) |
+| `samples`, `min`, `max` | the spread; absent on peak RSS, which is a single reading |
+
+Names follow these patterns:
+
+| Name | Unit |
+| --- | --- |
+| `op.<regime>.<op>.ops` / `.ref` | µs per call |
+| `op.<regime>.<op>.speedup` | ratio |
+| `model.prefill`, `model.decode` | tok/s |
+| `memory.peak_rss.model` | MiB, after load + prefill + decode |
+| `memory.peak_rss.process` | MiB, whole run |
+
+`ci/run.sh bench` writes them to `build/release/bench-results.jsonl`, and CI
+uploads that file as an artifact on every run, so drift can be tracked over
+time.
+
 ## Working on a module
 
 Each module is owned by one workflow with its own file in
@@ -111,7 +222,7 @@ it tests against, and its done criteria. These are local-only, as noted above.
 | 07 | [sampling](docs/workflows/07-sampling.md) | `src/sampling/` |
 | 08 | [runtime](docs/workflows/08-runtime.md) | `src/runtime/` |
 | 09 | [cli](docs/workflows/09-cli.md) | `src/cli/` |
-| 10 | [bench + CI](docs/workflows/10-bench-ci.md) | `bench/`, CI config |
+| 10 | [bench + CI](docs/workflows/10-bench-ci.md) | `bench/`, `ci/`, `.github/workflows/` |
 
 Three rules, in priority order:
 
