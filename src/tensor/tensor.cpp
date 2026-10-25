@@ -7,7 +7,8 @@
 namespace minillm {
 namespace {
 
-/// Row-major packed strides for `shape`, in elements.
+/// Row-major packed strides for `shape`, in elements. Only called on shapes
+/// check_shape() accepted, or views of them, so no product here overflows.
 std::array<std::int64_t, kMaxDims> packed_strides(const Shape& shape) {
   std::array<std::int64_t, kMaxDims> strides{};
   std::int64_t acc = 1;
@@ -23,7 +24,16 @@ std::array<std::int64_t, kMaxDims> packed_strides(const Shape& shape) {
   return strides;
 }
 
-void check_shape(const Shape& shape) {
+/// Rejects any shape a `dtype` tensor cannot have, and returns its byte count.
+///
+/// Besides the rank and the sign of each extent, every product a tensor of
+/// this shape will ever form has to fit in int64: its packed strides, its
+/// element count and its size in bytes. Multiplying the extents from the
+/// innermost out forms exactly the strides packed_strides() does, then the
+/// element count. A zero extent zeroes everything outside it, which is why
+/// {2^62, 0, 2^62} is a valid empty tensor while {0, 2^62, 2^62}, whose
+/// dimension 0 would need a stride of 2^124, is not.
+std::size_t check_shape(const Shape& shape, DType dtype) {
   if (shape.ndim() < 1 || shape.ndim() > kMaxDims) {
     throw std::invalid_argument("Tensor: rank must be 1.." + std::to_string(kMaxDims) + ", got " +
                                 std::to_string(shape.ndim()));
@@ -33,6 +43,21 @@ void check_shape(const Shape& shape) {
       throw std::invalid_argument("Tensor: negative extent in shape " + shape.to_string());
     }
   }
+  std::int64_t count = 1;
+  for (int i = shape.ndim() - 1; i >= 0; --i) {
+    if (__builtin_mul_overflow(count, shape[i], &count)) {
+      throw std::invalid_argument("Tensor: shape " + shape.to_string() +
+                                  " is too large: its strides or element count overflow int64");
+    }
+  }
+  const auto esize = static_cast<std::int64_t>(dtype_size(dtype));  // rejects Q8_0
+  std::int64_t bytes = 0;
+  if (__builtin_mul_overflow(count, esize, &bytes)) {
+    throw std::invalid_argument("Tensor: " + std::string(dtype_name(dtype)) + shape.to_string() +
+                                " is too large: " + std::to_string(count) + " elements of " +
+                                std::to_string(esize) + " bytes overflow int64");
+  }
+  return static_cast<std::size_t>(bytes);
 }
 
 }  // namespace
@@ -114,8 +139,19 @@ std::int64_t& Shape::operator[](int i) {
 
 std::int64_t Shape::numel() const {
   if (ndim_ == 0) return 0;
+  // A zero extent makes the count 0 however large the others are, and
+  // checking for one first makes the answer independent of the order in
+  // which the rest would be multiplied.
+  for (int i = 0; i < ndim_; ++i) {
+    if (dims_[static_cast<std::size_t>(i)] == 0) return 0;
+  }
   std::int64_t n = 1;
-  for (int i = 0; i < ndim_; ++i) n *= dims_[static_cast<std::size_t>(i)];
+  for (int i = 0; i < ndim_; ++i) {
+    if (__builtin_mul_overflow(n, dims_[static_cast<std::size_t>(i)], &n)) {
+      throw std::overflow_error("Shape::numel: the element count of " + to_string() +
+                                " overflows int64");
+    }
+  }
   return n;
 }
 
@@ -145,8 +181,7 @@ std::string Shape::to_string() const {
 // --------------------------------------------------------------------------
 
 Tensor Tensor::empty(const Shape& shape, DType dtype) {
-  check_shape(shape);
-  const std::size_t bytes = static_cast<std::size_t>(shape.numel()) * dtype_size(dtype);
+  const std::size_t bytes = check_shape(shape, dtype);
   Tensor t;
   // make_shared<std::byte[]> gives us a correctly-aligned allocation for any
   // scalar type and a single control block; views share ownership through it.
@@ -160,14 +195,14 @@ Tensor Tensor::empty(const Shape& shape, DType dtype) {
 
 Tensor Tensor::zeros(const Shape& shape, DType dtype) {
   Tensor t = empty(shape, dtype);
+  // empty() has checked that this product fits.
   const std::size_t bytes = static_cast<std::size_t>(shape.numel()) * dtype_size(dtype);
   std::memset(t.data_, 0, bytes);
   return t;
 }
 
 Tensor Tensor::wrap(void* data, const Shape& shape, DType dtype) {
-  check_shape(shape);
-  (void)dtype_size(dtype);  // reject Q8_0 here too
+  check_shape(shape, dtype);
   if (data == nullptr && shape.numel() != 0) {
     throw std::invalid_argument("Tensor::wrap: null data for non-empty shape " + shape.to_string());
   }
@@ -215,7 +250,7 @@ const float* Tensor::f32() const {
 }
 
 Tensor Tensor::reshape(const Shape& shape) const {
-  check_shape(shape);
+  check_shape(shape, dtype_);
   if (!is_contiguous()) {
     throw std::invalid_argument("Tensor::reshape: tensor is not contiguous: " + to_string());
   }
@@ -234,16 +269,22 @@ Tensor Tensor::slice(int dim, std::int64_t start, std::int64_t count) const {
     throw std::out_of_range("Tensor::slice: dimension " + std::to_string(dim) +
                             " out of range for " + to_string());
   }
-  if (start < 0 || count < 0 || start + count > shape_[dim]) {
-    throw std::out_of_range("Tensor::slice: [" + std::to_string(start) + ", " +
-                            std::to_string(start + count) + ") out of range for dimension " +
+  // Compared without forming start + count, which can overflow.
+  if (start < 0 || count < 0 || start > shape_[dim] || count > shape_[dim] - start) {
+    throw std::out_of_range("Tensor::slice: " + std::to_string(count) + " entries from " +
+                            std::to_string(start) + " out of range for dimension " +
                             std::to_string(dim) + " of " + to_string());
   }
   Tensor t = *this;
   t.shape_[dim] = count;
-  t.data_ = static_cast<std::byte*>(data_) +
-            static_cast<std::size_t>(start * strides_[static_cast<std::size_t>(dim)]) *
-                dtype_size(dtype_);
+  // An empty tensor addresses nothing, and its strides can step far past the
+  // end of its buffer, which may be zero bytes long, so its views keep its
+  // pointer.
+  if (numel() != 0) {
+    t.data_ = static_cast<std::byte*>(data_) +
+              static_cast<std::size_t>(start * strides_[static_cast<std::size_t>(dim)]) *
+                  dtype_size(dtype_);
+  }
   return t;
 }
 
