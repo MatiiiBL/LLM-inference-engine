@@ -155,9 +155,7 @@ peak RSS.
 - *Decode* is the 64 greedy one-token steps that follow it.
 
 The two have different bottlenecks. Prefill is compute-bound on matmul. Decode
-is memory-bound: every token streams all the weights once. Until the forward
-pass is assembled after Wave 1, this section prints `SKIP` with the
-not-implemented message instead.
+is memory-bound: every token streams all the weights once.
 
 **ops:: vs ref::** has one row per op, at the shape the forward pass actually
 runs it with:
@@ -246,7 +244,7 @@ You may freely add private headers and sources inside your own
 
 ## Status
 
-Phase 0. `Tensor`, every reference op and the KV cache are complete and tested
-against PyTorch. Every other module is a stub that compiles, links, and throws
-`std::logic_error("not implemented: ...")`, with a placeholder test that
-asserts the stub is wired up and says which workflow will replace it.
+The forward pass is assembled. `minillm` runs SmolLM2-135M end to end, and
+its 64-token greedy generations match the PyTorch oracle's id for id; every
+hidden state and the final logits are checked against torch layer by layer
+(`tests/model/`).

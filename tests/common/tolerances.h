@@ -90,15 +90,35 @@ inline constexpr Tolerance kProjection{1e-4, 1e-5};
 /// Per-layer hidden states. 30 layers of residual accumulation; the error at
 /// layer i is roughly the error at layer i-1 plus one block's worth.
 ///
-/// PROVISIONAL: a placeholder until Model::forward exists and the real drift
-/// is measured. The workflow that lands the forward pass must replace this
-/// with measured values and record the measurement in its PR.
-inline constexpr Tolerance kHiddenState{2e-3, 2e-3};
+/// The error is set by the first token's row. SmolLM2 parks attention-sink
+/// activations there, up to ~2e4 in a handful of channels, so that row's
+/// residual sums run at magnitudes where one ulp is ~1e-3. The huge elements
+/// themselves stay within 6e-6 relative (rtol covers them 16x over), but every
+/// other element of the row inherits an absolute error of a few of those ulps
+/// whatever its own size — hence atol does the work, and rtol stays small so
+/// the large elements are not waved through.
+/// Measured on the model/ prompts (release; asan gives the same numbers):
+///   p0,  5 tokens: max abs 2.0e-2 (state 29, an element of 3212), max rel
+///                  0.12; worst element uses 12% of this bound (state 11)
+///   p1,  6 tokens: max abs 1.2e-2 (state 29), max rel 0.24; 14% (state 30)
+///   p2, 15 tokens: max abs 6.8e-3 (state 29), max rel 0.46; 34% (state 29,
+///                  an error of 2.1e-3 on an element of 1.5 in row 0)
+/// The max rels come from elements near zero. The error does not grow with
+/// prompt length: against torch on prefixes of one 444-token text (n = 32,
+/// 64, 128, 256) the worst element uses 12-13% at every n, and past row 0 the
+/// max abs error per position is 2e-4 to 1.5e-3, flat from position 8 to 255.
+inline constexpr Tolerance kHiddenState{1e-4, 6e-3};
 
-/// Final logits: hidden-state drift plus a [vocab, hidden] matmul.
-/// PROVISIONAL, as above. Note that greedy token IDS are compared exactly —
-/// a loose logit tolerance never excuses a divergent token.
-inline constexpr Tolerance kLogits{1e-3, 5e-3};
+/// Final logits (the last row): hidden-state drift plus a [vocab, hidden]
+/// matmul. The final norm brings the hidden state back to O(1), so the drift
+/// stays small. Greedy token IDS are still compared exactly: a logit tolerance
+/// never excuses a divergent token.
+/// Measured (release): max abs 4.6e-5 / 3.8e-5 / 3.9e-5 and max rel 5.7e-2 /
+/// 1.8e-3 / 3.1e-2 for p0 / p1 / p2, at most 10% of this bound. The same
+/// 444-token text at n = 32-256 peaks at 9.3e-5 (22%, n = 128). Prefill then
+/// one decode step against a one-shot prefill of the same tokens — the m = 1
+/// and m = n matmul paths — differ by at most 5.5e-5 (17%).
+inline constexpr Tolerance kLogits{1e-4, 3e-4};
 
 }  // namespace tol
 
