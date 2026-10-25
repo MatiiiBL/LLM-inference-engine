@@ -64,6 +64,19 @@ std::int32_t argmax(std::span<const float> logits) {
   return static_cast<std::int32_t>(best);
 }
 
+/// The largest logit, or -inf if there is none. NaNs are skipped: std::max
+/// keeps its first argument against one. Four running maxima rather than one
+/// make the loop bound by throughput, not by one long chain of comparisons.
+float largest(std::span<const float> logits) {
+  float lanes[4] = {kNegInf, kNegInf, kNegInf, kNegInf};
+  std::size_t i = 0;
+  for (; i + 4 <= logits.size(); i += 4) {
+    for (std::size_t j = 0; j < 4; ++j) lanes[j] = std::max(lanes[j], logits[i + j]);
+  }
+  for (; i < logits.size(); ++i) lanes[0] = std::max(lanes[0], logits[i]);
+  return std::max(std::max(lanes[0], lanes[1]), std::max(lanes[2], lanes[3]));
+}
+
 /// Stage 1. Each distinct id in `history` is penalized exactly once.
 void apply_repetition_penalty(std::span<float> logits, std::span<const std::int32_t> history,
                               float penalty) {
@@ -162,15 +175,30 @@ std::int32_t Sampler::sample(std::span<float> logits, std::span<const std::int32
   }
   if (params_.temperature <= 0.0f) return argmax(logits);
 
+  // Every logit -inf (or NaN), or some +inf: there is no proper
+  // distribution, and the most likely token is the only sensible answer.
+  const float max_logit = largest(logits);
+  if (std::isinf(max_logit)) {
+    if (max_logit < 0.0f) return 0;
+    return static_cast<std::int32_t>(std::find(logits.begin(), logits.end(), max_logit) -
+                                     logits.begin());
+  }
+
   // 2. Temperature, finite and > 0 here: the constructor validated params_.
+  // The logits become (v - max) / temperature, which softmax cannot tell
+  // from v / temperature. Dividing v itself by a tiny temperature can push
+  // distinct logits to +inf, where they tie and the lowest id wins instead
+  // of the largest logit; v - max <= 0, so the quotient can only round down
+  // to -inf, probability 0, while the largest logit stays at exactly 0.
   // A NaN logit becomes -inf, an impossible token, so that every ordering
-  // below is a strict total order. Top-1 cannot depend on the temperature,
-  // but dividing by a tiny one can overflow distinct logits into a tie at
-  // +inf that the lowest id would win, so top_k = 1 leaves the logits as
-  // they are.
+  // below is a strict total order.
+  //
+  // Top-1 cannot depend on the temperature, but dividing by a huge one can
+  // round a logit just below the max to -0, a tie with the max's 0 that the
+  // lowest id would win, so top_k = 1 does not divide at all.
   const float temperature = params_.top_k == 1 ? 1.0f : params_.temperature;
   for (float& v : logits) {
-    v /= temperature;
+    v = (v - max_logit) / temperature;
     if (std::isnan(v)) v = kNegInf;
   }
 
@@ -195,20 +223,11 @@ std::int32_t Sampler::sample(std::span<float> logits, std::span<const std::int32
     std::sort(ids.begin(), ids.end(), order);
   }
 
-  float max_logit = kNegInf;
-  for (const std::int32_t id : ids) max_logit = std::max(max_logit, x[id]);
-  // Every candidate is -inf, or some are +inf: there is no proper
-  // distribution, and the most likely token is the only sensible answer.
-  if (!std::isfinite(max_logit)) {
-    for (const std::int32_t id : ids) {
-      if (x[id] == max_logit) return id;
-    }
-  }
-
   // Unnormalized softmax weights, written over the logits (they are scratch).
+  // The largest logit is now 0, and always among the candidates.
   double total = 0.0;
   for (const std::int32_t id : ids) {
-    x[id] = std::exp(x[id] - max_logit);
+    x[id] = std::exp(x[id]);
     total += x[id];
   }
 
