@@ -1,15 +1,183 @@
 // Weights + safetensors loading — owned by workflow 01-loader.
 //
-// STUB, except for the Weights container itself: it is a map with error
-// messages, there is nothing to discover about it, and having it working means
-// other modules can be tested with hand-built weights before the real loader
-// exists.
+// The format (https://github.com/huggingface/safetensors):
+//
+//   [8 bytes]  N, a little-endian u64: the header length
+//   [N bytes]  a JSON object: name -> {"dtype", "shape", "data_offsets": [begin, end]},
+//              plus an optional "__metadata__" entry, which is skipped
+//   [rest]     the data section; data_offsets are relative to its start
+//
+// Every tensor is read into a buffer it owns (no mmap), so nothing a Tensor
+// points at depends on the file staying open or mapped.
 
+#include <algorithm>
+#include <bit>
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <limits>
+#include <map>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <nlohmann/json.hpp>
 
 #include "minillm/loader.h"
 
 namespace minillm {
+namespace {
+
+namespace fs = std::filesystem;
+using ordered_json = nlohmann::ordered_json;
+
+// The data section is little-endian; reading it straight into native floats
+// is only correct on a little-endian host.
+static_assert(std::endian::native == std::endian::little, "minillm assumes a little-endian host");
+
+[[noreturn]] void fail(const fs::path& file, const std::string& message) {
+  throw std::runtime_error("safetensors: " + file.string() + ": " + message);
+}
+
+/// An open .safetensors file whose header has been parsed and checked.
+struct SafetensorsFile {
+  std::ifstream stream;
+  std::vector<TensorInfo> tensors;  ///< in file order, i.e. sorted by data_begin
+  std::uint64_t data_start = 0;     ///< file offset of the data section
+};
+
+/// One header entry. `data_size` is the length of the data section.
+TensorInfo parse_entry(const fs::path& file, const std::string& name, const ordered_json& entry,
+                       std::uint64_t data_size) {
+  const auto bad = [&](const std::string& message) {
+    fail(file, "tensor '" + name + "': " + message);
+  };
+  constexpr auto kMaxExtent = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max());
+
+  if (!entry.is_object()) bad("entry must be a JSON object, got " + entry.dump());
+  TensorInfo info;
+  info.name = name;
+
+  const auto dtype = entry.find("dtype");
+  if (dtype == entry.end() || !dtype->is_string()) bad("missing string \"dtype\"");
+  try {
+    info.dtype = dtype_from_string(dtype->get<std::string>());
+  } catch (const std::invalid_argument&) {
+    bad("unsupported dtype " + dtype->dump() + " (supported: F32, BF16, F16)");
+  }
+
+  const auto shape = entry.find("shape");
+  if (shape == entry.end() || !shape->is_array()) bad("missing array \"shape\"");
+  if (shape->empty() || shape->size() > static_cast<std::size_t>(kMaxDims)) {
+    bad("shape " + shape->dump() + " has rank " + std::to_string(shape->size()) +
+        "; minillm supports rank 1.." + std::to_string(kMaxDims));
+  }
+  std::int64_t dims[kMaxDims] = {};
+  std::uint64_t numel = 1;
+  for (std::size_t i = 0; i < shape->size(); ++i) {
+    const ordered_json& d = (*shape)[i];
+    if (!d.is_number_unsigned() || d.get<std::uint64_t>() > kMaxExtent) {
+      bad("shape must hold non-negative integers, got " + shape->dump());
+    }
+    const std::uint64_t extent = d.get<std::uint64_t>();
+    if (extent != 0 && numel > kMaxExtent / extent) bad("shape " + shape->dump() + " overflows");
+    numel *= extent;
+    dims[i] = static_cast<std::int64_t>(extent);
+  }
+  info.shape = Shape(dims, static_cast<int>(shape->size()));
+
+  const auto offsets = entry.find("data_offsets");
+  if (offsets == entry.end() || !offsets->is_array() || offsets->size() != 2 ||
+      !(*offsets)[0].is_number_unsigned() || !(*offsets)[1].is_number_unsigned()) {
+    bad("\"data_offsets\" must be [begin, end] with non-negative integers");
+  }
+  const std::uint64_t begin = (*offsets)[0].get<std::uint64_t>();
+  const std::uint64_t end = (*offsets)[1].get<std::uint64_t>();
+  if (begin > end) bad("data_offsets " + offsets->dump() + " are reversed");
+  if (end > data_size) {
+    bad("data_offsets " + offsets->dump() + " run past the end of the file (the data section is " +
+        std::to_string(data_size) + " bytes)");
+  }
+  const std::uint64_t esize = dtype_size(info.dtype);
+  if (numel > std::numeric_limits<std::uint64_t>::max() / esize || end - begin != numel * esize) {
+    bad("data_offsets " + offsets->dump() + " span " + std::to_string(end - begin) +
+        " bytes, but " + std::string(dtype_name(info.dtype)) + info.shape.to_string() + " needs " +
+        std::to_string(numel * esize));
+  }
+  info.data_begin = static_cast<std::size_t>(begin);
+  info.data_end = static_cast<std::size_t>(end);
+  return info;
+}
+
+SafetensorsFile open_safetensors(const fs::path& file) {
+  SafetensorsFile f;
+  f.stream.open(file, std::ios::binary);
+  if (!f.stream) fail(file, "cannot open file");
+  std::error_code ec;
+  const std::uint64_t file_size = fs::file_size(file, ec);
+  if (ec) fail(file, "cannot read the file size: " + ec.message());
+
+  if (file_size < 8) {
+    fail(file, "truncated: " + std::to_string(file_size) +
+                   " bytes is too short for the 8-byte header length");
+  }
+  unsigned char len_bytes[8];
+  f.stream.read(reinterpret_cast<char*>(len_bytes), sizeof(len_bytes));
+  if (!f.stream) fail(file, "cannot read the header length");
+  std::uint64_t header_len = 0;
+  for (int i = 7; i >= 0; --i) header_len = (header_len << 8) | len_bytes[i];
+  if (header_len > file_size - 8) {
+    fail(file, "truncated: the header length is " + std::to_string(header_len) +
+                   " bytes, but only " + std::to_string(file_size - 8) + " follow it");
+  }
+
+  std::string header(static_cast<std::size_t>(header_len), '\0');
+  f.stream.read(header.data(), static_cast<std::streamsize>(header_len));
+  if (!f.stream) fail(file, "cannot read the " + std::to_string(header_len) + "-byte header");
+
+  ordered_json root;
+  try {
+    root = ordered_json::parse(header);
+  } catch (const ordered_json::exception& e) {
+    fail(file, std::string("header is not valid JSON: ") + e.what());
+  }
+  if (!root.is_object()) fail(file, "header must be a JSON object");
+
+  f.data_start = 8 + header_len;
+  const std::uint64_t data_size = file_size - f.data_start;
+  for (const auto& item : root.items()) {
+    if (item.key() == "__metadata__") continue;
+    f.tensors.push_back(parse_entry(file, item.key(), item.value(), data_size));
+  }
+
+  // stable_sort keeps header order among empty tensors that share an offset.
+  std::stable_sort(f.tensors.begin(), f.tensors.end(), [](const TensorInfo& a, const TensorInfo& b) {
+    return a.data_begin != b.data_begin ? a.data_begin < b.data_begin : a.data_end < b.data_end;
+  });
+  // Sorted by begin, a range overlaps an earlier one iff it starts before the
+  // previous non-empty range ends (everything before that already passed).
+  const TensorInfo* prev = nullptr;
+  for (const TensorInfo& t : f.tensors) {
+    if (t.data_begin == t.data_end) continue;
+    if (prev != nullptr && t.data_begin < prev->data_end) {
+      fail(file, "tensors '" + prev->name + "' [" + std::to_string(prev->data_begin) + ", " +
+                     std::to_string(prev->data_end) + ") and '" + t.name + "' [" +
+                     std::to_string(t.data_begin) + ", " + std::to_string(t.data_end) +
+                     ") overlap");
+    }
+    prev = &t;
+  }
+  return f;
+}
+
+std::uint16_t load_u16(const std::byte* p, std::int64_t i) {
+  std::uint16_t v;
+  std::memcpy(&v, p + 2 * i, sizeof(v));  // memcpy: a wrapped buffer may be unaligned
+  return v;
+}
+
+}  // namespace
 
 bool Weights::has(std::string_view name) const { return tensors_.find(name) != tensors_.end(); }
 
@@ -51,20 +219,97 @@ std::size_t Weights::bytes() const {
   return total;
 }
 
-Tensor convert_to_f32(const Tensor&) {
-  throw std::logic_error("not implemented: convert_to_f32 (workflow 01-loader)");
+Tensor convert_to_f32(const Tensor& src) {
+  if (src.dtype() == DType::Q8_0) {
+    throw std::invalid_argument("convert_to_f32: Q8_0 is reserved and not implemented");
+  }
+  if (src.is_empty()) return Tensor();
+  if (src.dtype() == DType::F32) return src.copy_contiguous();
+
+  // A flat walk needs a contiguous source; a strided view costs one extra copy.
+  const Tensor in = src.is_contiguous() ? src : src.copy_contiguous();
+  Tensor out = Tensor::empty(in.shape(), DType::F32);
+  const auto* raw = static_cast<const std::byte*>(in.data());
+  float* dst = out.f32();
+  const std::int64_t n = in.numel();
+  if (in.dtype() == DType::BF16) {
+    for (std::int64_t i = 0; i < n; ++i) dst[i] = bf16_to_f32(load_u16(raw, i));
+  } else {
+    for (std::int64_t i = 0; i < n; ++i) dst[i] = f16_to_f32(load_u16(raw, i));
+  }
+  return out;
 }
 
-Weights load_safetensors(const std::filesystem::path&) {
-  throw std::logic_error("not implemented: load_safetensors (workflow 01-loader)");
+std::vector<TensorInfo> read_safetensors_header(const std::filesystem::path& file) {
+  return open_safetensors(file).tensors;
 }
 
-Weights load_checkpoint(const std::filesystem::path&) {
-  throw std::logic_error("not implemented: load_checkpoint (workflow 01-loader)");
+Weights load_safetensors(const std::filesystem::path& file) {
+  SafetensorsFile f = open_safetensors(file);
+  Weights weights;
+  for (const TensorInfo& info : f.tensors) {
+    Tensor raw = Tensor::empty(info.shape, info.dtype);
+    const std::size_t bytes = info.data_end - info.data_begin;
+    f.stream.seekg(static_cast<std::streamoff>(f.data_start + info.data_begin));
+    f.stream.read(static_cast<char*>(raw.data()), static_cast<std::streamsize>(bytes));
+    if (!f.stream) {
+      fail(file, "truncated data section: cannot read the " + std::to_string(bytes) +
+                     " bytes of '" + info.name + "'");
+    }
+    weights.insert(info.name, info.dtype == DType::F32 ? std::move(raw) : convert_to_f32(raw));
+  }
+  return weights;
 }
 
-std::vector<TensorInfo> read_safetensors_header(const std::filesystem::path&) {
-  throw std::logic_error("not implemented: read_safetensors_header (workflow 01-loader)");
+Weights load_checkpoint(const std::filesystem::path& model_dir) {
+  const fs::path single = model_dir / "model.safetensors";
+  const fs::path index_path = model_dir / "model.safetensors.index.json";
+  std::error_code ec;
+  if (fs::is_regular_file(single, ec)) return load_safetensors(single);
+  if (!fs::is_regular_file(index_path, ec)) {
+    throw std::runtime_error("load_checkpoint: " + model_dir.string() +
+                             " has neither model.safetensors nor model.safetensors.index.json");
+  }
+
+  nlohmann::json index;
+  {
+    std::ifstream in(index_path, std::ios::binary);
+    if (!in) fail(index_path, "cannot open file");
+    try {
+      index = nlohmann::json::parse(in);
+    } catch (const nlohmann::json::exception& e) {
+      fail(index_path, std::string("not valid JSON: ") + e.what());
+    }
+  }
+  // weight_map: tensor name -> shard file name, relative to model_dir.
+  const auto map = index.is_object() ? index.find("weight_map") : index.end();
+  if (map == index.end() || !map->is_object() || map->empty()) {
+    fail(index_path, "missing or empty \"weight_map\" object");
+  }
+  std::map<std::string, std::vector<std::string>> names_by_shard;
+  for (const auto& item : map->items()) {
+    if (!item.value().is_string()) {
+      fail(index_path, "weight_map entry for '" + item.key() + "' must be a shard file name");
+    }
+    names_by_shard[item.value().get<std::string>()].push_back(item.key());
+  }
+
+  Weights weights;
+  for (const auto& [shard, listed] : names_by_shard) {
+    const fs::path shard_path = model_dir / shard;
+    const Weights part = load_safetensors(shard_path);
+    for (const std::string& name : listed) {
+      if (!part.has(name)) {
+        fail(shard_path, index_path.filename().string() + " places '" + name +
+                             "' in this shard, but it is not there");
+      }
+    }
+    for (const std::string& name : part.names()) {
+      if (weights.has(name)) fail(shard_path, "tensor '" + name + "' is also in another shard");
+      weights.insert(name, part.get(name));  // a handle copy: shares the storage
+    }
+  }
+  return weights;
 }
 
 }  // namespace minillm
