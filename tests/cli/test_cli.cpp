@@ -9,8 +9,9 @@
 //   2. The real binary, spawned as a child process: exit statuses and
 //      messages, and that no exception escapes main().
 //   3. End to end: the real binary on the real checkpoint, greedy, against
-//      oracle/data/model/p{i}_greedy_ids.npy id for id, and its streamed
-//      stdout against a one-call decode of the same ids.
+//      oracle/data/model/p{i}_greedy_ids.npy id for id (under TSan, the
+//      first kTsanTokens of them), and its streamed stdout against a
+//      one-call decode of the same ids.
 //
 // This target links the tokenizer and the sampler but not the model (see
 // tests/CMakeLists.txt), so the forward pass is only ever reached through the
@@ -56,6 +57,18 @@
 #include "common/allclose.h"
 #include "common/oracle.h"
 #include "minillm/tokenizer.h"
+
+// ThreadSanitizer: GCC defines the macro, Clang has the feature test.
+#if defined(__SANITIZE_THREAD__)
+#define MINILLM_TEST_TSAN 1
+#elif defined(__has_feature)
+#if __has_feature(thread_sanitizer)
+#define MINILLM_TEST_TSAN 1
+#endif
+#endif
+#ifndef MINILLM_TEST_TSAN
+#define MINILLM_TEST_TSAN 0
+#endif
 
 extern char** environ;
 
@@ -565,13 +578,34 @@ constexpr std::array<std::string_view, 3> kOraclePrompts = {
 constexpr std::string_view kMultiBytePrompt = "Tokyo (東京";
 constexpr std::int64_t kMultiByteTokens = 16;
 
+/// Under ThreadSanitizer, the end-to-end runs generate this many tokens
+/// rather than the oracle's 64 and are compared with the oracle's first ones.
+/// TSan runs the binary roughly 40 times slower than release, and CI's TSan
+/// stage spent close to 400 of this test's 600 s here. What TSan is there
+/// for is the threaded run, and 16 tokens of kOraclePrompts[2] already take
+/// that run through every way the kernels split their work: its 15-token
+/// prefill splits attention across threads, and so does every decode step
+/// from the 8th token on, the first to attend over 22 positions. The full
+/// token-by-token comparison stays in the other presets.
+constexpr bool kTsan = MINILLM_TEST_TSAN;
+constexpr std::size_t kTsanTokens = 16;
+
 struct EndToEnd {
   std::string skip_reason;          ///< non-empty: nothing ran
-  std::array<RunResult, 3> oracle;  ///< kOraclePrompts, as many tokens as the oracle, --ignore-eos
-  RunResult stop_at_eos;            ///< kOraclePrompts[1] again, stopping at eos
+  std::array<RunResult, 3> oracle;  ///< kOraclePrompts, expected_greedy_ids() tokens, --ignore-eos
+  RunResult stop_at_eos;            ///< kOraclePrompts[1] again, stopping at eos; not under TSan
   RunResult multibyte;              ///< kMultiBytePrompt
-  RunResult threaded;               ///< kOraclePrompts[0] again, at threaded_count()
+  RunResult threaded;               ///< kOraclePrompts[2] again, at threaded_count()
 };
+
+/// What the end-to-end run of kOraclePrompts[i] must generate: the oracle's
+/// greedy ids, only the first kTsanTokens of them under TSan.
+std::vector<std::int32_t> expected_greedy_ids(std::size_t i) {
+  std::vector<std::int32_t> ids =
+      oracle_npy("model/p" + std::to_string(i) + "_greedy_ids.npy").as_i32_narrowing();
+  if (kTsan && ids.size() > kTsanTokens) ids.resize(kTsanTokens);
+  return ids;
+}
 
 std::vector<std::string> greedy_args(std::string_view prompt, std::size_t max_tokens,
                                      bool ignore_eos, int threads) {
@@ -629,24 +663,24 @@ const EndToEnd& end_to_end() {
       return r;
     }
 
-    std::array<std::size_t, kOraclePrompts.size()> n_oracle{};
+    std::array<std::size_t, kOraclePrompts.size()> n_tokens{};
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) {
-      n_oracle[i] =
-          oracle_npy("model/p" + std::to_string(i) + "_greedy_ids.npy").as_i32_narrowing().size();
+      n_tokens[i] = expected_greedy_ids(i).size();
     }
 
     // The oracle never stops early, so --ignore-eos to match it token for token.
+    // Under TSan nothing generates far enough to reach eos, so that run is left out.
     std::vector<std::vector<std::string>> batch;
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) {
-      batch.push_back(greedy_args(kOraclePrompts[i], n_oracle[i], true, 1));
+      batch.push_back(greedy_args(kOraclePrompts[i], n_tokens[i], true, 1));
     }
-    batch.push_back(greedy_args(kOraclePrompts[1], n_oracle[1], false, 1));
+    if (!kTsan) batch.push_back(greedy_args(kOraclePrompts[1], n_tokens[1], false, 1));
     batch.push_back(greedy_args(kMultiBytePrompt, kMultiByteTokens, false, 1));
     std::vector<RunResult> results = run_all(batch, kRunsAtOnce);
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) r.oracle[i] = std::move(results[i]);
-    r.stop_at_eos = std::move(results[3]);
-    r.multibyte = std::move(results[4]);
-    r.threaded = run_cli(greedy_args(kOraclePrompts[0], n_oracle[0], true, threaded_count()));
+    if (!kTsan) r.stop_at_eos = std::move(results[3]);
+    r.multibyte = std::move(results.back());
+    r.threaded = run_cli(greedy_args(kOraclePrompts[2], n_tokens[2], true, threaded_count()));
 
     // Until every module the binary uses is implemented, it stops at the
     // first stub it reaches and says so.
@@ -1421,30 +1455,32 @@ TEST_CASE("end to end: greedy decoding reproduces the oracle's tokens for every 
       assert_equal(*prompt_ids, oracle_npy(base + "input_ids.npy").as_i32_narrowing(),
                    label + " input ids");
     }
-    assert_equal(generated_ids(run), oracle_npy(base + "greedy_ids.npy").as_i32_narrowing(),
-                 label + " greedy ids");
+    assert_equal(generated_ids(run), expected_greedy_ids(i), label + " greedy ids");
   }
 }
 
 TEST_CASE("end to end: --threads sizes the pool and leaves greedy output unchanged") {
   const EndToEnd* e2e = e2e_or_skip();
   if (!e2e) return;
-  const std::vector<std::int32_t> oracle = oracle_npy("model/p0_greedy_ids.npy").as_i32_narrowing();
+  const std::vector<std::int32_t> oracle = expected_greedy_ids(2);
   struct Run {
     const RunResult* run;
     int threads;
   };
-  for (const Run& r : {Run{&e2e->oracle[0], 1}, Run{&e2e->threaded, threaded_count()}}) {
+  for (const Run& r : {Run{&e2e->oracle[2], 1}, Run{&e2e->threaded, threaded_count()}}) {
     const std::string threads = std::to_string(r.threads);
     CAPTURE(threads);
     // The load banner reports num_threads(), which only set_num_threads changes.
     CHECK(contains(line_containing(r.run->err, "minillm: loaded "), "; " + threads + " thread(s)"));
-    assert_equal(generated_ids(*r.run), oracle, "prompt 0 greedy ids at --threads " + threads);
+    assert_equal(generated_ids(*r.run), oracle, "prompt 2 greedy ids at --threads " + threads);
   }
-  CHECK(e2e->threaded.out == e2e->oracle[0].out);
+  CHECK(e2e->threaded.out == e2e->oracle[2].out);
 }
 
-TEST_CASE("end to end: generation stops at eos, which is neither printed nor counted") {
+// Not under TSan (see kTsanTokens): eos is 55 tokens into prompt 1, and stopping
+// there is single-threaded logic, which the fake-model generate cases above test too.
+TEST_CASE("end to end: generation stops at eos, which is neither printed nor counted" *
+          doctest::skip(kTsan)) {
   const EndToEnd* e2e = e2e_or_skip();
   if (!e2e) return;
   const std::optional<Tokenizer> tok = load_tokenizer();
@@ -1475,10 +1511,12 @@ TEST_CASE("end to end: streamed stdout is byte for byte a one-call decode of the
     std::string name;
     const RunResult* run;
   };
-  for (const Named& n : {Named{"prompt 0", &e2e->oracle[0]}, Named{"prompt 1", &e2e->oracle[1]},
-                         Named{"prompt 2", &e2e->oracle[2]},
-                         Named{"prompt 1 to eos", &e2e->stop_at_eos},
-                         Named{"multi-byte prompt", &e2e->multibyte}}) {
+  std::vector<Named> runs = {{"prompt 0", &e2e->oracle[0]},
+                             {"prompt 1", &e2e->oracle[1]},
+                             {"prompt 2", &e2e->oracle[2]},
+                             {"multi-byte prompt", &e2e->multibyte}};
+  if (!kTsan) runs.push_back({"prompt 1 to eos", &e2e->stop_at_eos});
+  for (const Named& n : runs) {
     CAPTURE(n.name);
     const std::vector<std::int32_t> ids = generated_ids(*n.run);
     CHECK(n.run->out == tok->decode(ids) + "\n");

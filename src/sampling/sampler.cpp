@@ -55,8 +55,12 @@ struct Descending {
   }
 };
 
-/// Same rule as ops::argmax: strictly greater wins, so ties go to the lowest id.
+/// Same rule as ops::argmax, which is torch.argmax's: the first NaN if there
+/// is one; otherwise strictly greater wins, so ties go to the lowest id.
 std::int32_t argmax(std::span<const float> logits) {
+  for (std::size_t i = 0; i < logits.size(); ++i) {
+    if (std::isnan(logits[i])) return static_cast<std::int32_t>(i);
+  }
   std::size_t best = 0;
   for (std::size_t i = 1; i < logits.size(); ++i) {
     if (logits[i] > logits[best]) best = i;

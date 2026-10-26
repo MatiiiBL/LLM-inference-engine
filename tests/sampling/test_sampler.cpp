@@ -8,7 +8,8 @@
 //
 // ops::argmax is not linkable from here (this test links minillm_sampling
 // only), so greedy results are compared against its documented rule instead:
-// the first index of the maximum, i.e. std::max_element.
+// the first NaN if there is one, else the first index of the maximum, i.e.
+// std::max_element.
 
 #include <doctest/doctest.h>
 
@@ -49,7 +50,8 @@ std::vector<float> tied_row(std::int64_t n, std::uint64_t seed) {
   return row;
 }
 
-/// ops::argmax's documented rule: the first index of the maximum.
+/// ops::argmax's documented rule for a row without NaNs: the first index of
+/// the maximum.
 std::int32_t first_argmax(const std::vector<float>& row) {
   return static_cast<std::int32_t>(std::max_element(row.begin(), row.end()) - row.begin());
 }
@@ -191,7 +193,7 @@ TEST_CASE("non-finite params throw instead of quietly returning token 0") {
   // otherwise takes all the mass, out of play.
   throws(with_temperature(kInf), {1.0f, kInf}, {});
   // Infinite penalty: the penalized zero became 0 * inf = NaN, which greedy
-  // argmax never picks.
+  // argmax then never picked.
   SamplingParams penalized;
   penalized.repetition_penalty = kInf;
   throws(penalized, {-1.0f, 0.0f}, {1});
@@ -273,6 +275,47 @@ TEST_CASE("top_k = 1 is greedy regardless of temperature") {
   p.temperature = huge;
   Sampler flat(p);
   CHECK(sample_copy(flat, {std::nextafter(1.0f, 0.0f), 1.0f}) == 1);
+}
+
+TEST_CASE("greedy decoding returns the first NaN, as torch.argmax does") {
+  // torch.argmax counts a NaN as greater than every number, +inf included.
+  // Each expected id is torch 2.14.1's answer for the same row.
+  struct Case {
+    const char* name;
+    std::vector<float> row;
+    std::int32_t expected;
+  };
+  const Case cases[] = {
+      {"NaN first", {kNaN, 1.0f, 3.0f, 2.0f}, 0},
+      {"NaN in the middle", {1.0f, 3.0f, kNaN, 2.0f}, 2},
+      {"NaN last", {1.0f, 3.0f, 2.0f, kNaN}, 3},
+      {"several NaNs", {1.0f, kNaN, 3.0f, kNaN, 2.0f, kNaN}, 1},
+      {"+inf before the NaN", {1.0f, kInf, kNaN, 2.0f}, 2},
+      {"+inf after the NaN", {1.0f, kNaN, kInf, 2.0f}, 1},
+      {"NaN among -inf", {-kInf, -kInf, kNaN, -kInf}, 2},
+      {"all NaN", {kNaN, kNaN, kNaN, kNaN}, 0},
+      {"a lone NaN", {kNaN}, 0},
+  };
+  for (const float temperature : {0.0f, -1.0f}) {
+    Sampler sampler(with_temperature(temperature));
+    for (const Case& c : cases) {
+      CHECK_MESSAGE(sample_copy(sampler, c.row) == c.expected,
+                    c.name << " at temperature " << temperature);
+    }
+  }
+  // The penalty runs first and leaves a NaN a NaN.
+  SamplingParams penalized;
+  penalized.repetition_penalty = 1.3f;
+  Sampler sampler(penalized);
+  const std::vector<std::int32_t> history = {1, 3};
+  CHECK(sample_copy(sampler, {1.0f, 3.0f, 2.0f, kNaN}, history) == 3);
+
+  // Sampling is not greedy decoding, even at top_k = 1: there a NaN is an
+  // impossible token, as in "NaN and infinite logits never break a draw".
+  SamplingParams top1 = with_temperature(1.0f);
+  top1.top_k = 1;
+  Sampler drawing(top1);
+  CHECK(sample_copy(drawing, {1.0f, kNaN, 3.0f, 2.0f}) == 2);
 }
 
 TEST_CASE("as the temperature goes to 0+, every draw is the argmax") {
@@ -655,7 +698,8 @@ TEST_CASE("NaN and infinite logits never break a draw") {
   SamplingParams p = with_temperature(1.0f);
   // A NaN is an impossible token.
   CHECK(drawn(draw_counts(p, {kNaN, 1.0f, kNaN, 0.5f}, 500)) == std::set<std::int32_t>{1, 3});
-  // Nothing is possible: the lowest id, like argmax. A NaN counts as -inf.
+  // Nothing is possible: the lowest id, as argmax gives for all -inf. Here a
+  // NaN counts as -inf, unlike in greedy decoding.
   CHECK(drawn(draw_counts(p, std::vector<float>(8, -kInf), 10)) == std::set<std::int32_t>{0});
   Sampler nothing(p);
   CHECK(sample_copy(nothing, {kNaN, -kInf, kNaN}) == 0);

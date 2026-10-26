@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -373,9 +375,8 @@ TEST_CASE("ops::argmax resolves ties to the lowest index") {
 }
 
 TEST_CASE("ops::argmax agrees with ref around NaN and infinities") {
-  // ref compares with a strict >, so a NaN is never picked unless it is
-  // element 0 — which then can never be beaten. Greedy decoding must not
-  // depend on which namespace it calls.
+  // A NaN anywhere is the answer; an infinity is an ordinary value. Greedy
+  // decoding must not depend on which namespace it calls.
   const float nan = std::numeric_limits<float>::quiet_NaN();
   const float inf = std::numeric_limits<float>::infinity();
   for (const std::int64_t k : {std::int64_t{1}, std::int64_t{17}, std::int64_t{577}, kVocab}) {
@@ -392,6 +393,81 @@ TEST_CASE("ops::argmax agrees with ref around NaN and infinities") {
   Tensor all_neg_inf = Tensor::zeros({33});
   for (std::int64_t i = 0; i < 33; ++i) all_neg_inf.f32()[i] = -inf;
   CHECK(ops::argmax(all_neg_inf) == 0);
+}
+
+TEST_CASE("ops::argmax returns the first NaN, as torch.argmax does") {
+  // torch.argmax counts a NaN as greater than every number, +inf included.
+  // Each expected index is torch 2.14.1's answer for the same row.
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  struct Case {
+    const char* name;
+    std::vector<float> x;
+    std::int32_t expected;
+  };
+  const Case cases[] = {
+      {"NaN first", {nan, 1.0f, 3.0f, 2.0f}, 0},
+      {"NaN in the middle", {1.0f, 3.0f, nan, 2.0f}, 2},
+      {"NaN last", {1.0f, 3.0f, 2.0f, nan}, 3},
+      {"several NaNs", {1.0f, nan, 3.0f, nan, 2.0f, nan}, 1},
+      {"+inf before the NaN", {1.0f, inf, nan, 2.0f}, 2},
+      {"+inf after the NaN", {1.0f, nan, inf, 2.0f}, 1},
+      {"NaN among -inf", {-inf, -inf, nan, -inf}, 2},
+      {"all NaN", {nan, nan, nan, nan}, 0},
+      {"a lone NaN", {nan}, 0},
+  };
+  for (const Case& c : cases) {
+    Tensor x = Tensor::empty({static_cast<std::int64_t>(c.x.size())});
+    std::copy(c.x.begin(), c.x.end(), x.f32());
+    CHECK_MESSAGE(ops::argmax(x) == c.expected, c.name);
+  }
+  CHECK(ops::argmax(nan_filled({kVocab})) == 0);
+
+  // No NaN, but a row whose sum is NaN anyway — inf + -inf, or finite values
+  // that overflow both ways — which the kernel's NaN check must see through.
+  Tensor infinities = random_tensor({kVocab}, 131);
+  infinities.f32()[100] = -inf;
+  infinities.f32()[30000] = inf;
+  CHECK(ops::argmax(infinities) == 30000);
+  const float huge = std::numeric_limits<float>::max();
+  Tensor overflowing = Tensor::empty({kVocab + 3});
+  for (std::int64_t i = 0; i < kVocab + 3; ++i) overflowing.f32()[i] = i % 16 < 8 ? -huge : huge;
+  CHECK(ops::argmax(overflowing) == 8);
+  CHECK(ref::argmax(overflowing) == 8);
+
+  // The first NaN in each part of the kernel: either side of the last
+  // multiple of 32, 16 and 4, where its main loop, its 16-float blocks and
+  // its 4-lane loop end, plus the ends and the middle. Alone, then with more
+  // NaNs after it and +inf right before and right after it.
+  std::vector<std::int64_t> widths(std::begin(kAwkwardWidths), std::end(kAwkwardWidths));
+  widths.push_back(kVocab);
+  widths.push_back(kVocab + 3);
+  for (const std::int64_t k : widths) {
+    std::set<std::int64_t> positions = {0, k / 2, k - 1};
+    for (const std::int64_t step : {32, 16, 4}) {
+      positions.insert(k / step * step - 1);
+      positions.insert(k / step * step);
+    }
+    const Tensor base = random_tensor({k}, 130);
+    for (const std::int64_t first : positions) {
+      if (first < 0 || first >= k) continue;
+      Tensor alone = base.copy_contiguous();
+      alone.f32()[first] = nan;
+      Tensor crowded = alone.copy_contiguous();
+      for (const std::int64_t later : positions) {
+        if (later > first && later < k) crowded.f32()[later] = nan;
+      }
+      if (first > 0) crowded.f32()[first - 1] = inf;
+      if (first + 1 < k && !std::isnan(crowded.f32()[first + 1])) crowded.f32()[first + 1] = inf;
+      for (const Tensor* x : {&alone, &crowded}) {
+        const char* what = x == &alone ? "alone" : "with more NaNs and +inf";
+        CHECK_MESSAGE(ops::argmax(*x) == first,
+                      "ops::argmax width " << k << ", first NaN at " << first << ", " << what);
+        CHECK_MESSAGE(ref::argmax(*x) == first,
+                      "ref::argmax width " << k << ", first NaN at " << first << ", " << what);
+      }
+    }
+  }
 }
 
 TEST_CASE("ops::rmsnorm matches torch") {

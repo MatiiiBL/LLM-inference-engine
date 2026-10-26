@@ -169,9 +169,11 @@ void rope(Tensor& q, Tensor* k, std::span<const std::int64_t> positions, float t
 void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
                std::int64_t start_pos, float scale, Tensor& out);
 
-/// Index of the maximum element of a rank-1 F32 tensor (greedy decoding).
-/// Ties resolve to the lowest index, matching torch.argmax. Throws
-/// std::invalid_argument if x is not rank 1 or is empty.
+/// Index of the maximum element of a rank-1 F32 tensor (greedy decoding),
+/// matching torch.argmax: a NaN counts as greater than every number, so if
+/// x holds a NaN the result is the index of the first one; otherwise ties
+/// resolve to the lowest index. Throws std::invalid_argument if x is not
+/// rank 1 or is empty.
 std::int32_t argmax(const Tensor& x);
 
 }  // namespace minillm::ops
