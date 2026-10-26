@@ -109,11 +109,12 @@ class Arena {
 };
 
 /// Number of threads the optimized kernels in minillm::ops may use, counting
-/// the calling thread. n <= 0 means the ThreadPool constructor's default (one
-/// per performance-core hardware thread, or per hardware thread where cores
-/// are alike); 1 runs every kernel inline. Blocks until no kernel is running,
-/// then resizes the process-wide pool. Default: 0. Throws std::logic_error if
-/// called from inside a parallel_for body.
+/// the calling thread. n <= 0 means one per hardware thread; 1 runs every
+/// kernel inline. Where the OS reports core types (Apple silicon), only a call
+/// whose work size says it gains from the efficiency cores uses more than one
+/// thread per performance-core hardware thread. Blocks until no kernel is
+/// running, then resizes the process-wide pool. Default: 0. Throws
+/// std::logic_error if called from inside a parallel_for body.
 void set_num_threads(int n);
 
 /// The resolved setting: always >= 1.
@@ -123,6 +124,15 @@ int num_threads();
 /// call from any thread, concurrently, and from inside a body: if the pool is
 /// busy, the whole range runs inline on the calling thread instead.
 void kernel_parallel_for(std::int64_t n, std::int64_t grain,
+                         const std::function<void(std::int64_t begin, std::int64_t end)>& body);
+
+/// kernel_parallel_for for a call that knows how much work it is: `work` is
+/// what the whole range costs, in multiply-adds or operations of similar
+/// cost. A call large enough to gain from every core may use all
+/// num_threads() threads; any other call, and every call without a work
+/// size, uses at most one per performance-core hardware thread where the OS
+/// reports core types. `work` <= 0 means unknown, as in the call without it.
+void kernel_parallel_for(std::int64_t n, std::int64_t grain, std::int64_t work,
                          const std::function<void(std::int64_t begin, std::int64_t end)>& body);
 
 }  // namespace minillm
