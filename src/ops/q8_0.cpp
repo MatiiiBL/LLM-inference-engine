@@ -262,7 +262,7 @@ void matmul_decode(const float* x, const BlockQ8_0* w, float* out, std::int64_t 
   };
   const std::int64_t unit_macs = std::max<std::int64_t>(1, m * k * kDecodeRows);
   kernel_parallel_for((n + kDecodeRows - 1) / kDecodeRows,
-                      (kMinChunkMacs + unit_macs - 1) / unit_macs, std::ref(run));
+                      (kMinChunkMacs + unit_macs - 1) / unit_macs, m * k * n, std::ref(run));
 }
 
 // ---------------------------------------------------------------------------
@@ -429,7 +429,7 @@ void matmul_panel(const float* x, const BlockQ8_0* w, float* out, std::int64_t m
   };
   const std::int64_t unit_macs = std::max<std::int64_t>(1, m * k * kPanelCols);
   kernel_parallel_for((n + kPanelCols - 1) / kPanelCols,
-                      (kMinChunkMacs + unit_macs - 1) / unit_macs, std::ref(run));
+                      (kMinChunkMacs + unit_macs - 1) / unit_macs, m * k * n, std::ref(run));
 }
 
 }  // namespace

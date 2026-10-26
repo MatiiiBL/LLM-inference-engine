@@ -27,8 +27,9 @@ namespace minillm::test {
 /// The kernel thread counts the threaded path is checked at. 10 is the
 /// development machine's hardware_concurrency(); on a smaller machine it
 /// oversubscribes, which exercises the split just as well. 0 is the default
-/// set_num_threads resolves it to (the performance cores on Apple silicon,
-/// every hardware thread elsewhere), which is what the CLI runs at.
+/// set_num_threads resolves it to (every hardware thread, with only large
+/// calls going past the performance cores on Apple silicon), which is what
+/// the CLI runs at.
 inline constexpr int kThreadCounts[] = {1, 2, 3, 4, 10, 0};
 
 /// Calls run() at threads = 1, then at every other count in kThreadCounts,

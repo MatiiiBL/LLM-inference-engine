@@ -3,9 +3,10 @@
 // parallel_for
 //
 //   1. writes the job (body, n, chunk count) into plain fields,
-//   2. publishes it by storing the chunk count into `unclaimed`,
-//   3. hands a ticket to as many workers as the job can use — the others are
-//      not woken at all — and wakes the first of them that is asleep,
+//   2. publishes it by storing its ticket and chunk count into `unclaimed`,
+//   3. hands a ticket to as many workers as the job can use, or may use —
+//      the others are not woken at all — and wakes the first of them that
+//      is asleep,
 //   4. claims chunks alongside them, and
 //   5. waits until every chunk has finished.
 //
@@ -38,12 +39,16 @@
 // Memory ordering. The job fields are plain. The caller writes them only
 // after every chunk of the previous job has finished (it has seen `done`
 // reach the chunk count), then release-stores `unclaimed`. A worker reads
-// them only after it has claimed a chunk — an acquire fetch_sub on
-// `unclaimed` that returned a positive count — and while it holds that
+// them only after it has claimed a chunk — an acquire read-modify-write on
+// `unclaimed` that took one from a positive count — and while it holds that
 // unfinished chunk the job cannot complete, so the fields cannot change
 // under it. Whichever job a claim lands in, the fields it then reads are
 // that job's: a worker woken late for one job may well help with the next.
-// A claim that comes back empty touches nothing else. Everything a chunk
+// Except a strict worker: `unclaimed` carries the job's ticket next to the
+// count, and a strict worker claims by compare-exchange, only from the job
+// whose ticket it holds. The kernel pool makes strict the workers a small
+// call does not use, so a small call never runs on more threads than it
+// chose. A claim that comes back empty touches nothing else. Everything a chunk
 // does — its body, storing the first exception, destroying any other — comes
 // before its fetch_add on `done`. Those increments are all read-modify-writes,
 // so the caller's load that sees `done` reach the chunk count synchronizes
@@ -94,6 +99,30 @@ constexpr std::int64_t kChunksPerThread = 4;
 /// The ticket that tells a worker to exit.
 constexpr std::uint64_t kStop = std::numeric_limits<std::uint64_t>::max();
 
+/// `unclaimed` holds a job's ticket in its high 32 bits, so that a strict
+/// claim can check the job and the count at once, and kBias plus the job's
+/// unclaimed chunks in its low 32. A failed fetch_sub takes the count below
+/// zero, but at most once per thread per job, so it never borrows from the
+/// ticket. Tickets wrap at 2^32 jobs, which only a strict worker stalled for
+/// 2^32 jobs between reading its ticket and claiming could notice.
+constexpr std::uint64_t kBias = std::uint64_t{1} << 31;
+constexpr std::int64_t kMaxChunks = (std::int64_t{1} << 31) - 1;
+
+constexpr std::uint64_t pack(std::uint64_t ticket, std::int64_t count) {
+  return ticket << 32 | (kBias + static_cast<std::uint64_t>(count));
+}
+
+/// The unclaimed chunks in `word`, a value of `unclaimed`; < 0 once every
+/// chunk is claimed and some claimants have failed.
+constexpr std::int64_t unclaimed_count(std::uint64_t word) {
+  return static_cast<std::int64_t>(word & 0xffffffffu) - static_cast<std::int64_t>(kBias);
+}
+
+/// Whether `word`, a value of `unclaimed`, belongs to the job with `ticket`.
+constexpr bool same_job(std::uint64_t word, std::uint64_t ticket) {
+  return word >> 32 == (ticket & 0xffffffffu);
+}
+
 // True while this thread is running a parallel_for body, on any pool. A
 // nested parallel_for would either deadlock (a worker waiting on itself) or
 // publish a second job over the one in flight, so it is rejected outright.
@@ -113,18 +142,17 @@ class BodyScope {
   bool outer_;
 };
 
-/// The thread count that n <= 0 stands for: one thread per hardware thread
-/// of the performance cores, where the OS tells core types apart (Apple
-/// silicon's hw.perflevel0, the fastest level), otherwise one per hardware
-/// thread. At least 1.
-///
-/// Decode streams the weights from memory and has no use for the efficiency
-/// cores: on an M4 (4 + 6 cores), 4 threads already reach the bandwidth 10
-/// do on an idle machine, and on a busy one the 6 extra threads, slower and
-/// more often preempted, made decode about 10% slower than 4. Prefill is
-/// compute-bound and does scale to every core; --threads says so.
-int default_threads() {
-  const int all = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+/// One per hardware thread, at least 1: the kernel pool's size for n <= 0.
+int hardware_threads() {
+  return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+}
+
+/// One thread per hardware thread of the performance cores, where the OS
+/// tells core types apart (Apple silicon's hw.perflevel0, the fastest level),
+/// otherwise hardware_threads(). ThreadPool's size for n <= 0, and the most
+/// threads a small kernel call uses; see "How many threads a call runs on".
+int performance_threads() {
+  const int all = hardware_threads();
 #if defined(__APPLE__)
   int fast = 0;
   std::size_t size = sizeof fast;
@@ -184,10 +212,11 @@ struct alignas(64) Slot {
   std::condition_variable cv;
 };
 
-}  // namespace
-
-struct ThreadPool::Impl {
+/// The workers and the job they share. ThreadPool runs every call on all of
+/// them; the kernel pool tells each call how many to use.
+struct Pool {
   int n_threads = 1;
+  int first_strict = 0;  // workers from this index on are strict; see the top
   std::unique_ptr<Slot[]> slots;  // one per worker, n_threads - 1
   std::vector<std::thread> workers;
 
@@ -198,9 +227,9 @@ struct ThreadPool::Impl {
   std::exception_ptr error;  // the first exception; written by whoever set `failed`
   std::uint64_t job = 0;     // the last ticket handed out; caller only
 
-  // Chunks of the current job nobody has claimed. Every claimant takes one
-  // more than exists and so leaves it negative; the next job's store resets it.
-  std::atomic<std::int64_t> unclaimed{0};
+  // The current job's ticket and how many of its chunks nobody has claimed
+  // yet, as pack() lays them out.
+  std::atomic<std::uint64_t> unclaimed{0};
   std::atomic<std::int64_t> done{0};  // chunks of the current job finished
   std::atomic<bool> failed{false};
   std::atomic<bool> busy{false};  // a dispatched job is in flight
@@ -209,11 +238,11 @@ struct ThreadPool::Impl {
   std::condition_variable done_cv;
   std::atomic<bool> caller_sleeping{false};
 
-  // Stops and joins the workers. Lives here rather than in ~ThreadPool so a
-  // constructor that fails halfway through starting threads still joins the
-  // ones it did start. Only started workers are sent a stop ticket, so a
-  // constructor that failed to allocate the slots has no slot to touch.
-  ~Impl() {
+  // Stops and joins the workers. Lives here rather than in start() so a start
+  // that fails halfway through starting threads still joins the ones it did
+  // start. Only started workers are sent a stop ticket, so a start that
+  // failed to allocate the slots has no slot to touch.
+  ~Pool() {
     for (std::size_t w = 0; w < workers.size(); ++w) give_ticket(slots[w], kStop);
     for (std::thread& t : workers) t.join();
   }
@@ -264,11 +293,28 @@ struct ThreadPool::Impl {
     }
   }
 
-  /// Claims and runs chunks until none are left.
-  void run_chunks() noexcept {
+  /// Claims a chunk of the current job, or for a strict claimant only of the
+  /// job with `ticket`. Returns how many chunks were unclaimed before, or 0.
+  std::int64_t claim(std::uint64_t ticket, bool strict) noexcept {
+    if (!strict) {
+      const std::uint64_t word = unclaimed.fetch_sub(1, std::memory_order_acquire);
+      return std::max<std::int64_t>(unclaimed_count(word), 0);
+    }
+    std::uint64_t word = unclaimed.load(std::memory_order_relaxed);
+    while (same_job(word, ticket) && unclaimed_count(word) > 0) {
+      if (unclaimed.compare_exchange_weak(word, word - 1, std::memory_order_acquire,
+                                          std::memory_order_relaxed)) {
+        return unclaimed_count(word);
+      }
+    }
+    return 0;
+  }
+
+  /// Claims and runs chunks until none are left; see claim().
+  void run_chunks(std::uint64_t ticket, bool strict) noexcept {
     for (;;) {
-      const std::int64_t left = unclaimed.fetch_sub(1, std::memory_order_acquire);
-      if (left <= 0) return;
+      const std::int64_t left = claim(ticket, strict);
+      if (left == 0) return;
       // This chunk is ours and unfinished, so the job and its fields stay put
       // until the done.fetch_add below. Read everything needed before it.
       const std::int64_t total = chunks;
@@ -297,8 +343,11 @@ struct ThreadPool::Impl {
       if (seen == kStop) return;
       // Pass the wakeup on, unless the job is already all claimed: then the
       // next sleeper would only find nothing to do.
-      if (slept && unclaimed.load(std::memory_order_relaxed) > 0) wake_next(index, seen);
-      run_chunks();
+      if (slept) {
+        const std::uint64_t word = unclaimed.load(std::memory_order_relaxed);
+        if (same_job(word, seen) && unclaimed_count(word) > 0) wake_next(index, seen);
+      }
+      run_chunks(seen, index >= first_strict);
     }
   }
 
@@ -310,16 +359,71 @@ struct ThreadPool::Impl {
     done_cv.wait(lock, finished);
     caller_sleeping.store(false);
   }
+
+  /// Starts the n_threads - 1 workers; the caller is the n_threads-th. Workers
+  /// `strict_from` and later only claim chunks of a job they were ticketed for.
+  void start(int threads, int strict_from) {
+    n_threads = threads;
+    first_strict = strict_from;
+    slots = std::make_unique<Slot[]>(static_cast<std::size_t>(threads - 1));
+    workers.reserve(static_cast<std::size_t>(threads - 1));
+    for (int w = 0; w + 1 < threads; ++w) workers.emplace_back([this, w] { worker_loop(w); });
+  }
+
+  /// parallel_for on the calling thread and workers 0 .. threads - 2, with up
+  /// to `per_thread` chunks for each. n > 0, 1 <= threads <= n_threads, and
+  /// the caller is not inside a body.
+  void run(std::int64_t n_items, std::int64_t grain, const Body& job_body, int threads,
+           std::int64_t per_thread) {
+    // Every chunk gets at least `grain` items, so there are at most n / grain
+    // of them. One chunk, or one thread, means no parallelism: run it all here
+    // as a single chunk, touching nothing shared.
+    grain = std::max<std::int64_t>(grain, 1);
+    const std::int64_t total = std::min({n_items / grain, per_thread * threads, kMaxChunks});
+    if (total <= 1 || threads == 1) {
+      BodyScope scope;
+      job_body(0, n_items);
+      return;
+    }
+
+    if (busy.exchange(true, std::memory_order_acquire)) {
+      throw std::logic_error(
+          "ThreadPool::parallel_for: called from two threads at once; a pool runs one "
+          "parallel_for at a time");
+    }
+    const std::uint64_t ticket = ++job;
+    body = &job_body;
+    n = n_items;
+    chunks = total;
+    done.store(0, std::memory_order_relaxed);
+    failed.store(false, std::memory_order_relaxed);
+    unclaimed.store(pack(ticket, total), std::memory_order_release);
+
+    // Every ticket is stored before anyone is woken; see wake_next. Workers
+    // past the job's last helper keep their old ticket and are not woken.
+    const int helpers = static_cast<int>(std::min<std::int64_t>(total, threads) - 1);
+    for (int w = 0; w < helpers; ++w) slots[w].ticket.store(ticket);
+    wake_next(-1, ticket);
+
+    run_chunks(ticket, false);
+    // Every chunk, even after one has thrown: a running chunk still uses `body`.
+    wait_for_chunks(total);
+
+    std::exception_ptr e = std::move(error);
+    error = nullptr;
+    body = nullptr;
+    busy.store(false, std::memory_order_release);
+    if (e) std::rethrow_exception(e);
+  }
 };
 
+}  // namespace
+
+struct ThreadPool::Impl : Pool {};
+
 ThreadPool::ThreadPool(int n_threads) : impl_(std::make_unique<Impl>()) {
-  if (n_threads <= 0) n_threads = default_threads();
-  impl_->n_threads = n_threads;
-  impl_->slots = std::make_unique<Slot[]>(static_cast<std::size_t>(n_threads - 1));
-  impl_->workers.reserve(static_cast<std::size_t>(n_threads - 1));
-  for (int w = 0; w + 1 < n_threads; ++w) {
-    impl_->workers.emplace_back([p = impl_.get(), w] { p->worker_loop(w); });
-  }
+  const int threads = n_threads > 0 ? n_threads : performance_threads();
+  impl_->start(threads, threads);
 }
 
 ThreadPool::~ThreadPool() = default;
@@ -337,46 +441,7 @@ void ThreadPool::parallel_for(std::int64_t n, std::int64_t grain, const Body& bo
         "is not supported");
   }
   if (n == 0) return;
-
-  // Every chunk gets at least `grain` items, so there are at most n / grain
-  // of them. One chunk, or one thread, means no parallelism: run it all here
-  // as a single chunk, touching nothing shared.
-  Impl& p = *impl_;
-  grain = std::max<std::int64_t>(grain, 1);
-  const std::int64_t chunks = std::min(n / grain, kChunksPerThread * p.n_threads);
-  if (chunks <= 1 || p.n_threads == 1) {
-    BodyScope scope;
-    body(0, n);
-    return;
-  }
-
-  if (p.busy.exchange(true, std::memory_order_acquire)) {
-    throw std::logic_error(
-        "ThreadPool::parallel_for: called from two threads at once; a pool runs one "
-        "parallel_for at a time");
-  }
-  p.body = &body;
-  p.n = n;
-  p.chunks = chunks;
-  p.done.store(0, std::memory_order_relaxed);
-  p.failed.store(false, std::memory_order_relaxed);
-  p.unclaimed.store(chunks, std::memory_order_release);
-
-  // Every ticket is stored before anyone is woken; see wake_next.
-  const std::uint64_t ticket = ++p.job;
-  const int helpers = static_cast<int>(std::min<std::int64_t>(chunks, p.n_threads) - 1);
-  for (int w = 0; w < helpers; ++w) p.slots[w].ticket.store(ticket);
-  p.wake_next(-1, ticket);
-
-  p.run_chunks();
-  // Every chunk, even after one has thrown: a running chunk still uses `body`.
-  p.wait_for_chunks(chunks);
-
-  std::exception_ptr error = std::move(p.error);
-  p.error = nullptr;
-  p.body = nullptr;
-  p.busy.store(false, std::memory_order_release);
-  if (error) std::rethrow_exception(error);
+  impl_->run(n, grain, body, impl_->n_threads, kChunksPerThread);
 }
 
 void ThreadPool::parallel_for(std::int64_t n, const Body& body) { parallel_for(n, 1, body); }
@@ -394,16 +459,78 @@ void ThreadPool::parallel_for(std::int64_t n, const Body& body) { parallel_for(n
 //
 // A call from inside a body runs inline without touching the mutex at all:
 // on the thread that holds it, try_lock would be undefined behaviour.
+//
+// How many threads a call runs on. The pool has num_threads() threads, by
+// default one per hardware thread. Where the performance cores are not all
+// of them (Apple silicon), a call uses at most the performance cores'
+// hardware threads unless it says, with a work size of at least kLargeWork,
+// that it is large. The OS still decides which core runs which thread; four
+// busy threads on an M4 land on its four performance cores.
+//
+// Large calls are compute-bound: a 128-token prefill ran 1.6-1.9x faster on
+// all 10 cores of an M4 than on its 4 performance cores. Decode's calls are
+// small and stream their weights, which 4 performance cores already do at
+// the bandwidth of 10; on a busy machine the extra, slower, more often
+// preempted threads made decode slower. Putting decode's largest calls
+// (gate/up/down_proj, 0.88M multiply-adds) on every core too made it 7%
+// slower as found and 4% slower with every core busy. The lm_head, at 28M,
+// is the exception: decode with it on every core was within 2% as found of
+// decode with it on the performance cores, and 5% faster with every core
+// busy.
+//
+// kLargeWork was chosen on the M4 by sweeping it over prompts of 4 to 32
+// tokens, where the projections range from 0.4M to 28M multiply-adds:
+// whole-prefill speed against the 4-thread pool, interleaved in one batch,
+//
+//     threshold     4 tokens   8 tokens   16 tokens   32 tokens
+//     1M            1.23x      1.15x      1.27x       1.35x
+//     2M            1.19x      1.16x      1.23x       1.35x
+//     4M            1.05x      1.13x      1.23x       1.33x
+//     8M            1.05x      1.04x      1.16x       1.34x
+//
+// so 1M (2^20). Every decode call of SmolLM2-135M but the lm_head stays
+// below it: the largest, gate/up/down_proj, are 0.88M.
+//
+// Chunks per thread. A large call gets kLargeChunksPerThread: its workers
+// start at different times, the efficiency cores' up to tens of
+// microseconds late as the wakeups pass down the chain, and run at different
+// speeds, so smaller chunks even out the end of the call; 8 instead of 4
+// made a 128-token prefill 8% faster (16 did no better). A small call gets
+// kSmallChunksPerThread: a decode step's calls last 2-16 us, and two fewer
+// claims per thread per call made decode 3-6% faster on Q8_0 weights and
+// 0-5% on F32. A call without a work size keeps the ThreadPool split.
 // ---------------------------------------------------------------------------
 
 namespace {
 
-int resolve_threads(int n) { return n > 0 ? n : default_threads(); }
+/// Work, in multiply-adds, from which a call may use every thread; see above.
+constexpr std::int64_t kLargeWork = std::int64_t{1} << 20;
+
+/// Chunks per thread for a call of at least kLargeWork, and for one that
+/// gives a smaller work size; see above.
+constexpr std::int64_t kLargeChunksPerThread = 8;
+constexpr std::int64_t kSmallChunksPerThread = 2;
+
+int resolve_threads(int n) { return n > 0 ? n : hardware_threads(); }
+
+/// A started kernel pool of `threads` threads. The workers that a call below
+/// kLargeWork does not use are strict, so it never runs on more than
+/// `small_threads`. If starting one fails, the ones already started are joined.
+std::unique_ptr<Pool> make_pool(int threads, int small_threads) {
+  auto pool = std::make_unique<Pool>();
+  pool->start(threads, std::min(threads, small_threads) - 1);
+  return pool;
+}
 
 struct KernelPool {
   std::mutex mu;  // held by the kernel using `pool`, or by set_num_threads
-  std::unique_ptr<ThreadPool> pool;  // under `mu`; null until first needed, or at 1 thread
+  std::unique_ptr<Pool> pool;  // under `mu`; null until first needed, or at 1 thread
   std::atomic<int> threads{resolve_threads(0)};  // written under `mu`
+  // The most threads a call below kLargeWork uses: the performance cores'
+  // where they are not all of them, otherwise no limit beyond `threads`.
+  const int small_threads = performance_threads() < hardware_threads()
+                                ? performance_threads()
+                                : std::numeric_limits<int>::max();
 };
 
 // Never destroyed, so a kernel called from another static's destructor still
@@ -431,20 +558,24 @@ void set_num_threads(int n) {
   const std::lock_guard<std::mutex> lock(kp.mu);
   if (threads == kp.threads.load(std::memory_order_relaxed)) return;
   kp.pool.reset();
-  if (threads > 1) kp.pool = std::make_unique<ThreadPool>(threads);
+  if (threads > 1) kp.pool = make_pool(threads, kp.small_threads);
   kp.threads.store(threads, std::memory_order_relaxed);
 }
 
 int num_threads() { return kernel_pool().threads.load(std::memory_order_relaxed); }
 
 void kernel_parallel_for(std::int64_t n, std::int64_t grain, const Body& body) {
+  kernel_parallel_for(n, grain, 0, body);
+}
+
+void kernel_parallel_for(std::int64_t n, std::int64_t grain, std::int64_t work, const Body& body) {
   if (n < 0) {
     throw std::invalid_argument("kernel_parallel_for: n must be >= 0, got " + std::to_string(n));
   }
   if (n == 0) return;
   KernelPool& kp = kernel_pool();
-  // What ThreadPool::parallel_for would run inline anyway, decided here so
-  // that small calls never touch the mutex.
+  // What Pool::run would run inline anyway, decided here so that small calls
+  // never touch the mutex.
   if (t_in_body || n / std::max<std::int64_t>(grain, 1) <= 1 ||
       kp.threads.load(std::memory_order_relaxed) == 1) {
     run_inline(n, body);
@@ -460,8 +591,13 @@ void kernel_parallel_for(std::int64_t n, std::int64_t grain, const Body& body) {
     run_inline(n, body);
     return;
   }
-  if (kp.pool == nullptr) kp.pool = std::make_unique<ThreadPool>(threads);
-  kp.pool->parallel_for(n, grain, body);
+  if (kp.pool == nullptr) kp.pool = make_pool(threads, kp.small_threads);
+  if (work >= kLargeWork) {
+    kp.pool->run(n, grain, body, threads, kLargeChunksPerThread);
+  } else {
+    kp.pool->run(n, grain, body, std::min(threads, kp.small_threads),
+                 work > 0 ? kSmallChunksPerThread : kChunksPerThread);
+  }
 }
 
 }  // namespace minillm

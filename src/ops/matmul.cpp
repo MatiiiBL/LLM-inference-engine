@@ -202,7 +202,7 @@ void matmul(const Tensor& x, const Tensor& w, Tensor& out) {
   };
   const std::int64_t unit_macs = std::max<std::int64_t>(1, m * k * kCols);
   kernel_parallel_for((n + kCols - 1) / kCols, (kMinChunkMacs + unit_macs - 1) / unit_macs,
-                      std::ref(run));
+                      m * k * n, std::ref(run));
 }
 
 }  // namespace minillm::ops

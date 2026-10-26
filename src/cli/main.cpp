@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -88,14 +89,23 @@ int run(const minillm::cli::Options& opts) {
   const std::size_t weight_bytes = weights.bytes();
   Model model(std::move(cfg), std::move(weights), n_prompt + opts.max_tokens);
   const ModelConfig& mc = model.config();
+  // Calls too small to gain from the efficiency cores use at most the
+  // performance cores' threads, which is ThreadPool's default size.
+  const int threads = num_threads();
+  const int fast = ThreadPool().size();
+  const std::string thread_count =
+      fast < threads && fast < static_cast<int>(std::thread::hardware_concurrency())
+          ? "up to " + std::to_string(threads) + " threads, " + std::to_string(fast) +
+                " for small calls"
+          : std::to_string(threads) + " thread(s)";
   std::fprintf(stderr,
                "minillm: loaded %s (%s, %lld layers, hidden %lld, vocab %lld) in %.2f s; "
-               "%s weights, %.1f MB; %d thread(s)\n",
+               "%s weights, %.1f MB; %s\n",
                opts.model_dir.string().c_str(), mc.model_type.c_str(),
                static_cast<long long>(mc.num_hidden_layers),
                static_cast<long long>(mc.hidden_size), static_cast<long long>(mc.vocab_size),
                seconds_between(t_load, Clock::now()), dtype_name(opts.weights),
-               static_cast<double>(weight_bytes) / 1e6, num_threads());
+               static_cast<double>(weight_bytes) / 1e6, thread_count.c_str());
   if (opts.print_ids) print_ids("prompt ids", prompt_ids);
 
   Sampler sampler(opts.sampling);
