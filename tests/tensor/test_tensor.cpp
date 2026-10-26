@@ -3,11 +3,17 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#endif
 
 #include "minillm/tensor.h"
 
@@ -420,4 +426,83 @@ TEST_CASE("f32_to_f16 rounds to nearest even and inverts f16_to_f32") {
     if (f32_to_f16(f16_to_f32(bits)) != bits) ++mismatches;
   }
   CHECK(mismatches == 0);
+}
+
+// The hardware f32 -> f16 conversion, rounding to nearest even: fcvt on
+// aarch64 (macos-15 in CI), vcvtps2ph on x86-64 with F16C (ubuntu-24.04).
+// Hosts with neither skip the comparison below.
+namespace {
+
+#if defined(__x86_64__)
+#define MINILLM_F16_TARGET __attribute__((target("f16c")))
+#else
+#define MINILLM_F16_TARGET
+#endif
+
+#if defined(__aarch64__)
+constexpr const char* kHardwareF16 = "fcvt";
+bool hardware_f16_available() { return true; }
+std::uint16_t hardware_f32_to_f16(float v) {
+  const auto h = static_cast<_Float16>(v);
+  std::uint16_t bits;
+  std::memcpy(&bits, &h, sizeof(bits));
+  return bits;
+}
+#elif defined(__x86_64__)
+constexpr const char* kHardwareF16 = "F16C vcvtps2ph";
+bool hardware_f16_available() { return __builtin_cpu_supports("f16c"); }
+MINILLM_F16_TARGET std::uint16_t hardware_f32_to_f16(float v) {
+  return static_cast<std::uint16_t>(_cvtss_sh(v, _MM_FROUND_TO_NEAREST_INT));
+}
+#else
+constexpr const char* kHardwareF16 = nullptr;
+bool hardware_f16_available() { return false; }
+std::uint16_t hardware_f32_to_f16(float) { return 0; }
+#endif
+
+bool is_f16_nan(std::uint16_t h) { return (h & 0x7c00u) == 0x7c00u && (h & 0x03ffu) != 0; }
+
+/// How many of the bit patterns [first, last], stepping by `step`, f32_to_f16
+/// converts differently from the hardware. Compiled for F16C on x86-64 so the
+/// hardware conversion inlines into the loop.
+MINILLM_F16_TARGET std::uint64_t count_f32_to_f16_mismatches(std::uint32_t first,
+                                                             std::uint32_t last,
+                                                             std::uint32_t step) {
+  std::uint64_t mismatches = 0;
+  for (std::uint64_t u = first; u <= last; u += step) {
+    const auto bits = static_cast<std::uint32_t>(u);
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    const std::uint16_t ours = f32_to_f16(f);
+    if ((bits & 0x7fffffffu) > 0x7f800000u) {
+      // The hardware keeps the top of a NaN's payload; f32_to_f16 promises
+      // only "NaN stays NaN", as 0x7e00 with the input's sign.
+      const auto nan = static_cast<std::uint16_t>(((bits >> 16) & 0x8000u) | 0x7e00u);
+      if (ours != nan || !is_f16_nan(hardware_f32_to_f16(f))) ++mismatches;
+    } else if (ours != hardware_f32_to_f16(f)) {
+      ++mismatches;
+    }
+  }
+  return mismatches;
+}
+
+}  // namespace
+
+TEST_CASE("f32_to_f16 matches the hardware conversion on every non-negative float") {
+  if (!hardware_f16_available()) {
+    // Both CI runners have one, so a green CI run means both compared.
+    if (std::getenv("GITHUB_ACTIONS") != nullptr) {
+      FAIL("a CI runner without hardware f32 -> f16 conversion: the comparison did not run");
+    }
+    MESSAGE("this host has no hardware f32 -> f16 conversion (neither aarch64 nor x86-64 with "
+            "F16C); the comparison runs on both CI runners instead");
+    return;
+  }
+  CAPTURE(kHardwareF16);
+  // All 2^31 non-negative patterns: zero, subnormals, normals, the overflow to
+  // inf, inf itself and every NaN.
+  CHECK(count_f32_to_f16_mismatches(0, 0x7fffffffu, 1) == 0);
+  // The sign is OR-ed in after rounding the magnitude; a sample of the
+  // negative half (every 997th pattern) confirms it.
+  CHECK(count_f32_to_f16_mismatches(0x80000000u, 0xffffffffu, 997) == 0);
 }
