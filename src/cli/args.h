@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "minillm/sampler.h"
+#include "minillm/tensor.h"
 
 namespace minillm::cli {
 
@@ -34,6 +35,7 @@ struct Options {
   std::int64_t max_tokens = 64;
   SamplingParams sampling;
   int threads = 0;
+  DType weights = DType::F32;  ///< F32 or Q8_0 (quantize_weights_q8_0 at load)
   bool ignore_eos = false;
   bool print_ids = false;
   bool help = false;
@@ -59,6 +61,7 @@ inline constexpr std::string_view kUsage =
     "  --repetition-penalty <f>                            (default 1)\n"
     "  --seed <n>                                          (default 42)\n"
     "  --threads <n>              threads to use, 0 = auto (default 0)\n"
+    "  --weights <f32|q8_0>       weight format            (default f32)\n"
     "  --ignore-eos               keep generating past the end-of-text token\n"
     "  --print-ids                print prompt and generated token ids to stderr\n"
     "  --help\n"
@@ -67,7 +70,9 @@ inline constexpr std::string_view kUsage =
     "Any flag that takes a value also accepts --flag=value.\n"
     "--threads 0 uses one thread per hardware thread of the performance cores, or\n"
     "of every core where all cores are alike. The output is the same at any\n"
-    "--threads; only the speed changes.\n";
+    "--threads; only the speed changes.\n"
+    "--weights q8_0 rounds the projections and the embedding to 8 bits at load\n"
+    "(143 MB instead of 538 MB for SmolLM2-135M); arithmetic stays f32.\n";
 
 namespace detail {
 
@@ -182,6 +187,15 @@ inline Options parse_args(std::span<const std::string_view> args) {
           flag, value(), "an integer >= 0", [](std::uint64_t) { return true; });
     } else if (flag == "--threads") {
       opts.threads = detail::parse_number<int>(flag, value(), "an integer >= 0", non_negative);
+    } else if (flag == "--weights") {
+      const std::string_view v = value();
+      if (v == "f32") {
+        opts.weights = DType::F32;
+      } else if (v == "q8_0") {
+        opts.weights = DType::Q8_0;
+      } else {
+        throw UsageError("--weights must be f32 or q8_0, got '" + std::string(v) + "'");
+      }
     } else if (flag == "--ignore-eos") {
       no_value();
       opts.ignore_eos = true;

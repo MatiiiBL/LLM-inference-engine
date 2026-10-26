@@ -5,10 +5,12 @@
 // its own arguments and then runs straight through.
 //
 // Memory: the weights are held by handle (Tensor copies share storage, so
-// nothing is copied, including the tied LM head). The KV cache and one Arena
-// are allocated in the constructor, both sized for max_seq_len; forward()
-// rewinds the arena and carves its buffers from it (src/model/scratch.h), so
-// a pass never touches the heap.
+// nothing is copied, including the tied LM head). The projections and the
+// embedding may be Q8_0 (quantize_weights_q8_0); forward() never looks at a
+// dtype, because ops::matmul and ops::embedding dispatch on it. The KV cache
+// and one Arena are allocated in the constructor, both sized for
+// max_seq_len; forward() rewinds the arena and carves its buffers from it
+// (src/model/scratch.h), so a pass never touches the heap.
 //
 // Keys and values are projected straight into the cache: positions
 // [start_pos, start_pos + n) of one layer are a contiguous [n, kv_dim] block,
@@ -59,6 +61,10 @@ std::int64_t checked_max_seq_len(const ModelConfig& cfg, std::int64_t max_seq_le
   return max_seq_len < cfg.max_position_embeddings ? max_seq_len : cfg.max_position_embeddings;
 }
 
+/// What a tensor may be stored as: norms are always F32, while the
+/// projections, the embedding and an untied LM head may also be Q8_0.
+enum class Stored { kF32, kF32OrQ8_0 };
+
 /// Looks tensors up by name and checks each against the shape `cfg` implies,
 /// remembering which names it has handed out so that leftovers can be
 /// reported afterwards.
@@ -66,14 +72,16 @@ class TensorBinder {
  public:
   explicit TensorBinder(const Weights& weights) : weights_(weights) {}
 
-  /// The tensor `name`, which must exist with exactly `shape`.
-  const Tensor& require(const std::string& name, const Shape& shape) {
+  /// The tensor `name`, which must exist with exactly `shape`, stored as
+  /// `stored` allows.
+  const Tensor& require(const std::string& name, const Shape& shape,
+                        Stored stored = Stored::kF32) {
     const Tensor* t = weights_.find(name);
     if (t == nullptr) {
       fail("missing tensor '" + name + "': expected f32" + shape.to_string() +
            ", the checkpoint has none");
     }
-    check(name, *t, shape);
+    check(name, *t, shape, stored);
     used_.insert(name);
     return *t;
   }
@@ -92,10 +100,17 @@ class TensorBinder {
 
   void mark_used(const std::string& name) { used_.insert(name); }
 
-  static void check(const std::string& name, const Tensor& t, const Shape& shape) {
-    if (t.dtype() != DType::F32 || t.shape() != shape) {
+  /// A misshapen tensor of an allowed dtype is reported against the same
+  /// dtype; a disallowed dtype against every dtype the slot takes.
+  static void check(const std::string& name, const Tensor& t, const Shape& shape, Stored stored) {
+    const bool dtype_ok =
+        t.dtype() == DType::F32 || (stored == Stored::kF32OrQ8_0 && t.dtype() == DType::Q8_0);
+    if (!dtype_ok || t.shape() != shape) {
+      const char* expected = dtype_ok                       ? dtype_name(t.dtype())
+                             : stored == Stored::kF32OrQ8_0 ? "f32 or q8_0"
+                                                            : "f32";
       fail("tensor '" + name + "' is " + dtype_name(t.dtype()) + t.shape().to_string() +
-           ", expected f32" + shape.to_string());
+           ", expected " + expected + shape.to_string());
     }
     if (!t.is_contiguous()) fail("tensor '" + name + "' is not contiguous: " + t.to_string());
   }
@@ -146,42 +161,50 @@ Model::Model(ModelConfig cfg, Weights weights, std::int64_t max_seq_len) {
   // a bad checkpoint fails before claiming any more memory.
   const std::int64_t hidden = cfg.hidden_size;
   const std::int64_t inter = cfg.intermediate_size;
+  constexpr Stored kWeight = Stored::kF32OrQ8_0;
   TensorBinder bind(weights);
-  Tensor embed_tokens = bind.require("model.embed_tokens.weight", Shape{cfg.vocab_size, hidden});
+  Tensor embed_tokens =
+      bind.require("model.embed_tokens.weight", Shape{cfg.vocab_size, hidden}, kWeight);
   std::vector<LayerWeights> layers(static_cast<std::size_t>(cfg.num_hidden_layers));
   for (std::int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
     const std::string p = "model.layers." + std::to_string(i) + ".";
     LayerWeights& lw = layers[static_cast<std::size_t>(i)];
     lw.input_norm = bind.require(p + "input_layernorm.weight", Shape{hidden});
-    lw.q_proj = bind.require(p + "self_attn.q_proj.weight", Shape{cfg.q_dim(), hidden});
-    lw.k_proj = bind.require(p + "self_attn.k_proj.weight", Shape{cfg.kv_dim(), hidden});
-    lw.v_proj = bind.require(p + "self_attn.v_proj.weight", Shape{cfg.kv_dim(), hidden});
-    lw.o_proj = bind.require(p + "self_attn.o_proj.weight", Shape{hidden, cfg.q_dim()});
+    lw.q_proj = bind.require(p + "self_attn.q_proj.weight", Shape{cfg.q_dim(), hidden}, kWeight);
+    lw.k_proj = bind.require(p + "self_attn.k_proj.weight", Shape{cfg.kv_dim(), hidden}, kWeight);
+    lw.v_proj = bind.require(p + "self_attn.v_proj.weight", Shape{cfg.kv_dim(), hidden}, kWeight);
+    lw.o_proj = bind.require(p + "self_attn.o_proj.weight", Shape{hidden, cfg.q_dim()}, kWeight);
     lw.post_norm = bind.require(p + "post_attention_layernorm.weight", Shape{hidden});
-    lw.gate_proj = bind.require(p + "mlp.gate_proj.weight", Shape{inter, hidden});
-    lw.up_proj = bind.require(p + "mlp.up_proj.weight", Shape{inter, hidden});
-    lw.down_proj = bind.require(p + "mlp.down_proj.weight", Shape{hidden, inter});
+    lw.gate_proj = bind.require(p + "mlp.gate_proj.weight", Shape{inter, hidden}, kWeight);
+    lw.up_proj = bind.require(p + "mlp.up_proj.weight", Shape{inter, hidden}, kWeight);
+    lw.down_proj = bind.require(p + "mlp.down_proj.weight", Shape{hidden, inter}, kWeight);
   }
   Tensor final_norm = bind.require("model.norm.weight", Shape{hidden});
 
   // Tied embeddings: the LM head IS embed_tokens — the same handle, never a
   // copy. A tied checkpoint may still carry an lm_head.weight (some exporters
   // write the shared matrix twice). transformers would quietly ignore it; we
-  // accept it only if it is bit for bit embed_tokens, because anything else
-  // means the config and the checkpoint disagree about the model, and picking
-  // either one silently computes plausible but wrong logits. An accepted copy
-  // is dropped with the rest of `weights` when the constructor returns.
+  // accept it only if it is bit for bit embed_tokens, in the same dtype
+  // (quantize_weights_q8_0 quantizes both, to the same bytes), because
+  // anything else means the config and the checkpoint disagree about the
+  // model, and picking either one silently computes plausible but wrong
+  // logits. An accepted copy is dropped with the rest of `weights` when the
+  // constructor returns.
   Tensor lm_head;
   const std::string lm_head_name = "lm_head.weight";
   if (!cfg.tie_word_embeddings) {
-    lm_head = bind.require(lm_head_name, Shape{cfg.vocab_size, hidden});
+    lm_head = bind.require(lm_head_name, Shape{cfg.vocab_size, hidden}, kWeight);
   } else {
     lm_head = embed_tokens;
     if (const Tensor* extra = weights.find(lm_head_name)) {
-      TensorBinder::check(lm_head_name, *extra, embed_tokens.shape());
-      const auto bytes = static_cast<std::size_t>(embed_tokens.numel()) * sizeof(float);
+      TensorBinder::check(lm_head_name, *extra, embed_tokens.shape(), kWeight);
+      if (extra->dtype() != embed_tokens.dtype()) {
+        fail("tie_word_embeddings is true, but the checkpoint's lm_head.weight is " +
+             std::string(dtype_name(extra->dtype())) + " and model.embed_tokens.weight " +
+             dtype_name(embed_tokens.dtype()));
+      }
       if (extra->data() != embed_tokens.data() &&
-          std::memcmp(extra->data(), embed_tokens.data(), bytes) != 0) {
+          std::memcmp(extra->data(), embed_tokens.data(), embed_tokens.nbytes()) != 0) {
         fail("tie_word_embeddings is true, but the checkpoint's lm_head.weight differs from "
              "model.embed_tokens.weight; the config and the checkpoint disagree");
       }
@@ -207,21 +230,46 @@ Model::~Model() = default;
 Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
 
-void quantize_weights_q8_0(Weights&, const ModelConfig&) {
-  throw std::logic_error("not implemented: quantize_weights_q8_0 (workflow 17)");
+void quantize_weights_q8_0(Weights& weights, const ModelConfig& cfg) {
+  std::vector<std::string> names = {"model.embed_tokens.weight"};
+  for (std::int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
+    const std::string p = "model.layers." + std::to_string(i) + ".";
+    for (const char* proj : {"self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                             "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"}) {
+      names.push_back(p + proj + ".weight");
+    }
+  }
+  // Untied, lm_head is required; tied, a stray copy is quantized too, so the
+  // constructor still finds it equal to the quantized embed_tokens.
+  if (!cfg.tie_word_embeddings || weights.has("lm_head.weight")) names.push_back("lm_head.weight");
+
+  // A missing tensor is reported before anything is replaced.
+  for (const std::string& name : names) weights.get(name);
+  for (const std::string& name : names) {
+    Tensor quantized;
+    try {
+      quantized = quantize_q8_0(weights.get(name));
+    } catch (const std::invalid_argument& e) {
+      throw std::invalid_argument("quantize_weights_q8_0: tensor '" + name + "': " + e.what());
+    }
+    // Drops the F32 storage now, so the peak stays at the F32 checkpoint plus
+    // one Q8_0 tensor.
+    weights.replace(name, std::move(quantized));
+  }
 }
 
 Model Model::from_dir(const std::filesystem::path& model_dir, std::int64_t max_seq_len,
                       DType weight_dtype) {
-  if (weight_dtype != DType::F32) {
-    throw std::logic_error("not implemented: Model::from_dir with " +
-                           std::string(dtype_name(weight_dtype)) + " weights (workflow 17)");
+  if (weight_dtype != DType::F32 && weight_dtype != DType::Q8_0) {
+    bad_argument("from_dir: weight_dtype must be f32 or q8_0, got " +
+                 std::string(dtype_name(weight_dtype)));
   }
   ModelConfig cfg = ModelConfig::from_json_file(model_dir / "config.json");
   check_config(cfg);
   // A bad argument should not wait on reading the weights.
   checked_max_seq_len(cfg, max_seq_len);
   Weights weights = load_checkpoint(model_dir);
+  if (weight_dtype == DType::Q8_0) quantize_weights_q8_0(weights, cfg);
   return Model(std::move(cfg), std::move(weights), max_seq_len);
 }
 

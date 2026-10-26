@@ -120,6 +120,28 @@ inline constexpr Tolerance kHiddenState{1e-4, 6e-3};
 /// and m = n matmul paths — differ by at most 5.5e-5 (17%).
 inline constexpr Tolerance kLogits{1e-4, 3e-4};
 
+/// Q8_0 weights need no tolerance of their own against
+/// oracle/data/model_q8_0/ (torch on the rounded weights): kHiddenState and
+/// kLogits above apply as they are. Measured (release; asan the same):
+/// hidden states worst 8.5% / 2.8% / 2.4% of kHiddenState and logits max abs
+/// 5.1e-5 / 4.6e-5 / 3.0e-5 (at most 9.1% of kLogits) for p0 / p1 / p2.
+///
+/// The one Q8_0 entry is a quality budget, not a comparison tolerance: the
+/// mean KL(fp32 engine || Q8_0 engine), in nats per position, teacher-forced
+/// (proposal 14, §5.3 layer 4). It moves only if the format or the quantizer
+/// changes (kernel reassociation moves KL by ~1e-8), and a quantizer that
+/// truncates instead of rounding is 2.8-3.4x over it on every set.
+/// Measured (release): 7.71e-3 / 2.89e-3 / 1.86e-3 on the oracle prompts
+/// plus their fp32 continuations (218 positions), the prose corpus (1060)
+/// and the code corpus (2748), as proposal 14 did; the budget is ~1.3-1.4x
+/// that, 72-77% used.
+struct KlBudget {
+  double oracle_prompts;
+  double prose;
+  double code;
+};
+inline constexpr KlBudget kQ8_0KlMean{1.0e-2, 4.0e-3, 2.5e-3};
+
 }  // namespace tol
 
 /// RoPE tolerance for data containing positions up to `max_position`.

@@ -13,6 +13,7 @@
 // generate.h (the prefill/decode loop).
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <exception>
@@ -80,15 +81,21 @@ int run(const minillm::cli::Options& opts) {
   const std::int32_t eos_id =
       opts.ignore_eos ? -1 : (cfg.eos_token_id >= 0 ? cfg.eos_token_id : tokenizer.eos_id());
 
-  Model model(std::move(cfg), load_checkpoint(opts.model_dir), n_prompt + opts.max_tokens);
+  Weights weights = load_checkpoint(opts.model_dir);
+  // Each tensor's F32 storage is freed as soon as its Q8_0 copy replaces it,
+  // so quantizing raises the F32 load's peak by one Q8_0 tensor at most.
+  if (opts.weights == DType::Q8_0) quantize_weights_q8_0(weights, cfg);
+  const std::size_t weight_bytes = weights.bytes();
+  Model model(std::move(cfg), std::move(weights), n_prompt + opts.max_tokens);
   const ModelConfig& mc = model.config();
   std::fprintf(stderr,
                "minillm: loaded %s (%s, %lld layers, hidden %lld, vocab %lld) in %.2f s; "
-               "%d thread(s)\n",
+               "%s weights, %.1f MB; %d thread(s)\n",
                opts.model_dir.string().c_str(), mc.model_type.c_str(),
                static_cast<long long>(mc.num_hidden_layers),
                static_cast<long long>(mc.hidden_size), static_cast<long long>(mc.vocab_size),
-               seconds_between(t_load, Clock::now()), num_threads());
+               seconds_between(t_load, Clock::now()), dtype_name(opts.weights),
+               static_cast<double>(weight_bytes) / 1e6, num_threads());
   if (opts.print_ids) print_ids("prompt ids", prompt_ids);
 
   Sampler sampler(opts.sampling);
