@@ -58,15 +58,16 @@ inline constexpr std::string_view kUsage =
     "  --top-p <f>                1 disables               (default 1)\n"
     "  --repetition-penalty <f>                            (default 1)\n"
     "  --seed <n>                                          (default 42)\n"
-    "  --threads <n>              compute threads, 0 = all (default 0)\n"
+    "  --threads <n>              threads to use, 0 = auto (default 0)\n"
     "  --ignore-eos               keep generating past the end-of-text token\n"
     "  --print-ids                print prompt and generated token ids to stderr\n"
     "  --help\n"
     "\n"
     "The continuation is streamed to stdout; everything else goes to stderr.\n"
     "Any flag that takes a value also accepts --flag=value.\n"
-    "--threads 0 uses one thread per hardware thread. The output is the same at\n"
-    "any --threads; only the speed changes.\n";
+    "--threads 0 uses one thread per hardware thread of the performance cores, or\n"
+    "of every core where all cores are alike. The output is the same at any\n"
+    "--threads; only the speed changes.\n";
 
 namespace detail {
 

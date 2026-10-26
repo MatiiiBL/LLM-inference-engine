@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <limits>
 #include <memory>
@@ -29,6 +30,7 @@
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #elif defined(__linux__)
 #include <filesystem>
 #endif
@@ -95,6 +97,28 @@ int settled_thread_count() {
     last = now;
   }
   return last;
+}
+
+/// What n <= 0 resolves to, worked out independently of the pool: the
+/// hardware threads of the performance cores where the OS reports them
+/// (Apple silicon's hw.perflevel0), otherwise std::thread::hardware_concurrency().
+int expected_default_threads() {
+  const int all = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+#if defined(__APPLE__)
+  int fast = 0;
+  std::size_t size = sizeof fast;
+  if (sysctlbyname("hw.perflevel0.logicalcpu", &fast, &size, nullptr, 0) == 0 && fast > 0) {
+    return std::min(fast, all);
+  }
+#endif
+  return all;
+}
+
+/// CPU time used so far by every thread of this process.
+std::chrono::nanoseconds process_cpu_time() {
+  timespec ts{};
+  REQUIRE(clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts) == 0);
+  return std::chrono::seconds(ts.tv_sec) + std::chrono::nanoseconds(ts.tv_nsec);
 }
 
 /// What one parallel_for call did, as observed by check_cover.
@@ -188,13 +212,24 @@ constexpr int kThreadCounts[] = {1, 2, 3, 4, 10};
 // ---------------------------------------------------------------------------
 
 TEST_CASE("ThreadPool size counts the calling thread") {
-  const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  const int def = expected_default_threads();
   CHECK(ThreadPool(1).size() == 1);
   CHECK(ThreadPool(2).size() == 2);
   CHECK(ThreadPool(5).size() == 5);
-  CHECK(ThreadPool(0).size() == hw);
-  CHECK(ThreadPool(-3).size() == hw);
-  CHECK(ThreadPool().size() == hw);
+  CHECK(ThreadPool(0).size() == def);
+  CHECK(ThreadPool(-3).size() == def);
+  CHECK(ThreadPool().size() == def);
+}
+
+TEST_CASE("the default thread count is the performance cores, or every hardware thread") {
+  const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  const int def = expected_default_threads();
+  MESSAGE("default thread count " << def << " of " << hw << " hardware threads");
+  CHECK(def >= 1);
+  CHECK(def <= hw);
+#if !defined(__APPLE__)
+  CHECK(def == hw);  // no core types to tell apart: unchanged from hardware_concurrency()
+#endif
 }
 
 TEST_CASE("parallel_for covers [0, n) exactly once") {
@@ -351,6 +386,33 @@ TEST_CASE("chunks run concurrently, one per thread") {
       }
     });
     CHECK(std::count(met.begin(), met.end(), 1) == threads);
+  }
+}
+
+TEST_CASE("a call wakes every sleeping thread it needs") {
+  // The caller wakes only the first sleeping worker, and each woken worker
+  // wakes the next. Let every worker fall asleep first, then hand out a job
+  // whose chunks can only finish if all of them are running at once: a
+  // broken chain leaves the job one thread short, and every item times out.
+  using clock = std::chrono::steady_clock;
+  for (const int threads : {2, 3, 8}) {
+    CAPTURE(threads);
+    ThreadPool pool(threads);
+    for (int round = 0; round < 3; ++round) {
+      CAPTURE(round);
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));  // far past the spin
+      std::atomic<int> arrived{0};
+      std::vector<char> met(static_cast<std::size_t>(threads), 0);
+      pool.parallel_for(threads, [&](Index begin, Index end) {
+        for (Index i = begin; i < end; ++i) {
+          arrived.fetch_add(1);
+          const auto deadline = clock::now() + std::chrono::seconds(10);
+          while (arrived.load() < threads && clock::now() < deadline) std::this_thread::yield();
+          met[static_cast<std::size_t>(i)] = arrived.load() >= threads;
+        }
+      });
+      CHECK(std::count(met.begin(), met.end(), 1) == threads);
+    }
   }
 }
 
@@ -564,6 +626,48 @@ TEST_CASE("no wakeup is lost while threads are falling asleep") {
     }
     CHECK(wrong == 0);
   }
+}
+
+TEST_CASE("an idle pool burns no CPU") {
+  // A waiting worker spins for 50 us and then sleeps. So once the calls
+  // stop, the process's CPU time must stop growing:
+  // workers still spinning would add a whole core each, every second. The
+  // check allows 10 ms of settling, far more than the spin, and then a
+  // quarter of one core over the window, for whatever else the process (or
+  // a sanitizer runtime) does meanwhile.
+  using namespace std::chrono_literals;
+  const auto window = 200ms;
+  const auto cpu_during_idle = [&](const std::function<void()>& work) {
+    work();
+    std::this_thread::sleep_for(10ms);
+    const auto start = process_cpu_time();
+    std::this_thread::sleep_for(window);
+    return process_cpu_time() - start;
+  };
+  const auto allowed = window / 4;
+  std::vector<int> sink(1000);
+  const Body touch = [&](Index begin, Index end) {
+    for (Index i = begin; i < end; ++i) ++sink[static_cast<std::size_t>(i)];
+  };
+
+  for (const int threads : {4, 8}) {
+    CAPTURE(threads);
+    ThreadPool pool(threads);
+    const auto cpu = cpu_during_idle([&] {
+      for (int call = 0; call < 200; ++call) pool.parallel_for(1000, 1, touch);
+    });
+    const double cpu_ms = std::chrono::duration<double, std::milli>(cpu).count();
+    CAPTURE(cpu_ms);
+    CHECK(cpu < allowed);
+  }
+
+  KernelThreads guard(4);
+  const auto cpu = cpu_during_idle([&] {
+    for (int call = 0; call < 200; ++call) kernel_parallel_for(1000, 1, touch);
+  });
+  const double cpu_ms = std::chrono::duration<double, std::milli>(cpu).count();
+  CAPTURE(cpu_ms);
+  CHECK(cpu < allowed);
 }
 
 // ---------------------------------------------------------------------------
@@ -844,16 +948,16 @@ TEST_CASE("arena scratch can be filled by a thread pool") {
 // kernel_parallel_for and the process-wide pool
 // ---------------------------------------------------------------------------
 
-TEST_CASE("set_num_threads resolves n <= 0 to hardware_concurrency, and num_threads reports it") {
-  const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+TEST_CASE("set_num_threads resolves n <= 0 to the default, and num_threads reports it") {
+  const int def = expected_default_threads();
   KernelThreads guard(3);
   CHECK(num_threads() == 3);
   set_num_threads(0);
-  CHECK(num_threads() == hw);
+  CHECK(num_threads() == def);
   set_num_threads(1);
   CHECK(num_threads() == 1);
   set_num_threads(-7);
-  CHECK(num_threads() == hw);
+  CHECK(num_threads() == def);
   set_num_threads(5);
   CHECK(num_threads() == 5);
 }
