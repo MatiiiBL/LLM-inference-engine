@@ -12,6 +12,7 @@
 //     ceiling
 //   * prefill and decode tokens/s for the whole model
 //   * peak resident memory
+//   * what one kernel_parallel_for costs the thread pool, hot and cold
 // each at one or more kernel thread counts (--threads), so the scaling of the
 // threaded kernels is measured the same way as their speedup over ref::.
 //
@@ -123,7 +124,8 @@ struct Options {
 constexpr const char* kUsage = R"(usage: minillm_bench [options]
 
 Benchmarks every op in ops.h (ops:: vs ref::) at the model's real shapes, then
-prefill and decode throughput for the whole model, then peak resident memory.
+prefill and decode throughput for the whole model, then peak resident memory,
+then the thread pool's cost per kernel_parallel_for.
 Run it from the repository root on the release preset:
 
   cmake --preset release && cmake --build --preset release
@@ -1015,6 +1017,84 @@ int run_model_benches(const Options& opt, Report& report) {
 }
 
 // ---------------------------------------------------------------------------
+// Runtime benchmarks: what one kernel_parallel_for costs
+// ---------------------------------------------------------------------------
+
+/// The pool's own cost per kernel_parallel_for, at each thread count: handing
+/// out the job, waking workers, and waiting for the last chunk. The body does
+/// next to nothing, so that is all there is to time. `hot` calls back to back,
+/// as a forward pass does about 240 times per decode step; `cold` calls once
+/// the workers have gone to sleep, as the first call after a pause does.
+/// Returns how many benchmarks matched the filter.
+int run_runtime_benches(const Options& opt, Report& report) {
+  const bool want_hot = selected(opt, "runtime.parallel_for.hot");
+  const bool want_cold = selected(opt, "runtime.parallel_for.cold");
+  if (!want_hot && !want_cold) return 0;
+
+  // Enough items for several chunks on every thread.
+  constexpr std::int64_t kItems = 1024;
+  // Far longer than a worker spins before it sleeps.
+  constexpr auto kPause = std::chrono::milliseconds(2);
+  constexpr int kColdCalls = 20;  // per sample
+  std::vector<std::int64_t> sink(static_cast<std::size_t>(kItems));
+  const auto body = [&](std::int64_t begin, std::int64_t end) {
+    for (std::int64_t i = begin; i < end; ++i) ++sink[static_cast<std::size_t>(i)];
+  };
+  const auto call = [&] {
+    kernel_parallel_for(kItems, 1, std::ref(body));
+    keep_alive(sink.data());
+  };
+
+  std::printf("\n== runtime — one kernel_parallel_for over %lld items with a trivial body ==\n\n",
+              static_cast<long long>(kItems));
+  std::printf("%-26s %3s %10s %6s %9s\n", "", "thr", "median", "+/-", "calls");
+  std::fflush(stdout);
+  const auto row = [&](const std::string& name, int threads, const Timing& t) {
+    std::printf("%-26s %3d %10s %5.1f%% %9s\n", name.c_str(), threads,
+                human_time(t.per_call.median()).c_str(), t.per_call.spread() * 100.0,
+                t.calls().c_str());
+    std::fflush(stdout);
+    report.add_time(name, threads, t);
+  };
+
+  int matched = 0;
+  if (want_hot) {
+    ++matched;
+    std::vector<Contender> contenders;
+    for (const int threads : opt.threads) contenders.push_back({use_threads(threads), call});
+    Rounds rounds;
+    const std::vector<Timing> t = time_round_robin(contenders, opt, rounds);
+    for (std::size_t i = 0; i < t.size(); ++i) {
+      row("runtime.parallel_for.hot", opt.threads[i], t[i]);
+    }
+  }
+  if (want_cold) {
+    ++matched;
+    // Each sample is the median of kColdCalls single calls, each made after
+    // kPause of nothing; samples are interleaved across thread counts.
+    std::vector<std::vector<double>> samples(opt.threads.size());
+    for (int s = 0; s < opt.samples; ++s) {
+      for (std::size_t i = 0; i < opt.threads.size(); ++i) {
+        set_num_threads(opt.threads[i]);
+        call();  // a resized pool's threads have not run anything yet
+        std::vector<double> calls;
+        for (int c = 0; c < kColdCalls; ++c) {
+          std::this_thread::sleep_for(kPause);
+          const Clock::time_point start = Clock::now();
+          call();
+          calls.push_back(seconds_since(start));
+        }
+        samples[i].push_back(Stats(std::move(calls)).median());
+      }
+    }
+    for (std::size_t i = 0; i < opt.threads.size(); ++i) {
+      row("runtime.parallel_for.cold", opt.threads[i], {Stats(samples[i]), kColdCalls});
+    }
+  }
+  return matched;
+}
+
+// ---------------------------------------------------------------------------
 
 int run(const Options& opt) {
   const ModelConfig cfg = ModelConfig::from_json_file(opt.model_dir / "config.json");
@@ -1049,6 +1129,7 @@ int run(const Options& opt) {
   int matched = run_model_benches(opt, report);
   matched += run_op_benches(cfg, opt, report);
   matched += run_q8_0_benches(cfg, opt, report);
+  matched += run_runtime_benches(opt, report);
   if (matched == 0) {
     std::fprintf(stderr, "minillm_bench: --filter '%s' matched no benchmark\n", opt.filter.c_str());
     return kExitError;

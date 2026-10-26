@@ -28,7 +28,9 @@ namespace minillm {
 /// thread at a time.
 class ThreadPool {
  public:
-  /// `n_threads` <= 0 means std::thread::hardware_concurrency() (at least 1).
+  /// `n_threads` <= 0 means one thread per hardware thread of the performance
+  /// cores where the OS reports core types (Apple silicon), otherwise
+  /// std::thread::hardware_concurrency(); at least 1.
   /// `n_threads == 1` runs everything inline and starts no threads.
   explicit ThreadPool(int n_threads = 0);
   ~ThreadPool();
@@ -107,8 +109,9 @@ class Arena {
 };
 
 /// Number of threads the optimized kernels in minillm::ops may use, counting
-/// the calling thread. n <= 0 means std::thread::hardware_concurrency() (at
-/// least 1); 1 runs every kernel inline. Blocks until no kernel is running,
+/// the calling thread. n <= 0 means the ThreadPool constructor's default (one
+/// per performance-core hardware thread, or per hardware thread where cores
+/// are alike); 1 runs every kernel inline. Blocks until no kernel is running,
 /// then resizes the process-wide pool. Default: 0. Throws std::logic_error if
 /// called from inside a parallel_for body.
 void set_num_threads(int n);

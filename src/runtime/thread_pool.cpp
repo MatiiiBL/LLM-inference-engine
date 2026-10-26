@@ -5,7 +5,7 @@
 //   1. writes the job (body, n, chunk count) into plain fields,
 //   2. publishes it by storing the chunk count into `unclaimed`,
 //   3. hands a ticket to as many workers as the job can use — the others are
-//      not woken at all,
+//      not woken at all — and wakes the first of them that is asleep,
 //   4. claims chunks alongside them, and
 //   5. waits until every chunk has finished.
 //
@@ -17,10 +17,23 @@
 // them than a slow one. On a machine with performance and efficiency cores a
 // static one-chunk-per-thread split runs at the speed of the slowest core.
 //
-// Waiting spins for a short while, yielding the core to anything else that
-// is runnable, before it sleeps. A forward pass makes hundreds of
+// Waiting spins for kSpin before it sleeps. A forward pass makes hundreds of
 // parallel_for calls back to back, and waking a sleeping thread costs more
-// than the work in most of them.
+// than the work in most of them. Once parallel_for has returned and no new
+// call starts, every worker is asleep within kSpin.
+//
+// Spinning never yields to the OS. On macOS sched_yield() also depresses the
+// thread's priority, so on a busy machine a worker that yielded and then
+// claimed a chunk could lose its core for a whole scheduler quantum (~10 ms)
+// while every other thread waited for that chunk; at the default thread count
+// that made decode slower than on one thread. The spin is bounded instead:
+// with more runnable threads than cores, a spinner holds a core for at most
+// kSpin before it sleeps and frees it.
+//
+// Waking a sleeper is a system call, and a decode step makes about 240
+// parallel_for calls, so the caller does at most one: it wakes the first
+// sleeping worker it ticketed, which wakes the next sleeping one before
+// running chunks, and so on, for as long as the job has chunks left to claim.
 //
 // Memory ordering. The job fields are plain. The caller writes them only
 // after every chunk of the previous job has finished (it has seen `done`
@@ -37,7 +50,16 @@
 // with every one of them, and sees all of it. The two sleep handshakes —
 // ticket / sleeping, and done / caller_sleeping — are seq_cst, so of a
 // sleeper and its waker at least one sees the other's store: no wakeup is
-// lost.
+// lost. A worker that wakes the next sleeper stands in for the caller: the
+// caller stored every ticket of the job before it woke the first worker of
+// the chain, under that worker's mutex, and each link wakes the next under
+// the next one's, so each ticket store happens before every waker's load of
+// `sleeping`, as the handshake needs. A worker woken some other way — a
+// spurious wakeup, or a late link of an earlier job's chain — may not see
+// the later tickets yet and end the chain early; the sleepers after it then
+// miss this one job. That costs speed, never progress: the caller claims
+// every chunk nobody else does, and only ever waits for chunks already
+// claimed, by threads that are running them.
 
 #include <algorithm>
 #include <atomic>
@@ -50,6 +72,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include "minillm/runtime.h"
 
@@ -87,6 +113,28 @@ class BodyScope {
   bool outer_;
 };
 
+/// The thread count that n <= 0 stands for: one thread per hardware thread
+/// of the performance cores, where the OS tells core types apart (Apple
+/// silicon's hw.perflevel0, the fastest level), otherwise one per hardware
+/// thread. At least 1.
+///
+/// Decode streams the weights from memory and has no use for the efficiency
+/// cores: on an M4 (4 + 6 cores), 4 threads already reach the bandwidth 10
+/// do on an idle machine, and on a busy one the 6 extra threads, slower and
+/// more often preempted, made decode about 10% slower than 4. Prefill is
+/// compute-bound and does scale to every core; --threads says so.
+int default_threads() {
+  const int all = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+#if defined(__APPLE__)
+  int fast = 0;
+  std::size_t size = sizeof fast;
+  if (sysctlbyname("hw.perflevel0.logicalcpu", &fast, &size, nullptr, 0) == 0 && fast > 0) {
+    return std::min(fast, all);
+  }
+#endif
+  return all;
+}
+
 /// Start of chunk `i` when [0, n) is cut into `chunks` contiguous pieces whose
 /// sizes differ by at most one. chunk_begin(n, chunks, chunks) == n.
 std::int64_t chunk_begin(std::int64_t n, std::int64_t chunks, std::int64_t i) {
@@ -114,8 +162,6 @@ inline void cpu_relax() {
 }
 
 /// Spins until ready() or kSpin has passed, and returns the last ready().
-/// Yields between bursts: with more runnable threads than cores, a spinner
-/// must not keep the core from a thread that is holding a chunk.
 template <class Ready>
 bool spin_until(Ready&& ready) {
   using clock = std::chrono::steady_clock;
@@ -126,7 +172,6 @@ bool spin_until(Ready&& ready) {
       cpu_relax();
     }
     if (clock::now() >= deadline) return ready();
-    std::this_thread::yield();
   }
 }
 
@@ -183,18 +228,40 @@ struct ThreadPool::Impl {
     }
   }
 
-  static std::uint64_t wait_for_ticket(Slot& s, std::uint64_t seen) {
+  /// Waits for a ticket other than `seen` and returns it; `slept` says
+  /// whether it took a wakeup.
+  static std::uint64_t wait_for_ticket(Slot& s, std::uint64_t seen, bool& slept) {
     std::uint64_t t = seen;
     const auto arrived = [&] {
       t = s.ticket.load();
       return t != seen;
     };
+    slept = false;
     if (spin_until(arrived)) return t;
+    slept = true;
     std::unique_lock<std::mutex> lock(s.mu);
     s.sleeping.store(true);
     s.cv.wait(lock, arrived);
     s.sleeping.store(false);
     return t;
+  }
+
+  /// Wakes the first worker after `index` that holds `ticket` and is asleep,
+  /// if any; index -1 starts at the first worker. Workers that are awake are
+  /// passed over, since they will see their ticket by themselves. The scan
+  /// stops at the first worker without `ticket`: parallel_for hands a job's
+  /// tickets to workers 0, 1, 2, ... in order, and a later job's tickets are
+  /// that job's to deliver.
+  void wake_next(int index, std::uint64_t ticket) {
+    for (int w = index + 1; w + 1 < n_threads; ++w) {
+      Slot& s = slots[w];
+      if (s.ticket.load() != ticket) return;
+      if (s.sleeping.load()) {
+        { std::lock_guard<std::mutex> lock(s.mu); }
+        s.cv.notify_one();
+        return;
+      }
+    }
   }
 
   /// Claims and runs chunks until none are left.
@@ -225,8 +292,12 @@ struct ThreadPool::Impl {
     Slot& s = slots[index];
     std::uint64_t seen = 0;
     for (;;) {
-      seen = wait_for_ticket(s, seen);
+      bool slept = false;
+      seen = wait_for_ticket(s, seen, slept);
       if (seen == kStop) return;
+      // Pass the wakeup on, unless the job is already all claimed: then the
+      // next sleeper would only find nothing to do.
+      if (slept && unclaimed.load(std::memory_order_relaxed) > 0) wake_next(index, seen);
       run_chunks();
     }
   }
@@ -242,9 +313,7 @@ struct ThreadPool::Impl {
 };
 
 ThreadPool::ThreadPool(int n_threads) : impl_(std::make_unique<Impl>()) {
-  if (n_threads <= 0) {
-    n_threads = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-  }
+  if (n_threads <= 0) n_threads = default_threads();
   impl_->n_threads = n_threads;
   impl_->slots = std::make_unique<Slot[]>(static_cast<std::size_t>(n_threads - 1));
   impl_->workers.reserve(static_cast<std::size_t>(n_threads - 1));
@@ -293,9 +362,11 @@ void ThreadPool::parallel_for(std::int64_t n, std::int64_t grain, const Body& bo
   p.failed.store(false, std::memory_order_relaxed);
   p.unclaimed.store(chunks, std::memory_order_release);
 
+  // Every ticket is stored before anyone is woken; see wake_next.
   const std::uint64_t ticket = ++p.job;
   const int helpers = static_cast<int>(std::min<std::int64_t>(chunks, p.n_threads) - 1);
-  for (int w = 0; w < helpers; ++w) Impl::give_ticket(p.slots[w], ticket);
+  for (int w = 0; w < helpers; ++w) p.slots[w].ticket.store(ticket);
+  p.wake_next(-1, ticket);
 
   p.run_chunks();
   // Every chunk, even after one has thrown: a running chunk still uses `body`.
@@ -327,10 +398,7 @@ void ThreadPool::parallel_for(std::int64_t n, const Body& body) { parallel_for(n
 
 namespace {
 
-int resolve_threads(int n) {
-  if (n > 0) return n;
-  return static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-}
+int resolve_threads(int n) { return n > 0 ? n : default_threads(); }
 
 struct KernelPool {
   std::mutex mu;  // held by the kernel using `pool`, or by set_num_threads
