@@ -171,7 +171,7 @@ runs it with:
 | `ops::`, `ref::` | median time per call over the samples (5 by default) |
 | `+/-` | half the spread of the samples: (max − min) / 2 / median |
 | `calls` | samples × calls per sample; fast ops are batched so each sample lasts ≥ 50 ms |
-| `thr` | the kernel thread count `ops::` ran with (`--threads`; `0`, the default, resolves to the hardware thread count) |
+| `thr` | the kernel thread count `ops::` ran with (`--threads`; `0`, the default, resolves to the performance cores on Apple silicon and to every hardware thread elsewhere) |
 | `speedup` | `ref::` / `ops::`, measured on interleaved pairs of samples, median over the pairs; > 1 means `ops::` is faster |
 | `scaling` | with several `--threads` counts: `ops::` at the first count / `ops::` at `thr`, over the same interleaved samples |
 
@@ -180,6 +180,12 @@ yet forwards `ops::` to `ref::`, so its true speedup is exactly 1.00x. Whatever
 its row shows is therefore the noise floor: about ±1% on a quiet machine, and a
 lot more while other jobs are running. An optimization that does not clear the
 noise floor has not been measured.
+
+**Runtime** times the thread pool itself: one `kernel_parallel_for` over 1024
+items with a trivial body, at each `--threads` count. `runtime.parallel_for.hot`
+calls back to back, as the forward pass does (about 240 calls per decode step);
+`runtime.parallel_for.cold` calls after the workers have gone to sleep, so it
+includes waking them.
 
 **Machine-readable lines** close the run, one per measurement:
 
