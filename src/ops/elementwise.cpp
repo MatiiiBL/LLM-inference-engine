@@ -139,12 +139,49 @@ std::int32_t argmax(const Tensor& x) {
   if (n == 0) detail::fail("argmax", "x is empty");
 
   const float* p = x.f32();
-  // ref keeps the first strictly greater element, so its answer is the
-  // lowest index holding the maximum — except that a NaN in element 0 is
-  // never beaten and NaNs elsewhere are never picked. max_of follows the same
-  // rule, so the two passes below reproduce ref's index exactly.
-  if (std::isnan(p[0])) return 0;
-  const float max_v = detail::max_of(p, n);
+  // ref's rule, which is torch.argmax's: the first NaN if there is one, else
+  // the lowest index holding the maximum.
+  //
+  // The first pass finds the maximum, NaNs skipped as in max_of, and on the
+  // side the sum of every element. A NaN anywhere makes the sum NaN; so can
+  // inf + -inf or an overflow, so a NaN sum only means "look": a plain scan
+  // then finds the first NaN, or finds none and the maximum stands.
+  //
+  // Each running maximum is a compare-and-select chain the loop waits on.
+  // With max_of's four chains the loop is bound by their latency; with
+  // eight, the sum's adds fit in the slack. The maximum does not depend on
+  // the order the elements are visited in, up to the sign of a zero
+  // maximum, which the == search below ignores.
+  constexpr int kChains = 8;
+  static_assert(kChains == 8, "the sum below adds eight vectors");
+  f32x4 m[kChains];
+  for (f32x4& chain : m) chain = splat(p[0]);
+  f32x4 sum = splat(0.0f);
+  std::int64_t j = 0;
+  for (; j + kChains * kLanes <= n; j += kChains * kLanes) {
+    f32x4 v[kChains];
+    for (int c = 0; c < kChains; ++c) v[c] = load(p + j + c * kLanes);
+    for (int c = 0; c < kChains; ++c) m[c] = detail::max_keep(m[c], v[c]);
+    sum += ((v[0] + v[1]) + (v[2] + v[3])) + ((v[4] + v[5]) + (v[6] + v[7]));
+  }
+  for (; j + kLanes <= n; j += kLanes) {
+    const f32x4 v = load(p + j);
+    m[0] = detail::max_keep(m[0], v);
+    sum += v;
+  }
+  for (int c = 1; c < kChains; ++c) m[0] = detail::max_keep(m[0], m[c]);
+  float max_v = detail::hmax(m[0]);
+  float total = detail::hsum(sum);
+  for (; j < n; ++j) {
+    if (p[j] > max_v) max_v = p[j];
+    total += p[j];
+  }
+
+  if (std::isnan(total)) {
+    for (std::int64_t i = 0; i < n; ++i) {
+      if (std::isnan(p[i])) return static_cast<std::int32_t>(i);
+    }
+  }
 
   // Find the first block holding max_v, then the first element within it.
   // -0.0 == +0.0, so a zero maximum resolves to whichever zero comes first,

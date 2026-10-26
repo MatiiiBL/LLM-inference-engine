@@ -2,7 +2,10 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -145,6 +148,34 @@ TEST_CASE("ref::argmax resolves ties to the lowest index") {
   CHECK(ref::argmax(negative) == 1);
 
   CHECK_THROWS_AS(ref::argmax(Tensor::zeros({2, 2})), std::invalid_argument);
+}
+
+TEST_CASE("ref::argmax returns the first NaN, as torch.argmax does") {
+  // torch.argmax counts a NaN as greater than every number, +inf included.
+  // Each expected index is torch 2.14.1's answer for the same row.
+  const float nan = std::numeric_limits<float>::quiet_NaN();
+  const float inf = std::numeric_limits<float>::infinity();
+  struct Case {
+    const char* name;
+    std::vector<float> x;
+    std::int32_t expected;
+  };
+  const Case cases[] = {
+      {"NaN first", {nan, 1.0f, 3.0f, 2.0f}, 0},
+      {"NaN in the middle", {1.0f, 3.0f, nan, 2.0f}, 2},
+      {"NaN last", {1.0f, 3.0f, 2.0f, nan}, 3},
+      {"several NaNs", {1.0f, nan, 3.0f, nan, 2.0f, nan}, 1},
+      {"+inf before the NaN", {1.0f, inf, nan, 2.0f}, 2},
+      {"+inf after the NaN", {1.0f, nan, inf, 2.0f}, 1},
+      {"NaN among -inf", {-inf, -inf, nan, -inf}, 2},
+      {"all NaN", {nan, nan, nan, nan}, 0},
+      {"a lone NaN", {nan}, 0},
+  };
+  for (const Case& c : cases) {
+    Tensor x = Tensor::empty({static_cast<std::int64_t>(c.x.size())});
+    std::copy(c.x.begin(), c.x.end(), x.f32());
+    CHECK_MESSAGE(ref::argmax(x) == c.expected, c.name);
+  }
 }
 
 TEST_CASE("elementwise ops reject mismatched shapes and dtypes") {

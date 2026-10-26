@@ -91,6 +91,11 @@ std::int32_t argmax(const Tensor& x) {
   if (n == 0) detail::fail("argmax", "x is empty");
 
   const float* p = x.f32();
+  // torch.argmax counts a NaN as greater than every number, so the first NaN
+  // wins outright.
+  for (std::int64_t i = 0; i < n; ++i) {
+    if (std::isnan(p[i])) return static_cast<std::int32_t>(i);
+  }
   std::int64_t best = 0;
   // Strictly greater, so ties resolve to the lowest index like torch.argmax.
   for (std::int64_t i = 1; i < n; ++i) {
