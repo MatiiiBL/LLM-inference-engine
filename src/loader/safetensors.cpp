@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -288,8 +289,16 @@ std::vector<std::string> Weights::names() const {
   return out;  // std::map iterates in sorted order
 }
 
-void Weights::replace(std::string_view, Tensor) {
-  throw std::logic_error("not implemented: Weights::replace (workflow 15)");
+void Weights::replace(std::string_view name, Tensor tensor) {
+  const auto it = tensors_.find(name);
+  if (it == tensors_.end()) {
+    throw std::runtime_error("Weights: cannot replace '" + std::string(name) +
+                             "': no tensor by that name (" + std::to_string(tensors_.size()) +
+                             " tensors loaded)");
+  }
+  // Move-assigning drops this map's reference to the old storage; it is freed
+  // here unless a copy of the old handle (or a view of it) is still alive.
+  it->second = std::move(tensor);
 }
 
 std::size_t Weights::size() const { return tensors_.size(); }
@@ -303,9 +312,6 @@ std::size_t Weights::bytes() const {
 }
 
 Tensor convert_to_f32(const Tensor& src) {
-  if (src.dtype() == DType::Q8_0) {
-    throw std::logic_error("not implemented: q8_0 convert_to_f32 (workflow 15)");
-  }
   if (src.is_empty()) return Tensor();
   if (src.dtype() == DType::F32) return src.copy_contiguous();
 
@@ -315,7 +321,18 @@ Tensor convert_to_f32(const Tensor& src) {
   const auto* raw = static_cast<const std::byte*>(in.data());
   float* dst = out.f32();
   const std::int64_t n = in.numel();
-  if (in.dtype() == DType::BF16) {
+  if (in.dtype() == DType::Q8_0) {
+    // q * d is exact in float: an int8 has at most 8 significant bits and an
+    // f16 scale 11, and the smallest nonzero product, 2^-24, is a normal float.
+    for (std::int64_t b = 0; b < n / kQ8_0Block; ++b) {
+      const std::byte* block = raw + b * static_cast<std::int64_t>(sizeof(BlockQ8_0));
+      const float d = f16_to_f32(load_u16(block + offsetof(BlockQ8_0, d), 0));
+      const auto* qs = reinterpret_cast<const std::int8_t*>(block + offsetof(BlockQ8_0, qs));
+      for (std::int64_t j = 0; j < kQ8_0Block; ++j) {
+        dst[b * kQ8_0Block + j] = static_cast<float>(qs[j]) * d;
+      }
+    }
+  } else if (in.dtype() == DType::BF16) {
     for (std::int64_t i = 0; i < n; ++i) dst[i] = bf16_to_f32(load_u16(raw, i));
   } else {
     for (std::int64_t i = 0; i < n; ++i) dst[i] = f16_to_f32(load_u16(raw, i));

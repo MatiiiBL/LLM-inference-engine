@@ -9,6 +9,7 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -30,6 +31,7 @@
 
 #include "common/allclose.h"
 #include "common/oracle.h"
+#include "common/random.h"
 #include "minillm/config.h"
 #include "minillm/loader.h"
 
@@ -805,6 +807,411 @@ TEST_CASE("convert_to_f32: f32 is copied, and strided input comes out contiguous
 }
 
 // ===========================================================================
+// Q8_0: quantize_q8_0, and convert_to_f32 back
+// ===========================================================================
+
+namespace {
+
+/// 2^e * k, exactly (for the k used here).
+float p2(double k, int e) { return std::ldexp(static_cast<float>(k), e); }
+
+/// loader.h's quantizer transcribed as literally as possible, for
+/// quantize_q8_0 to match byte for byte. Finite input only.
+BlockQ8_0 reference_q8_0_block(const float* x) {
+  BlockQ8_0 out{};
+  float amax = 0.0f;
+  for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+  out.d = f32_to_f16(amax / 127.0f);
+  const float d = f16_to_f32(out.d);
+  for (int j = 0; j < 32; ++j) {
+    out.qs[j] = d == 0.0f ? std::int8_t{0}
+                          : static_cast<std::int8_t>(
+                                std::clamp(std::round(x[j] * (1.0f / d)), -127.0f, 127.0f));
+  }
+  return out;
+}
+
+/// The smallest normal f16, 2^-14: a scale below it is subnormal.
+constexpr double kMinNormalF16 = 6.103515625e-05;
+
+/// Round-trip statistics of quantize_q8_0, dequantized with convert_to_f32.
+/// An element counts as clamped when |x| > 127.5 d: round(x / d) would have
+/// left [-127, 127], which only a subnormal (or zero) scale allows.
+struct RoundTrip {
+  std::int64_t blocks = 0;
+  std::int64_t zero_scale = 0;
+  std::int64_t subnormal_scale = 0;
+  std::int64_t clamped = 0;
+  std::int64_t clamped_with_normal_scale = 0;  ///< must stay 0
+  /// The rest must stay 0: unclamped elements with |x - q d| > d (0.5 + 2^-15),
+  /// blocks unlike reference_q8_0_block, and dequantized values that are not
+  /// float(q) * d.
+  std::int64_t over_bound = 0;
+  std::int64_t not_reference = 0;
+  std::int64_t not_exact = 0;
+  double max_err_over_d = 0.0;                 ///< over unclamped elements with d > 0
+  double min_d = std::numeric_limits<double>::infinity();
+  double max_d = 0.0;
+  double sq_err = 0.0;
+  double sq_x = 0.0;
+
+  void add(const Tensor& x, const Tensor& q) {
+    REQUIRE(q.dtype() == DType::Q8_0);
+    REQUIRE(q.shape() == x.shape());
+    const Tensor deq = convert_to_f32(q);
+    REQUIRE(deq.dtype() == DType::F32);
+    REQUIRE(deq.shape() == x.shape());
+    const float* xs = x.f32();
+    const float* ys = deq.f32();
+    const auto* qb = q.data_as<BlockQ8_0>();
+    for (std::int64_t b = 0; b < x.numel() / 32; ++b) {
+      ++blocks;
+      const BlockQ8_0 ref = reference_q8_0_block(xs + b * 32);
+      if (std::memcmp(&ref, &qb[b], sizeof(BlockQ8_0)) != 0) ++not_reference;
+      const float d = f16_to_f32(qb[b].d);
+      if (d == 0.0f) ++zero_scale;
+      if (d > 0.0f && d < kMinNormalF16) ++subnormal_scale;
+      if (d > 0.0f) min_d = std::min(min_d, static_cast<double>(d));
+      max_d = std::max(max_d, static_cast<double>(d));
+      for (std::int64_t j = 0; j < 32; ++j) {
+        const std::int64_t i = b * 32 + j;
+        if (ys[i] != static_cast<float>(qb[b].qs[j]) * d) ++not_exact;
+        const double err = std::fabs(static_cast<double>(xs[i]) - static_cast<double>(ys[i]));
+        sq_err += err * err;
+        sq_x += static_cast<double>(xs[i]) * xs[i];
+        if (std::fabs(xs[i]) > 127.5 * d) {
+          ++clamped;
+          if (d >= kMinNormalF16) ++clamped_with_normal_scale;
+          continue;
+        }
+        if (err > d * (0.5 + std::ldexp(1.0, -15))) ++over_bound;
+        if (d > 0.0f) max_err_over_d = std::max(max_err_over_d, err / d);
+      }
+    }
+  }
+
+  double rel_frobenius() const { return std::sqrt(sq_err / sq_x); }
+};
+
+/// Checks the invariants every RoundTrip must satisfy.
+void check_round_trip(const RoundTrip& r) {
+  CHECK(r.not_reference == 0);
+  CHECK(r.not_exact == 0);
+  CHECK(r.over_bound == 0);
+  CHECK(r.clamped_with_normal_scale == 0);
+  CHECK(r.max_err_over_d <= 0.5 + std::ldexp(1.0, -15));
+}
+
+}  // namespace
+
+TEST_CASE("quantize_q8_0 writes the golden bytes") {
+  // Eight blocks, as a [4, 64] tensor, each checked by hand. x * (1 / d) is
+  // given where it decides q; ties round away from zero.
+  std::vector<float> x;
+  // A: amax 127/16, so amax / 127 = 2^-4 = d exactly (0x2c00) and 1 / d = 16:
+  // every product below is exact, among them the halves +-0.5, +-1.5, +-2.5,
+  // +-33.5, +-64.5 and +-126.5. Element 12 is just below 0.5 / 16: 0.49999997.
+  for (const double k : {127.0, -127.0, 2.5, -2.5, 0.5, -0.5, 1.5, -1.5, 126.5, -126.5, 0.0, -0.0,
+                         0.0, 16.0, -16.0, 8.0, -8.0, 3.0, -5.0, 100.0, -64.0, 33.5, -33.5, 7.0,
+                         -9.0, 11.0, 4.0, -4.0, 64.5, -64.5, 120.0, -1.0}) {
+    x.push_back(p2(k, -4));
+  }
+  x[12] = std::nextafter(p2(0.5, -4), 0.0f);
+  // B: amax 1.0. 1 / 127 = 0.0078740157 is 2^-7 * 1.0079, whose 10-bit
+  // mantissa 8.06 rounds to 8: d = 2^-7 * (1 + 8/1024) = 0.00787353515625
+  // (0x2008), below 1 / 127, so 1 / d = 127.00775 and amax gives 127.0078 ->
+  // 127. 0.5 gives 63.504 -> 64 and 2^-8 gives 0.496 -> 0: no ties here.
+  for (const double k : {256.0, 128.0, -128.0, 64.0, -64.0, 192.0, -192.0, 1.0, -1.0, 3.0, -3.0,
+                         5.0, 32.0, -32.0, 0.0, 224.0, -224.0, 96.0, -96.0, 160.0, -160.0, 3.5,
+                         -3.5, 254.0, -254.0, 252.0, -4.0, 8.0, -8.0, 48.0, -48.0, 240.0}) {
+    x.push_back(p2(k, -8));
+  }
+  // C: amax 0.75, held by a negative element, which maps to -127. 0.75 / 127
+  // = 2^-8 * 1.5118, mantissa 524.09 -> 524: d = 0x1e0c = 0.0059051513671875
+  // and 1 / d = 169.34367.
+  for (const double k : {-48.0, 32.0, -32.0, 16.0, 0.0, 24.0, -24.0, 8.0, -8.0, 4.0, -4.0, 46.0,
+                         -46.0, 44.0, 7.0, -7.0, 19.0, -19.0, 0.5, -0.5, 47.0, -47.0, 0.1875,
+                         -0.1875, 32.0, 0.0625, -0.0625, 25.0, -25.0, 13.0, -13.0, 48.0}) {
+    x.push_back(p2(k, -6));
+  }
+  // E: all zero, both signs: d = 0, every q = 0.
+  for (int j = 0; j < 32; ++j) x.push_back(j % 2 == 0 ? 0.0f : -0.0f);
+  // F: amax 127 * 2^-25, so amax / 127 = 2^-25 exactly, the tie between f16 0
+  // and the smallest subnormal 2^-24: it rounds to even, d = 0, and every q is
+  // 0 although no x is.
+  for (int rep = 0; rep < 4; ++rep) {
+    for (const float v : {p2(127, -25), p2(-100, -25), p2(3, -25), p2(-1, -25), p2(64, -25),
+                          p2(-127, -25), p2(1, -30), 0.0f}) {
+      x.push_back(v);
+    }
+  }
+  // F2: amax 2^-18, so amax / 127 is 1.008 * 2^-25, just past that tie: d is
+  // the smallest subnormal, 2^-24 (0x0001), and 1 / d = 2^24 exactly. amax
+  // maps to only 64. Halves +-0.5 ... +-5.5, both signs, round away from zero.
+  for (const float v : {p2(1, -18), p2(-1, -18), p2(1, -25), p2(-1, -25), p2(3, -26), p2(-3, -26),
+                        p2(1, -26), p2(-1, -26)}) {
+    x.push_back(v);
+  }
+  for (int k = 0; k < 24; ++k) x.push_back(p2(k - 12, -25));
+  // G: amax 2^-13, amax / 127 = 16.13 * 2^-24, so the subnormal d = 16 * 2^-24
+  // = 2^-20 (0x0010) rounded down and 1 / d = 2^20. The clamp bites: amax
+  // maps to 128 -> 127, and so do 127.5 and 126.5.
+  for (const double k : {128.0, -128.0, 1.5, -1.5, -1.25, 1.25, 127.5, -127.5, 126.5, -126.5, 0.5,
+                         -0.5, 64.0, -64.0, 0.0, 1.0}) {
+    x.push_back(p2(k, -20));
+  }
+  for (int k = 0; k < 16; ++k) x.push_back(p2(k * 9 - 70, -20));
+  // H: amax 1550 * 2^-24, amax / 127 = 12.2 * 2^-24, so d = 12 * 2^-24
+  // (0x000c), 1 / d = 1398101.375 (2^24 / 12 = 1398101.33 to float). amax
+  // maps to 129.17 -> 127, 1536 to 128.0 -> 127, -1530 to -127.5 -> -127;
+  // -606 to -50.5000015, which is -50.5 in float -> -51.
+  for (const double k : {1550.0, -1550.0, 1536.0, -1530.0, 1524.0, 600.0, -606.0, 12.0, -6.0, 18.0,
+                         0.0, 1.0}) {
+    x.push_back(p2(k, -24));
+  }
+  for (int k = 0; k < 20; ++k) x.push_back(p2(k * 61 - 600, -24));
+  REQUIRE(x.size() == 8 * 32);
+
+  struct Golden {
+    const char* name;
+    std::uint16_t d;
+    std::array<int, 32> qs;
+  };
+  const std::array<Golden, 8> golden = {{
+      {"A", 0x2c00, {127, -127, 3, -3, 1, -1, 2, -2, 127, -127, 0, 0, 0, 16, -16, 8,
+                     -8, 3, -5, 100, -64, 34, -34, 7, -9, 11, 4, -4, 65, -65, 120, -1}},
+      {"B", 0x2008, {127, 64, -64, 32, -32, 95, -95, 0, 0, 1, -1, 2, 16, -16, 0, 111,
+                     -111, 48, -48, 79, -79, 2, -2, 126, -126, 125, -2, 4, -4, 24, -24, 119}},
+      {"C", 0x1e0c, {-127, 85, -85, 42, 0, 64, -64, 21, -21, 11, -11, 122, -122, 116, 19, -19,
+                     50, -50, 1, -1, 124, -124, 0, 0, 85, 0, 0, 66, -66, 34, -34, 127}},
+      {"E", 0x0000, {}},
+      {"F", 0x0000, {}},
+      {"F2", 0x0001, {64, -64, 1, -1, 1, -1, 0, 0, -6, -6, -5, -5, -4, -4, -3, -3,
+                      -2, -2, -1, -1, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6}},
+      {"G", 0x0010, {127, -127, 2, -2, -1, 1, 127, -127, 127, -127, 1, -1, 64, -64, 0, 1,
+                     -70, -61, -52, -43, -34, -25, -16, -7, 2, 11, 20, 29, 38, 47, 56, 65}},
+      {"H", 0x000c, {127, -127, 127, -127, 127, 50, -51, 1, -1, 2, 0, 0, -50, -45, -40, -35,
+                     -30, -25, -20, -14, -9, -4, 1, 6, 11, 16, 21, 26, 31, 36, 42, 47}},
+  }};
+
+  const Tensor q = quantize_q8_0(Tensor::wrap(x.data(), {4, 64}, DType::F32));
+  REQUIRE(q.dtype() == DType::Q8_0);
+  REQUIRE(q.shape() == Shape{4, 64});
+  REQUIRE(q.nbytes() == 8 * 34);
+  const auto* blocks = q.data_as<BlockQ8_0>();
+  for (std::size_t b = 0; b < golden.size(); ++b) {
+    CAPTURE(golden[b].name);
+    CHECK(blocks[b].d == golden[b].d);
+    for (int j = 0; j < 32; ++j) {
+      CAPTURE(j);
+      CHECK(static_cast<int>(blocks[b].qs[j]) == golden[b].qs[static_cast<std::size_t>(j)]);
+    }
+  }
+
+  // The layout is llama.cpp's: the f16 scale little-endian, then 32 int8s.
+  const auto* bytes = q.data_as<unsigned char>();
+  const std::array<unsigned char, 6> a_head = {0x00, 0x2c, 0x7f, 0x81, 0x03, 0xfd};
+  CHECK(std::equal(a_head.begin(), a_head.end(), bytes));
+  const std::array<unsigned char, 4> b_head = {0x08, 0x20, 0x7f, 0x40};
+  CHECK(std::equal(b_head.begin(), b_head.end(), bytes + 34));
+}
+
+TEST_CASE("quantize_q8_0 keeps the shape and writes one block per 32 values") {
+  for (const Shape& shape : {Shape{32}, Shape{3, 64}, Shape{2, 3, 32}, Shape{1, 2, 1, 96}}) {
+    CAPTURE(shape.to_string());
+    const Tensor x = random_tensor(shape, 42);
+    const Tensor q = quantize_q8_0(x);
+    CHECK(q.dtype() == DType::Q8_0);
+    CHECK(q.shape() == shape);
+    CHECK(q.is_contiguous());
+    CHECK(q.owns_data());
+    CHECK(q.nbytes() == static_cast<std::size_t>(shape.numel() / 32) * sizeof(BlockQ8_0));
+    // Blocks run along the flattened tensor, like its elements.
+    const auto* qb = q.data_as<BlockQ8_0>();
+    for (std::int64_t b = 0; b < shape.numel() / 32; ++b) {
+      const BlockQ8_0 ref = reference_q8_0_block(x.f32() + b * 32);
+      CHECK(std::memcmp(&ref, &qb[b], sizeof(BlockQ8_0)) == 0);
+    }
+  }
+  // A dimension-0 slice is contiguous, and quantizes like its own rows.
+  const Tensor x = random_tensor({4, 64}, 43);
+  const Tensor rows = quantize_q8_0(x.slice(0, 1, 2));
+  const Tensor all = quantize_q8_0(x);
+  CHECK(std::memcmp(rows.data(), all.data_as<BlockQ8_0>() + 2, rows.nbytes()) == 0);
+
+  CHECK(quantize_q8_0(Tensor::zeros({0, 32})).shape() == Shape{0, 32});
+  CHECK(quantize_q8_0(Tensor::zeros({3, 0})).nbytes() == 0);
+  CHECK(quantize_q8_0(Tensor()).is_empty());
+}
+
+TEST_CASE("quantize_q8_0 rejects the inputs loader.h names") {
+  using doctest::Contains;
+  SUBCASE("not f32") {
+    for (const DType dt : {DType::BF16, DType::F16, DType::Q8_0}) {
+      CAPTURE(dtype_name(dt));
+      CHECK_THROWS_WITH_AS(quantize_q8_0(Tensor::zeros({2, 32}, dt)), Contains("only f32"),
+                           std::invalid_argument);
+    }
+  }
+  SUBCASE("not contiguous") {
+    const Tensor x = Tensor::zeros({4, 64});
+    REQUIRE_FALSE(x.slice(1, 0, 32).is_contiguous());
+    CHECK_THROWS_WITH_AS(quantize_q8_0(x.slice(1, 0, 32)), Contains("contiguous"),
+                         std::invalid_argument);
+    CHECK_THROWS_WITH_AS(quantize_q8_0(x.slice(1, 32, 32)), Contains("contiguous"),
+                         std::invalid_argument);
+  }
+  SUBCASE("a last dimension that is not a multiple of 32") {
+    for (const Shape& shape : {Shape{31}, Shape{33}, Shape{4, 48}, Shape{64, 1}, Shape{2, 2, 16}}) {
+      CAPTURE(shape.to_string());
+      CHECK_THROWS_WITH_AS(quantize_q8_0(Tensor::zeros(shape)), Contains("multiple of 32"),
+                           std::invalid_argument);
+    }
+  }
+  SUBCASE("a non-finite value anywhere, named by its element index") {
+    const float inf = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float snan = std::numeric_limits<float>::signaling_NaN();
+    for (const auto& [index, value] : std::vector<std::pair<std::int64_t, float>>{
+             {0, nan}, {77, -nan}, {127, inf}, {64, -inf}, {95, snan}}) {
+      CAPTURE(index);
+      Tensor x = random_tensor({2, 64}, 44);
+      x.f32()[index] = value;
+      const std::string expected = "element " + std::to_string(index) + " is";
+      CHECK_THROWS_WITH_AS(quantize_q8_0(x), Contains(expected.c_str()), std::invalid_argument);
+    }
+  }
+}
+
+TEST_CASE("quantize_q8_0: amax 8321040 is the smallest whose scale overflows f16") {
+  // 65504 is the largest finite f16, and 65520, halfway to 2^16, rounds to
+  // even: to inf. 8321040 = 127 * 65520 exactly, so amax / 127 = 65520 -> inf.
+  // The float below it, 8321039.5, gives amax / 127 = 65519.996 -> 65504.
+  const float threshold = 8321040.0f;
+  const float below = std::nextafter(threshold, 0.0f);
+  REQUIRE(below == 8321039.5f);
+  CHECK(f32_to_f16(threshold / 127.0f) == 0x7c00);
+  CHECK(f32_to_f16(below / 127.0f) == 0x7bff);
+
+  for (const float sign : {1.0f, -1.0f}) {
+    CAPTURE(sign);
+    std::vector<float> x(64, 65504.0f);  // 1 / d = 1 / 65504 maps these to 1
+    x[37] = sign * below;
+    const Tensor q = quantize_q8_0(Tensor::wrap(x.data(), {64}, DType::F32));
+    const BlockQ8_0& block = q.data_as<BlockQ8_0>()[1];
+    CHECK(block.d == 0x7bff);
+    CHECK(block.qs[5] == static_cast<std::int8_t>(sign * 127));  // 127.03 -> 127
+    CHECK(block.qs[6] == 1);
+
+    x[37] = sign * threshold;
+    const Tensor over = Tensor::wrap(x.data(), {64}, DType::F32);
+    CHECK_THROWS_WITH_AS(quantize_q8_0(over), doctest::Contains("overflows the f16 scale"),
+                         std::invalid_argument);
+    CHECK_THROWS_WITH_AS(quantize_q8_0(over), doctest::Contains("elements 32..63"),
+                         std::invalid_argument);
+  }
+  std::vector<float> x(32, std::numeric_limits<float>::max());
+  CHECK_THROWS_AS(quantize_q8_0(Tensor::wrap(x.data(), {32}, DType::F32)), std::invalid_argument);
+}
+
+TEST_CASE("quantize_q8_0 round trip is within d * (0.5 + 2^-15) on random data") {
+  // 2048 blocks of N(0, 1) samples, block b scaled by 2^(b % 55 - 36): from
+  // scales that round to 0 (amax / 127 at most 2^-25), through f16-subnormal
+  // ones, where the clamp can bite, to amax around 2^20.
+  Tensor x = random_tensor({64, 1024}, 45);
+  for (std::int64_t b = 0; b < x.numel() / 32; ++b) {
+    const int e = static_cast<int>(b % 55) - 36;
+    for (std::int64_t j = 0; j < 32; ++j) x.f32()[b * 32 + j] = std::ldexp(x.f32()[b * 32 + j], e);
+  }
+  RoundTrip r;
+  r.add(x, quantize_q8_0(x));
+  check_round_trip(r);
+  CHECK(r.blocks == 2048);
+  // Every regime was reached.
+  CHECK(r.zero_scale > 0);
+  CHECK(r.subnormal_scale > 0);
+  CHECK(r.clamped > 0);
+  MESSAGE("random data: max |x - q d| / d over unclamped elements " << r.max_err_over_d << ", "
+          << r.zero_scale << " zero and " << r.subnormal_scale << " subnormal scales, "
+          << r.clamped << " clamped elements");
+}
+
+TEST_CASE("convert_to_f32: q8_0 is float(q) * d, exact") {
+  // [2, 96]: six blocks, one scale each, q from -127 to 121.
+  const std::array<std::uint16_t, 6> scales = {0x3c00, 0xb800, 0x0001, 0x7bff, 0x0000, 0x2008};
+  std::vector<BlockQ8_0> blocks(6);
+  for (std::size_t b = 0; b < blocks.size(); ++b) {
+    blocks[b].d = scales[b];
+    for (int j = 0; j < 32; ++j) blocks[b].qs[j] = static_cast<std::int8_t>(-127 + 8 * j);
+  }
+  const Tensor q = Tensor::wrap(blocks.data(), {2, 96}, DType::Q8_0);
+  const Tensor out = convert_to_f32(q);
+  REQUIRE(out.dtype() == DType::F32);
+  CHECK(out.shape() == Shape{2, 96});
+  CHECK(out.is_contiguous());
+  CHECK(out.owns_data());
+
+  // Bitwise, so the -0 of -127 * 0 counts too.
+  std::int64_t wrong = 0;
+  for (std::size_t b = 0; b < blocks.size(); ++b) {
+    for (int j = 0; j < 32; ++j) {
+      const float expected = static_cast<float>(blocks[b].qs[j]) * f16_to_f32(blocks[b].d);
+      if (std::memcmp(&out.f32()[b * 32 + static_cast<std::size_t>(j)], &expected,
+                      sizeof(float)) != 0) {
+        ++wrong;
+      }
+    }
+  }
+  CHECK(wrong == 0);
+  // Spot values, independent of f16_to_f32 (q = -127 at j = 0, 121 at 31).
+  CHECK(out.f32()[0] == -127.0f);                         // d = 1
+  CHECK(out.f32()[32] == 63.5f);                          // d = -0.5
+  CHECK(out.f32()[64 + 31] == std::ldexp(121.0f, -24));   // d = 2^-24
+  CHECK(out.f32()[96] == -8319008.0f);                    // d = 65504
+  CHECK(std::signbit(out.f32()[128]));                    // d = 0: -127 * 0 = -0
+  CHECK(out.f32()[160] == -0.99993896484375f);            // d = 0x2008
+
+  // Views convert like the blocks they start on.
+  const Tensor second = convert_to_f32(q.slice(0, 1, 1));
+  CHECK(second.shape() == Shape{1, 96});
+  CHECK(std::memcmp(second.f32(), out.f32() + 96, 96 * sizeof(float)) == 0);
+  const Tensor row = convert_to_f32(q.row(0));
+  CHECK(row.shape() == Shape{96});
+  CHECK(std::memcmp(row.f32(), out.f32(), 96 * sizeof(float)) == 0);
+}
+
+TEST_CASE("Weights::replace swaps in a tensor of any dtype or shape") {
+  Weights w;
+  w.insert("model.norm.weight", Tensor::zeros({64}));
+  const Tensor embed = random_tensor({4, 64}, 46);
+  w.insert("model.embed_tokens.weight", embed);
+  CHECK(w.bytes() == (64 + 256) * sizeof(float));
+
+  const Tensor old = w.get("model.embed_tokens.weight");  // a second handle on the f32 storage
+  w.replace("model.embed_tokens.weight", quantize_q8_0(embed));
+  const Tensor& q = w.get("model.embed_tokens.weight");
+  CHECK(q.dtype() == DType::Q8_0);
+  CHECK(q.shape() == Shape{4, 64});
+  CHECK(w.size() == 2);
+  CHECK(w.bytes() == 64 * sizeof(float) + 8 * sizeof(BlockQ8_0));
+  // The map let go of the f32 storage, but a handle still sharing it keeps it.
+  CHECK(old.f32() == embed.f32());
+  CHECK(old.f32()[200] == embed.f32()[200]);
+
+  // The shape may change too.
+  w.replace("model.norm.weight", Tensor::zeros({2, 3, 32}, DType::Q8_0));
+  CHECK(w.get("model.norm.weight").shape() == Shape{2, 3, 32});
+  CHECK(w.bytes() == 6 * sizeof(BlockQ8_0) + 8 * sizeof(BlockQ8_0));
+  CHECK(w.names() == std::vector<std::string>{"model.embed_tokens.weight", "model.norm.weight"});
+
+  // replace never inserts.
+  CHECK_THROWS_WITH_AS(w.replace("lm_head.weight", Tensor::zeros({1})),
+                       doctest::Contains("'lm_head.weight'"), std::runtime_error);
+  CHECK_FALSE(w.has("lm_head.weight"));
+  CHECK(w.size() == 2);
+}
+
+// ===========================================================================
 // safetensors: well-formed files
 // ===========================================================================
 
@@ -1372,4 +1779,46 @@ TEST_CASE("SmolLM2-135M weight samples match torch: shape, first 16 values, fp32
     assert_allclose(std::span<const float>(&actual, 1), std::span<const float>(&expected, 1),
                     tol::kReduction, name + " sum_f32");
   }
+}
+
+TEST_CASE("SmolLM2-135M: every projection and the embedding quantize within the round-trip bound") {
+  if (skip_without_model({"config.json", "model.safetensors"})) return;
+  const ModelConfig cfg = ModelConfig::from_json_file(model_file("config.json"));
+  const Weights& w = smollm2_weights();
+
+  // The tensors quantize_weights_q8_0 replaces (model.h): the seven
+  // projections of every layer and the (tied) embedding.
+  RoundTrip proj;
+  for (std::int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
+    for (const char* suffix : {"self_attn.q_proj.weight", "self_attn.k_proj.weight",
+                               "self_attn.v_proj.weight", "self_attn.o_proj.weight",
+                               "mlp.gate_proj.weight", "mlp.up_proj.weight",
+                               "mlp.down_proj.weight"}) {
+      const std::string name = "model.layers." + std::to_string(i) + "." + suffix;
+      CAPTURE(name);
+      const Tensor& x = w.get(name);
+      proj.add(x, quantize_q8_0(x));
+    }
+  }
+  RoundTrip embed;
+  const Tensor& table = w.get("model.embed_tokens.weight");
+  embed.add(table, quantize_q8_0(table));
+
+  for (const RoundTrip* r : {&proj, &embed}) {
+    check_round_trip(*r);
+    // Proposal 14 measured this checkpoint: no block needs a scale outside
+    // f16's normal range, so nothing is clamped.
+    CHECK(r->zero_scale == 0);
+    CHECK(r->subnormal_scale == 0);
+    CHECK(r->clamped == 0);
+  }
+  CHECK(proj.blocks == 3317760);
+  CHECK(embed.blocks == 884736);
+  // Proposal 14's numbers, which the same bytes reproduce on every platform.
+  CHECK(proj.rel_frobenius() == doctest::Approx(5.551e-3).epsilon(1e-3));
+  MESSAGE("SmolLM2-135M q8_0 round trip: projections max |x - q d| / d "
+          << proj.max_err_over_d << ", relative Frobenius error " << proj.rel_frobenius()
+          << ", d in [" << proj.min_d << ", " << proj.max_d << "]; embedding max ratio "
+          << embed.max_err_over_d << ", relative Frobenius error " << embed.rel_frobenius()
+          << ", d in [" << embed.min_d << ", " << embed.max_d << "]");
 }
