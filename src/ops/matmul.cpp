@@ -33,6 +33,7 @@
 
 #include "minillm/ops.h"
 #include "minillm/runtime.h"
+#include "q8_0.h"
 
 namespace minillm::ops {
 namespace {
@@ -163,6 +164,10 @@ void panel(const float* x, const float* w, float* out, std::int64_t m, std::int6
 }  // namespace
 
 void matmul(const Tensor& x, const Tensor& w, Tensor& out) {
+  if (w.dtype() == DType::Q8_0) {
+    detail::matmul_q8_0(x, w, out);
+    return;
+  }
   require_matrix("x", x);
   require_matrix("w", w);
   require_matrix("out", out);

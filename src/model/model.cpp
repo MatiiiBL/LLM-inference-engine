@@ -207,7 +207,16 @@ Model::~Model() = default;
 Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
 
-Model Model::from_dir(const std::filesystem::path& model_dir, std::int64_t max_seq_len) {
+void quantize_weights_q8_0(Weights&, const ModelConfig&) {
+  throw std::logic_error("not implemented: quantize_weights_q8_0 (workflow 17)");
+}
+
+Model Model::from_dir(const std::filesystem::path& model_dir, std::int64_t max_seq_len,
+                      DType weight_dtype) {
+  if (weight_dtype != DType::F32) {
+    throw std::logic_error("not implemented: Model::from_dir with " +
+                           std::string(dtype_name(weight_dtype)) + " weights (workflow 17)");
+  }
   ModelConfig cfg = ModelConfig::from_json_file(model_dir / "config.json");
   check_config(cfg);
   // A bad argument should not wait on reading the weights.

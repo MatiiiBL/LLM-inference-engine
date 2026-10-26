@@ -2,6 +2,8 @@
 //
 // Reads safetensors checkpoints into named fp32 tensors. Everything is
 // converted to F32 at load time: the rest of the engine never sees bf16/f16.
+// Q8_0 tensors exist only where a caller replaces loaded F32 weights with
+// quantize_q8_0's output (model.h: quantize_weights_q8_0).
 //
 // Expected tensor names (Hugging Face Llama):
 //   model.embed_tokens.weight                      [vocab_size, hidden_size]
@@ -35,7 +37,8 @@
 
 namespace minillm {
 
-/// A bag of named tensors, all F32 and contiguous, each owning its storage.
+/// A bag of named tensors, each contiguous and owning its storage. All F32 as
+/// loaded; a caller may replace some with other dtypes (Q8_0 today).
 class Weights {
  public:
   Weights() = default;
@@ -49,10 +52,15 @@ class Weights {
   /// Takes ownership of a tensor. Throws std::runtime_error on duplicates.
   void insert(std::string name, Tensor tensor);
 
+  /// Replaces an existing tensor, of any dtype or shape, dropping the old
+  /// one's storage once no other handle shares it. Throws std::runtime_error
+  /// naming the tensor if it is absent.
+  void replace(std::string_view name, Tensor tensor);
+
   /// Names in sorted order.
   std::vector<std::string> names() const;
   std::size_t size() const;
-  /// Total bytes of tensor data held.
+  /// Total bytes of tensor data held (Tensor::nbytes, so Q8_0 counts blocks).
   std::size_t bytes() const;
 
  private:
@@ -60,8 +68,27 @@ class Weights {
 };
 
 /// Converts a tensor to a newly allocated contiguous F32 tensor. F32 input is
-/// copied unchanged. Throws std::invalid_argument for Q8_0.
+/// copied unchanged. Q8_0 is dequantized: element j of a block is
+/// float(qs[j]) * f16_to_f32(d), which is exact in float.
 Tensor convert_to_f32(const Tensor& src);
+
+/// Quantizes a contiguous F32 tensor whose last dimension is a multiple of 32
+/// into a new Q8_0 tensor of the same shape. For each block of 32 values x:
+///
+///   amax = max |x|
+///   d    = f32_to_f16(amax / 127.0f)          (the stored scale)
+///   q    = clamp(round(x * (1.0f / f16_to_f32(d))), -127, 127)
+///
+/// all in float, with round() rounding halves away from zero. A block whose
+/// stored scale is zero (amax / 127 rounds to 0 in f16, as for an all-zero
+/// block) has every q = 0. Quantizing against the stored scale bounds the round-trip
+/// error by f16_to_f32(d) / 2 per element. The same input gives the same
+/// bytes on every platform.
+///
+/// Throws std::invalid_argument for a non-F32 or non-contiguous input, a last
+/// dimension that is not a multiple of 32, a non-finite value, or a block
+/// whose scale overflows f16 (amax / 127 rounds to inf).
+Tensor quantize_q8_0(const Tensor& src);
 
 /// Loads one .safetensors file, converting every tensor to F32.
 /// Throws std::runtime_error on a missing file, a malformed header, or a

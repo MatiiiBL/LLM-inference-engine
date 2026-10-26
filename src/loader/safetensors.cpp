@@ -288,19 +288,23 @@ std::vector<std::string> Weights::names() const {
   return out;  // std::map iterates in sorted order
 }
 
+void Weights::replace(std::string_view, Tensor) {
+  throw std::logic_error("not implemented: Weights::replace (workflow 15)");
+}
+
 std::size_t Weights::size() const { return tensors_.size(); }
 
 std::size_t Weights::bytes() const {
   std::size_t total = 0;
   for (const auto& [name, tensor] : tensors_) {
-    total += static_cast<std::size_t>(tensor.numel()) * dtype_size(tensor.dtype());
+    total += tensor.nbytes();
   }
   return total;
 }
 
 Tensor convert_to_f32(const Tensor& src) {
   if (src.dtype() == DType::Q8_0) {
-    throw std::invalid_argument("convert_to_f32: Q8_0 is reserved and not implemented");
+    throw std::logic_error("not implemented: q8_0 convert_to_f32 (workflow 15)");
   }
   if (src.is_empty()) return Tensor();
   if (src.dtype() == DType::F32) return src.copy_contiguous();

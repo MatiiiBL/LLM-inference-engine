@@ -3,6 +3,7 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -310,4 +311,113 @@ TEST_CASE("slicing an empty tensor does not move its pointer") {
   // And here (2^61 - 1) * 2 elements of 4 bytes wraps a 64-bit address.
   const Tensor big = Tensor::zeros({0, kTwoTo(61), 2});
   CHECK(big.slice(1, kTwoTo(61) - 1, 1).data() == big.data());
+}
+
+// --------------------------------------------------------------------------
+// Q8_0
+// --------------------------------------------------------------------------
+
+TEST_CASE("dtype_nbytes counts q8_0 in 34-byte blocks of 32") {
+  CHECK(dtype_nbytes(DType::F32, 10) == 40);
+  CHECK(dtype_nbytes(DType::BF16, 10) == 20);
+  CHECK(dtype_nbytes(DType::Q8_0, 0) == 0);
+  CHECK(dtype_nbytes(DType::Q8_0, 32) == 34);
+  CHECK(dtype_nbytes(DType::Q8_0, 576 * 1536) == 576 * 48 * 34);
+  CHECK_THROWS_AS(dtype_nbytes(DType::Q8_0, 33), std::invalid_argument);
+  CHECK_THROWS_AS(dtype_nbytes(DType::F32, -1), std::invalid_argument);
+  CHECK_THROWS_AS(dtype_nbytes(DType::F32, kTwoTo(61)), std::invalid_argument);  // 2^63 bytes
+  // 2^62 elements are 2^57 blocks of 34 bytes: about 2^62.1, still under 2^63.
+  CHECK(dtype_nbytes(DType::Q8_0, kTwoTo(62)) == static_cast<std::size_t>(kTwoTo(57)) * 34u);
+}
+
+TEST_CASE("q8_0 tensors need a last dimension that is a multiple of 32") {
+  Tensor t = Tensor::zeros({3, 64}, DType::Q8_0);
+  CHECK(t.dtype() == DType::Q8_0);
+  CHECK(t.numel() == 192);
+  CHECK(t.nbytes() == 6 * sizeof(BlockQ8_0));
+  CHECK(t.stride(0) == 64);
+  CHECK(t.is_contiguous());
+  const auto* bytes = t.data_as<unsigned char>();
+  for (std::size_t i = 0; i < t.nbytes(); ++i) CHECK(bytes[i] == 0);
+  CHECK_THROWS_AS(t.f32(), std::invalid_argument);
+
+  CHECK_NOTHROW(Tensor::empty({32}, DType::Q8_0));
+  CHECK_NOTHROW(Tensor::zeros({0, 32}, DType::Q8_0));
+  CHECK(Tensor::zeros({4, 0}, DType::Q8_0).nbytes() == 0);  // 0 is a multiple of 32
+  CHECK_THROWS_WITH_AS(Tensor::zeros({2, 48}, DType::Q8_0), doctest::Contains("multiple of 32"),
+                       std::invalid_argument);
+  BlockQ8_0 block{};
+  CHECK_THROWS_AS(Tensor::wrap(&block, {32, 1}, DType::Q8_0), std::invalid_argument);
+  CHECK(Tensor::wrap(&block, {1, 32}, DType::Q8_0).nbytes() == 34);
+
+  CHECK_NOTHROW(t.reshape({6, 32}));
+  CHECK_NOTHROW(t.reshape({192}));
+  CHECK_THROWS_AS(t.reshape({12, 16}), std::invalid_argument);
+  CHECK_THROWS_AS(t.reshape({64, 3}), std::invalid_argument);
+}
+
+TEST_CASE("q8_0 rows and dimension-0 slices start on a block") {
+  std::vector<BlockQ8_0> blocks(4 * 3);  // [4, 96]: 3 blocks per row
+  for (std::size_t b = 0; b < blocks.size(); ++b) {
+    blocks[b].d = static_cast<std::uint16_t>(b);
+    for (int j = 0; j < 32; ++j) blocks[b].qs[j] = static_cast<std::int8_t>(j - 16);
+  }
+  Tensor t = Tensor::wrap(blocks.data(), {4, 96}, DType::Q8_0);
+
+  Tensor r = t.row(2);
+  CHECK(r.shape() == Shape{96});
+  CHECK(r.data_as<BlockQ8_0>() == blocks.data() + 6);
+  CHECK(r.nbytes() == 3 * sizeof(BlockQ8_0));
+
+  Tensor s = t.slice(0, 1, 2);
+  CHECK(s.shape() == Shape{2, 96});
+  CHECK(s.is_contiguous());
+  CHECK(s.data_as<BlockQ8_0>() == blocks.data() + 3);
+
+  Tensor c = s.copy_contiguous();
+  CHECK(c.owns_data());
+  CHECK(c.dtype() == DType::Q8_0);
+  CHECK(c.shape() == Shape{2, 96});
+  CHECK(std::memcmp(c.data(), blocks.data() + 3, 6 * sizeof(BlockQ8_0)) == 0);
+
+  // A cut along the last dimension could split a block.
+  CHECK_THROWS_AS(t.slice(1, 0, 32), std::invalid_argument);
+  CHECK_THROWS_AS(r.slice(0, 32, 32), std::invalid_argument);
+  Tensor t3 = Tensor::wrap(blocks.data(), {2, 2, 96}, DType::Q8_0);
+  CHECK(t3.slice(0, 1, 1).data_as<BlockQ8_0>() == blocks.data() + 6);
+  CHECK_THROWS_AS(t3.slice(1, 1, 1), std::invalid_argument);
+}
+
+TEST_CASE("f32_to_f16 rounds to nearest even and inverts f16_to_f32") {
+  CHECK(f32_to_f16(1.0f) == 0x3c00);
+  CHECK(f32_to_f16(-2.0f) == 0xc000);
+  CHECK(f32_to_f16(0.0f) == 0x0000);
+  CHECK(f32_to_f16(-0.0f) == 0x8000);
+  CHECK(f32_to_f16(65504.0f) == 0x7bff);  // largest finite f16
+  CHECK(f32_to_f16(65519.0f) == 0x7bff);  // below the halfway point to 2^16
+  CHECK(f32_to_f16(65520.0f) == 0x7c00);  // the halfway point rounds to even: inf
+  CHECK(f32_to_f16(std::numeric_limits<float>::infinity()) == 0x7c00);
+  CHECK(f32_to_f16(-std::numeric_limits<float>::infinity()) == 0xfc00);
+  CHECK(f32_to_f16(std::numeric_limits<float>::quiet_NaN()) == 0x7e00);
+  CHECK(f32_to_f16(-std::numeric_limits<float>::quiet_NaN()) == 0xfe00);
+
+  // Ties go to the even mantissa: 1 + 2^-11 is halfway between 1 and 1 + 2^-10.
+  CHECK(f32_to_f16(1.0f + std::ldexp(1.0f, -11)) == 0x3c00);
+  CHECK(f32_to_f16(1.0f + 3 * std::ldexp(1.0f, -11)) == 0x3c02);
+  CHECK(f32_to_f16(std::nextafter(1.0f + std::ldexp(1.0f, -11), 2.0f)) == 0x3c01);
+
+  // Subnormals step by 2^-24, with the same tie rule.
+  CHECK(f32_to_f16(std::ldexp(1.0f, -24)) == 0x0001);
+  CHECK(f32_to_f16(std::ldexp(1.0f, -25)) == 0x0000);
+  CHECK(f32_to_f16(3 * std::ldexp(1.0f, -25)) == 0x0002);
+  CHECK(f32_to_f16(std::ldexp(1.0f, -14)) == 0x0400);  // smallest normal
+
+  // Every non-NaN f16 survives f16 -> f32 -> f16.
+  int mismatches = 0;
+  for (std::uint32_t h = 0; h <= 0xffffu; ++h) {
+    const auto bits = static_cast<std::uint16_t>(h);
+    if ((bits & 0x7c00u) == 0x7c00u && (bits & 0x03ffu) != 0) continue;  // NaN
+    if (f32_to_f16(f16_to_f32(bits)) != bits) ++mismatches;
+  }
+  CHECK(mismatches == 0);
 }
