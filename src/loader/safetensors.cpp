@@ -340,6 +340,14 @@ Tensor convert_to_f32(const Tensor& src) {
   return out;
 }
 
+Tensor convert_to_bf16(const Tensor&) {
+  throw std::logic_error("not implemented: convert_to_bf16 (workflow 21)");
+}
+
+bool bf16_exact(const Tensor&) {
+  throw std::logic_error("not implemented: bf16_exact (workflow 21)");
+}
+
 std::vector<TensorInfo> read_safetensors_header(const std::filesystem::path& file) {
   return open_safetensors(file).tensors;
 }

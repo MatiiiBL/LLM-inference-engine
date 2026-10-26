@@ -32,6 +32,7 @@ target_link_libraries(minillm_runtime PUBLIC Threads::Threads)
 # and so must link both, and a workflow that stops calling ref:: from its
 # kernel must not thereby break its own test's link line.
 add_library(minillm_ops STATIC
+  ops/bf16.cpp
   ops/elementwise.cpp
   ops/norm.cpp
   ops/matmul.cpp
