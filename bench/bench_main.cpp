@@ -10,6 +10,7 @@
 //   * ops::matmul on Q8_0 weights against F32, over whole sweeps of the
 //     model's linear layers (a decode token, a prefill), with the plain-read
 //     ceiling
+//   * the same for BF16 weights
 //   * prefill and decode tokens/s for the whole model
 //   * peak resident memory
 //   * what one kernel_parallel_for costs the thread pool, hot and cold, and
@@ -915,6 +916,140 @@ int run_q8_0_benches(const ModelConfig& cfg, const Options& opt, Report& report)
 }
 
 // ---------------------------------------------------------------------------
+// BF16 weights: ops::matmul on BF16 against the same call on F32 (workflow 20)
+// ---------------------------------------------------------------------------
+
+/// The model's linear layers in F32 and BF16, the same matrices: every F32
+/// value is a bf16 value, as in a model loaded from the bf16 checkpoint. The
+/// 269 MB of BF16 is as far beyond L2 as the 538 MB of F32.
+struct Bf16Weights {
+  LinearWeights lw;  ///< its F32 half, rounded to bf16 values; no Q8_0
+  std::vector<std::uint16_t> bf16_storage;
+  std::vector<Tensor> bf16;  ///< lw.f32's shapes, in its order
+};
+
+Bf16Weights make_bf16_weights(const ModelConfig& cfg) {
+  Bf16Weights bw{make_linear_weights(cfg), {}, {}};
+  // Only the F32 half is wanted here: give the Q8_0 bytes back before
+  // allocating the BF16 ones.
+  std::vector<BlockQ8_0>().swap(bw.lw.q8_storage);
+  bw.lw.q8.clear();
+
+  std::vector<float>& f32 = bw.lw.f32_storage;
+  bw.bf16_storage.resize(f32.size());
+  for (std::size_t i = 0; i < f32.size(); ++i) {
+    bw.bf16_storage[i] = f32_to_bf16(f32[i]);
+    f32[i] = bf16_to_f32(bw.bf16_storage[i]);
+  }
+  std::uint16_t* b = bw.bf16_storage.data();
+  for (const Tensor& w : bw.lw.f32) {
+    bw.bf16.push_back(Tensor::wrap(b, w.shape(), DType::BF16));
+    b += w.numel();
+  }
+  return bw;
+}
+
+/// BF16 against F32 ops::matmul over whole sweeps of the model's linear
+/// layers, at every thread count, with all contenders' samples interleaved:
+///
+///   bf16.decode.token    one decode token: every projection plus the lm_head,
+///                        m = 1, 211 calls. Memory-bound for both, so also the
+///                        weight bytes per second of each and the plain-read
+///                        ceiling over the F32 weights, timed in the same rounds.
+///   bf16.prefill.m64     every projection at m = 64 rows, 210 calls
+///   bf16.prefill.m79     the same at m = 79, the longest oracle prompt
+///
+/// The headline is speedup = F32 time / BF16 time, a median over rounds.
+/// Returns how many benchmarks matched the filter.
+int run_bf16_benches(const ModelConfig& cfg, const Options& opt, Report& report) {
+  const bool want_decode = selected(opt, "bf16.decode.token");
+  const std::vector<std::int64_t> prefill_rows = {64, 79};
+  std::vector<std::int64_t> want_prefill;
+  for (const std::int64_t m : prefill_rows) {
+    if (selected(opt, "bf16.prefill.m" + std::to_string(m))) want_prefill.push_back(m);
+  }
+  if (!want_decode && want_prefill.empty()) return 0;
+
+  const Bf16Weights bw = make_bf16_weights(cfg);
+  const std::vector<float>& f32_storage = bw.lw.f32_storage;
+  const double f32_bytes = static_cast<double>(f32_storage.size() * sizeof(float));
+  const double bf16_bytes = static_cast<double>(bw.bf16_storage.size() * sizeof(std::uint16_t));
+  std::mt19937 rng(20);
+
+  std::printf("\n== BF16 vs F32 ops::matmul over whole sweeps of the model's linear layers — "
+              "median time per sweep, speedup = median of f32/bf16 over interleaved samples ==\n\n");
+  std::printf("%-30s %3s %10s %6s %10s %6s %8s %6s %9s %9s %9s\n", "sweep", "thr", "f32", "+/-",
+              "bf16", "+/-", "speedup", "+/-", "f32 GB/s", "bf16 GB/s", "read GB/s");
+  std::fflush(stdout);
+
+  // Rounds of one sweep: each thread count contributes `per_count`
+  // contenders, F32 then BF16, then for decode the plain read.
+  auto measure = [&](const std::string& name, const std::string& label,
+                     std::vector<MatmulCall>& f32_calls, std::vector<MatmulCall>& bf16_calls,
+                     bool bandwidth) {
+    std::vector<Contender> contenders;
+    for (const int threads : opt.threads) {
+      contenders.push_back({use_threads(threads), [&] { sweep(f32_calls); }});
+      contenders.push_back({use_threads(threads), [&] { sweep(bf16_calls); }});
+      if (bandwidth) {
+        contenders.push_back({use_threads(threads), [&] {
+                                plain_read(f32_storage.data(),
+                                           static_cast<std::int64_t>(f32_storage.size()));
+                              }});
+      }
+    }
+    Rounds rounds;
+    const std::vector<Timing> t = time_round_robin(contenders, opt, rounds);
+    const std::size_t per_count = bandwidth ? 3 : 2;
+    for (std::size_t c = 0; c < opt.threads.size(); ++c) {
+      const int threads = opt.threads[c];
+      const std::size_t i = c * per_count;
+      const Stats speedup = ratio_stats(rounds[i], rounds[i + 1]);
+      const double f32_s = t[i].per_call.median();
+      const double bf16_s = t[i + 1].per_call.median();
+      std::printf("%-30s %3d %10s %5.1f%% %10s %5.1f%% %7.2fx %5.1f%%", label.c_str(), threads,
+                  human_time(f32_s).c_str(), t[i].per_call.spread() * 100.0,
+                  human_time(bf16_s).c_str(), t[i + 1].per_call.spread() * 100.0,
+                  speedup.median(), speedup.spread() * 100.0);
+      report.add_time(name + ".f32", threads, t[i]);
+      report.add_time(name + ".bf16", threads, t[i + 1]);
+      report.add_ratio(name + ".speedup", threads, speedup);
+      if (bandwidth) {
+        const double read_s = t[i + 2].per_call.median();
+        std::printf(" %9.1f %9.1f %9.1f", gbps(f32_bytes, f32_s), gbps(bf16_bytes, bf16_s),
+                    gbps(f32_bytes, read_s));
+        report.add_value(name + ".f32.gbps", threads, gbps(f32_bytes, f32_s), "GB/s",
+                         t[i].iterations());
+        report.add_value(name + ".bf16.gbps", threads, gbps(bf16_bytes, bf16_s), "GB/s",
+                         t[i + 1].iterations());
+        report.add_value("bf16.read.gbps", threads, gbps(f32_bytes, read_s), "GB/s",
+                         t[i + 2].iterations());
+      }
+      std::printf("\n");
+    }
+    std::fflush(stdout);
+  };
+
+  if (want_decode) {
+    std::vector<MatmulCall> f32_calls = make_matmul_calls(bw.lw.f32, 1, rng);
+    std::vector<MatmulCall> bf16_calls = make_matmul_calls(bw.bf16, 1, rng);
+    measure("bf16.decode.token", "decode token (" + std::to_string(f32_calls.size()) + " matmuls)",
+            f32_calls, bf16_calls, true);
+  }
+  // Prefill runs the projections only: the lm_head sees the last row alone.
+  const std::vector<Tensor> f32_proj(bw.lw.f32.begin(), bw.lw.f32.end() - 1);
+  const std::vector<Tensor> bf16_proj(bw.bf16.begin(), bw.bf16.end() - 1);
+  for (const std::int64_t m : want_prefill) {
+    std::vector<MatmulCall> f32_calls = make_matmul_calls(f32_proj, m, rng);
+    std::vector<MatmulCall> bf16_calls = make_matmul_calls(bf16_proj, m, rng);
+    measure("bf16.prefill.m" + std::to_string(m),
+            "prefill m=" + std::to_string(m) + " (" + std::to_string(f32_calls.size()) + " matmuls)",
+            f32_calls, bf16_calls, false);
+  }
+  return (want_decode ? 1 : 0) + static_cast<int>(want_prefill.size());
+}
+
+// ---------------------------------------------------------------------------
 // Whole-model benchmarks
 // ---------------------------------------------------------------------------
 
@@ -1171,6 +1306,7 @@ int run(const Options& opt) {
   int matched = run_model_benches(opt, report);
   matched += run_op_benches(cfg, opt, report);
   matched += run_q8_0_benches(cfg, opt, report);
+  matched += run_bf16_benches(cfg, opt, report);
   matched += run_runtime_benches(opt, report);
   if (matched == 0) {
     std::fprintf(stderr, "minillm_bench: --filter '%s' matched no benchmark\n", opt.filter.c_str());

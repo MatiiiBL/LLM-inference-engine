@@ -42,16 +42,15 @@
 
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <stdexcept>
 #include <string>
-#include <vector>
 
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
 
+#include "f32_panel.h"
 #include "minillm/runtime.h"
 #include "validate.h"
 
@@ -59,25 +58,10 @@ namespace minillm::ops::detail {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Four float lanes, and a block's int8 as floats
+// A block's int8 as floats (Vec and its operations are in f32_panel.h)
 // ---------------------------------------------------------------------------
 
 #if defined(__aarch64__)
-
-using Vec = float32x4_t;
-inline Vec vec_zero() { return vdupq_n_f32(0.0f); }
-inline Vec vec_load(const float* p) { return vld1q_f32(p); }
-inline void vec_store(float* p, Vec v) { vst1q_f32(p, v); }
-inline Vec vec_mul(Vec a, Vec b) { return vmulq_f32(a, b); }
-inline Vec vec_scale(Vec a, float s) { return vmulq_n_f32(a, s); }
-inline Vec vec_fma(Vec acc, Vec a, Vec b) { return vfmaq_f32(acc, a, b); }
-inline Vec vec_fma_n(Vec acc, Vec a, float s) { return vfmaq_n_f32(acc, a, s); }
-/// acc + a * b[L]
-template <int L>
-inline Vec vec_fma_lane(Vec acc, Vec a, Vec b) {
-  return vfmaq_laneq_f32(acc, a, b, L);
-}
-inline float vec_sum(Vec v) { return vaddvq_f32(v); }
 
 /// A block's scale as float: the hardware conversion, exact like tensor.h's
 /// f16_to_f32 (which the portable build uses).
@@ -113,25 +97,6 @@ inline void widen_block(const std::int8_t* qs, Vec f[8]) {
 }
 
 #else
-
-typedef float Vec __attribute__((vector_size(16)));
-inline Vec vec_splat(float s) { return Vec{s, s, s, s}; }
-inline Vec vec_zero() { return vec_splat(0.0f); }
-inline Vec vec_load(const float* p) {
-  Vec v;
-  std::memcpy(&v, p, sizeof(v));
-  return v;
-}
-inline void vec_store(float* p, Vec v) { std::memcpy(p, &v, sizeof(v)); }
-inline Vec vec_mul(Vec a, Vec b) { return a * b; }
-inline Vec vec_scale(Vec a, float s) { return a * vec_splat(s); }
-inline Vec vec_fma(Vec acc, Vec a, Vec b) { return acc + a * b; }
-inline Vec vec_fma_n(Vec acc, Vec a, float s) { return acc + a * vec_splat(s); }
-template <int L>
-inline Vec vec_fma_lane(Vec acc, Vec a, Vec b) {
-  return acc + a * vec_splat(b[L]);
-}
-inline float vec_sum(Vec v) { return (v[0] + v[1]) + (v[2] + v[3]); }
 
 inline float scale_of(const BlockQ8_0& block) { return f16_to_f32(block.d); }
 
@@ -266,7 +231,7 @@ void matmul_decode(const float* x, const BlockQ8_0* w, float* out, std::int64_t 
 }
 
 // ---------------------------------------------------------------------------
-// Panel kernel
+// Panel kernel (the tile is in f32_panel.h)
 // ---------------------------------------------------------------------------
 
 constexpr int kPanelVecs = 6;               ///< vectors of four columns per tile row
@@ -340,92 +305,14 @@ void pack_panel(const BlockQ8_0* w, std::int64_t nb, int nc, float* panel) {
   }
 }
 
-/// One step of p for panel_tile: x[i, p + L] (lane L of xv[i]) times the
-/// panel's row p + L, into every accumulator. Loading one panel vector at a
-/// time keeps the 4-row tile at 24 + 4 + 1 registers; loading a whole row
-/// first spills.
-template <int L, int MR>
-inline void panel_step(Vec (&acc)[MR][kPanelVecs], const float* row, const Vec (&xv)[MR]) {
-  for (int v = 0; v < kPanelVecs; ++v) {
-    const Vec wv = vec_load(row + 4 * v);
-    for (int i = 0; i < MR; ++i) acc[i][v] = vec_fma_lane<L>(acc[i][v], wv, xv[i]);
-  }
-}
-
-/// out[i, c] for i < MR, c < kPanelCols: MR rows of x (row length k, a
-/// multiple of 4) against the panel. out has row length ldo.
-template <int MR>
-void panel_tile(const float* x, std::int64_t k, const float* panel, float* out,
-                std::int64_t ldo) {
-  Vec acc[MR][kPanelVecs];
-  for (int i = 0; i < MR; ++i)
-    for (int v = 0; v < kPanelVecs; ++v) acc[i][v] = vec_zero();
-
-  for (std::int64_t p = 0; p < k; p += 4) {
-    Vec xv[MR];
-    for (int i = 0; i < MR; ++i) xv[i] = vec_load(x + i * k + p);
-    const float* row = panel + p * kPanelCols;
-    panel_step<0>(acc, row, xv);
-    panel_step<1>(acc, row + kPanelCols, xv);
-    panel_step<2>(acc, row + 2 * kPanelCols, xv);
-    panel_step<3>(acc, row + 3 * kPanelCols, xv);
-  }
-
-  for (int i = 0; i < MR; ++i)
-    for (int v = 0; v < kPanelVecs; ++v) vec_store(out + i * ldo + 4 * v, acc[i][v]);
-}
-
-/// panel_tile<rows> for rows in [1, kPanelRows].
-void panel_tile_rows(std::int64_t rows, const float* x, std::int64_t k, const float* panel,
-                     float* out, std::int64_t ldo) {
-  static_assert(kPanelRows == 4, "the switch below covers heights 1 to kPanelRows");
-  switch (rows) {
-    case 1: panel_tile<1>(x, k, panel, out, ldo); break;
-    case 2: panel_tile<2>(x, k, panel, out, ldo); break;
-    case 3: panel_tile<3>(x, k, panel, out, ldo); break;
-    default: panel_tile<4>(x, k, panel, out, ldo); break;
-  }
-}
-
 void matmul_panel(const float* x, const BlockQ8_0* w, float* out, std::int64_t m,
                   std::int64_t k, std::int64_t n) {
   const std::int64_t nb = k / kQ8_0Block;
-  // Rows of x in tiles of nearly equal height, kPanelRows or one less (for
-  // m >= kPanelMinRows): a short last tile would hold too few accumulator
-  // chains to hide the FMA latency. Heights do not change any result.
-  const std::int64_t tiles = (m + kPanelRows - 1) / kPanelRows;
-  const std::int64_t base = m / tiles;
-  const std::int64_t taller = m % tiles;  // tiles with base + 1 rows
-
+  const auto pack = [&](std::int64_t j, int nc, float* panel) {
+    pack_panel(w + j * nb, nb, nc, panel);
+  };
   const auto run = [&](std::int64_t begin, std::int64_t end) {
-    // The panel: kPanelCols * k floats, 55 KB at k = 576. One per thread,
-    // kept between calls.
-    thread_local std::vector<float> panel;
-    const std::size_t panel_floats = static_cast<std::size_t>(kPanelCols * k);
-    if (panel.size() < panel_floats) panel.resize(panel_floats);
-
-    for (std::int64_t q = begin; q < end; ++q) {
-      const std::int64_t j = q * kPanelCols;
-      const int nc = static_cast<int>(std::min<std::int64_t>(kPanelCols, n - j));
-      pack_panel(w + j * nb, nb, nc, panel.data());
-      std::int64_t i = 0;
-      for (std::int64_t t = 0; t < tiles; ++t) {
-        const std::int64_t rows = base + (t < taller ? 1 : 0);
-        if (nc == kPanelCols) {
-          panel_tile_rows(rows, x + i * k, k, panel.data(), out + i * n + j, n);
-        } else {
-          // The last panel of a width that kPanelCols does not divide: the
-          // tile writes all its columns, so stage them and copy the real ones.
-          float stage[kPanelRows * kPanelCols];
-          panel_tile_rows(rows, x + i * k, k, panel.data(), stage, kPanelCols);
-          for (std::int64_t r = 0; r < rows; ++r) {
-            std::memcpy(out + (i + r) * n + j, stage + r * kPanelCols,
-                        static_cast<std::size_t>(nc) * sizeof(float));
-          }
-        }
-        i += rows;
-      }
-    }
+    panel_columns<kPanelVecs, kPanelRows>(x, out, m, k, n, begin, end, pack);
   };
   const std::int64_t unit_macs = std::max<std::int64_t>(1, m * k * kPanelCols);
   kernel_parallel_for((n + kPanelCols - 1) / kPanelCols,
