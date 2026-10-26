@@ -7,6 +7,9 @@
 // refuses to run from a sanitizer or unoptimized build):
 //   * every op in ops.h at the model's real shapes, ops:: against ref::, so
 //     the speedup of each optimization is visible and attributable
+//   * ops::matmul on Q8_0 weights against F32, over whole sweeps of the
+//     model's linear layers (a decode token, a prefill), with the plain-read
+//     ceiling
 //   * prefill and decode tokens/s for the whole model
 //   * peak resident memory
 // each at one or more kernel thread counts (--threads), so the scaling of the
@@ -31,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -686,6 +690,225 @@ int run_op_benches(const ModelConfig& cfg, const Options& opt, Report& report) {
 }
 
 // ---------------------------------------------------------------------------
+// Q8_0 weights: ops::matmul on Q8_0 against the same call on F32 (workflow 16)
+// ---------------------------------------------------------------------------
+
+/// One ops::matmul call with its own buffers, made up front so that a timed
+/// sweep is nothing but the calls.
+struct MatmulCall {
+  Tensor x;
+  Tensor w;
+  Tensor out;
+};
+
+/// The model's linear layers in both formats: every projection of every
+/// layer and the lm_head, each with its own weights, F32 and Q8_0 in one
+/// allocation each. A decode token reads all of it once, so a sweep must not
+/// find any of it in cache from the sweep before: 538 MB of F32 is far beyond
+/// the M4's 16 MB of L2, and so is the 143 MB of Q8_0.
+struct LinearWeights {
+  std::vector<float> f32_storage;
+  std::vector<BlockQ8_0> q8_storage;
+  std::vector<Tensor> f32;  ///< forward-pass order; the last one is the lm_head
+  std::vector<Tensor> q8;   ///< the same shapes
+};
+
+LinearWeights make_linear_weights(const ModelConfig& cfg) {
+  const std::int64_t hidden = cfg.hidden_size;
+  std::vector<Shape> shapes;
+  for (std::int64_t l = 0; l < cfg.num_hidden_layers; ++l) {
+    for (const Shape& s : {Shape{cfg.q_dim(), hidden}, Shape{cfg.kv_dim(), hidden},
+                           Shape{cfg.kv_dim(), hidden}, Shape{hidden, cfg.q_dim()},
+                           Shape{cfg.intermediate_size, hidden}, Shape{cfg.intermediate_size, hidden},
+                           Shape{hidden, cfg.intermediate_size}}) {
+      shapes.push_back(s);
+    }
+  }
+  shapes.push_back(Shape{cfg.vocab_size, hidden});
+
+  std::int64_t numel = 0;
+  for (const Shape& s : shapes) numel += s.numel();
+  LinearWeights lw;
+  lw.f32_storage.resize(static_cast<std::size_t>(numel));
+  lw.q8_storage.resize(static_cast<std::size_t>(numel / kQ8_0Block));
+
+  // No kernel's speed depends on the values, so a fast generator does:
+  // uniform F32 in [-1, 1), and Q8_0 blocks with q in [-127, 127] and scales
+  // in [2^-10, 2^-5), the range the real checkpoint's scales fall in.
+  std::uint64_t s = 0x9e3779b97f4a7c15u;
+  auto next = [&s] {
+    s ^= s << 13;
+    s ^= s >> 7;
+    s ^= s << 17;
+    return s;
+  };
+  for (float& v : lw.f32_storage) {
+    v = static_cast<float>(static_cast<std::int32_t>(next() >> 32)) * 0x1p-31f;
+  }
+  for (BlockQ8_0& b : lw.q8_storage) {
+    b.d = static_cast<std::uint16_t>(((5 + next() % 5) << 10) | (next() & 0x3ffu));
+    for (std::int8_t& q : b.qs) q = static_cast<std::int8_t>(static_cast<int>(next() % 255) - 127);
+  }
+
+  float* f = lw.f32_storage.data();
+  BlockQ8_0* q = lw.q8_storage.data();
+  for (const Shape& shape : shapes) {
+    lw.f32.push_back(Tensor::wrap(f, shape));
+    lw.q8.push_back(Tensor::wrap(q, shape, DType::Q8_0));
+    f += shape.numel();
+    q += shape.numel() / kQ8_0Block;
+  }
+  return lw;
+}
+
+/// ops::matmul(x, w) with an m-row x for each weight in `weights`.
+std::vector<MatmulCall> make_matmul_calls(const std::vector<Tensor>& weights, std::int64_t m,
+                                          std::mt19937& rng) {
+  std::vector<MatmulCall> calls;
+  for (const Tensor& w : weights) {
+    calls.push_back({random_tensor({m, w.dim(1)}, rng), w, Tensor::empty(Shape{m, w.dim(0)})});
+  }
+  return calls;
+}
+
+void sweep(std::vector<MatmulCall>& calls) {
+  for (MatmulCall& c : calls) {
+    ops::matmul(c.x, c.w, c.out);
+    keep_alive(c.out.data());
+  }
+}
+
+/// Sums n floats, split across the kernel threads: a plain sequential read,
+/// the ceiling any weight-streaming kernel can reach on this machine.
+void plain_read(const float* p, std::int64_t n) {
+  typedef float f32x4 __attribute__((vector_size(16)));
+  constexpr std::int64_t kChunk = std::int64_t{1} << 20;  // floats per unit, 4 MB
+  const std::int64_t units = (n + kChunk - 1) / kChunk;
+  std::vector<float> sums(static_cast<std::size_t>(units));
+  kernel_parallel_for(units, 1, [&](std::int64_t begin, std::int64_t end) {
+    for (std::int64_t u = begin; u < end; ++u) {
+      const std::int64_t lo = u * kChunk;
+      const std::int64_t hi = std::min(n, lo + kChunk);
+      f32x4 acc[4] = {};
+      std::int64_t i = lo;
+      for (; i + 16 <= hi; i += 16) {
+        for (int a = 0; a < 4; ++a) {
+          f32x4 v;
+          std::memcpy(&v, p + i + 4 * a, sizeof(v));
+          acc[a] += v;
+        }
+      }
+      const f32x4 t = (acc[0] + acc[1]) + (acc[2] + acc[3]);
+      float sum = (t[0] + t[1]) + (t[2] + t[3]);
+      for (; i < hi; ++i) sum += p[i];
+      sums[static_cast<std::size_t>(u)] = sum;
+    }
+  });
+  keep_alive(sums.data());
+}
+
+double gbps(double bytes, double seconds) { return bytes / seconds / 1e9; }
+
+/// Q8_0 against F32 ops::matmul over whole sweeps of the model's linear
+/// layers, at every thread count, with all contenders' samples interleaved:
+///
+///   q8_0.decode.token    one decode token: every projection plus the lm_head,
+///                        m = 1, 211 calls. Memory-bound for F32, so also the
+///                        weight bytes per second of each and the plain-read
+///                        ceiling over the F32 weights, timed in the same rounds.
+///   q8_0.prefill.m64     every projection at m = 64 rows, 210 calls
+///   q8_0.prefill.m79     the same at m = 79, the longest oracle prompt
+///
+/// The headline is speedup = F32 time / Q8_0 time, a median over rounds.
+/// Returns how many benchmarks matched the filter.
+int run_q8_0_benches(const ModelConfig& cfg, const Options& opt, Report& report) {
+  const bool want_decode = selected(opt, "q8_0.decode.token");
+  const std::vector<std::int64_t> prefill_rows = {64, 79};
+  std::vector<std::int64_t> want_prefill;
+  for (const std::int64_t m : prefill_rows) {
+    if (selected(opt, "q8_0.prefill.m" + std::to_string(m))) want_prefill.push_back(m);
+  }
+  if (!want_decode && want_prefill.empty()) return 0;
+
+  const LinearWeights lw = make_linear_weights(cfg);
+  const double f32_bytes = static_cast<double>(lw.f32_storage.size() * sizeof(float));
+  const double q8_bytes = static_cast<double>(lw.q8_storage.size() * sizeof(BlockQ8_0));
+  std::mt19937 rng(16);
+
+  std::printf("\n== Q8_0 vs F32 ops::matmul over whole sweeps of the model's linear layers — "
+              "median time per sweep, speedup = median of f32/q8_0 over interleaved samples ==\n\n");
+  std::printf("%-30s %3s %10s %6s %10s %6s %8s %6s %9s %9s %9s\n", "sweep", "thr", "f32", "+/-",
+              "q8_0", "+/-", "speedup", "+/-", "f32 GB/s", "q8 GB/s", "read GB/s");
+  std::fflush(stdout);
+
+  // Rounds of one sweep: each thread count contributes `per_count`
+  // contenders, F32 then Q8_0, then for decode the plain read.
+  auto measure = [&](const std::string& name, const std::string& label,
+                     std::vector<MatmulCall>& f32_calls, std::vector<MatmulCall>& q8_calls,
+                     bool bandwidth) {
+    std::vector<Contender> contenders;
+    for (const int threads : opt.threads) {
+      contenders.push_back({use_threads(threads), [&] { sweep(f32_calls); }});
+      contenders.push_back({use_threads(threads), [&] { sweep(q8_calls); }});
+      if (bandwidth) {
+        contenders.push_back({use_threads(threads), [&] {
+                                plain_read(lw.f32_storage.data(),
+                                           static_cast<std::int64_t>(lw.f32_storage.size()));
+                              }});
+      }
+    }
+    Rounds rounds;
+    const std::vector<Timing> t = time_round_robin(contenders, opt, rounds);
+    const std::size_t per_count = bandwidth ? 3 : 2;
+    for (std::size_t c = 0; c < opt.threads.size(); ++c) {
+      const int threads = opt.threads[c];
+      const std::size_t i = c * per_count;
+      const Stats speedup = ratio_stats(rounds[i], rounds[i + 1]);
+      const double f32_s = t[i].per_call.median();
+      const double q8_s = t[i + 1].per_call.median();
+      std::printf("%-30s %3d %10s %5.1f%% %10s %5.1f%% %7.2fx %5.1f%%", label.c_str(), threads,
+                  human_time(f32_s).c_str(), t[i].per_call.spread() * 100.0,
+                  human_time(q8_s).c_str(), t[i + 1].per_call.spread() * 100.0, speedup.median(),
+                  speedup.spread() * 100.0);
+      report.add_time(name + ".f32", threads, t[i]);
+      report.add_time(name + ".q8_0", threads, t[i + 1]);
+      report.add_ratio(name + ".speedup", threads, speedup);
+      if (bandwidth) {
+        const double read_s = t[i + 2].per_call.median();
+        std::printf(" %9.1f %9.1f %9.1f", gbps(f32_bytes, f32_s), gbps(q8_bytes, q8_s),
+                    gbps(f32_bytes, read_s));
+        report.add_value(name + ".f32.gbps", threads, gbps(f32_bytes, f32_s), "GB/s",
+                         t[i].iterations());
+        report.add_value(name + ".q8_0.gbps", threads, gbps(q8_bytes, q8_s), "GB/s",
+                         t[i + 1].iterations());
+        report.add_value("q8_0.read.gbps", threads, gbps(f32_bytes, read_s), "GB/s",
+                         t[i + 2].iterations());
+      }
+      std::printf("\n");
+    }
+    std::fflush(stdout);
+  };
+
+  if (want_decode) {
+    std::vector<MatmulCall> f32_calls = make_matmul_calls(lw.f32, 1, rng);
+    std::vector<MatmulCall> q8_calls = make_matmul_calls(lw.q8, 1, rng);
+    measure("q8_0.decode.token", "decode token (" + std::to_string(f32_calls.size()) + " matmuls)",
+            f32_calls, q8_calls, true);
+  }
+  // Prefill runs the projections only: the lm_head sees the last row alone.
+  const std::vector<Tensor> f32_proj(lw.f32.begin(), lw.f32.end() - 1);
+  const std::vector<Tensor> q8_proj(lw.q8.begin(), lw.q8.end() - 1);
+  for (const std::int64_t m : want_prefill) {
+    std::vector<MatmulCall> f32_calls = make_matmul_calls(f32_proj, m, rng);
+    std::vector<MatmulCall> q8_calls = make_matmul_calls(q8_proj, m, rng);
+    measure("q8_0.prefill.m" + std::to_string(m),
+            "prefill m=" + std::to_string(m) + " (" + std::to_string(f32_calls.size()) + " matmuls)",
+            f32_calls, q8_calls, false);
+  }
+  return (want_decode ? 1 : 0) + static_cast<int>(want_prefill.size());
+}
+
+// ---------------------------------------------------------------------------
 // Whole-model benchmarks
 // ---------------------------------------------------------------------------
 
@@ -825,6 +1048,7 @@ int run(const Options& opt) {
   // benchmarks' buffers.
   int matched = run_model_benches(opt, report);
   matched += run_op_benches(cfg, opt, report);
+  matched += run_q8_0_benches(cfg, opt, report);
   if (matched == 0) {
     std::fprintf(stderr, "minillm_bench: --filter '%s' matched no benchmark\n", opt.filter.c_str());
     return kExitError;

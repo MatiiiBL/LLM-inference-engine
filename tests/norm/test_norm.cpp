@@ -9,9 +9,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -21,6 +23,7 @@
 #include "common/oracle.h"
 #include "common/random.h"
 #include "common/thread_invariant.h"
+#include "minillm/loader.h"
 #include "minillm/ops.h"
 
 using namespace minillm;
@@ -59,6 +62,25 @@ void assert_identical(const Tensor& actual, const Tensor& expected, const std::s
 Tensor nan_filled(const Shape& shape) {
   Tensor t = Tensor::empty(shape);
   std::fill_n(t.f32(), t.numel(), std::numeric_limits<float>::quiet_NaN());
+  return t;
+}
+
+/// An owning Q8_0 [rows, width] table built straight from blocks: every q
+/// uniform in [-127, 127], every scale a random finite f16 of either sign,
+/// zeros, subnormals and the largest value included. Embedding is exact, so
+/// the whole range is fair game.
+Tensor random_q8_0_table(std::int64_t rows, std::int64_t width, std::uint64_t seed) {
+  Tensor t = Tensor::empty({rows, width}, DType::Q8_0);
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<int> q(-127, 127);
+  std::uniform_int_distribution<int> exponent(0, 30);  // 31 is inf / NaN
+  std::uniform_int_distribution<int> mantissa(0, 1023);
+  std::uniform_int_distribution<int> sign(0, 1);
+  BlockQ8_0* blocks = t.data_as<BlockQ8_0>();
+  for (std::int64_t b = 0; b < rows * width / kQ8_0Block; ++b) {
+    blocks[b].d = static_cast<std::uint16_t>((sign(rng) << 15) | (exponent(rng) << 10) | mantissa(rng));
+    for (std::int8_t& v : blocks[b].qs) v = static_cast<std::int8_t>(q(rng));
+  }
   return t;
 }
 
@@ -612,4 +634,97 @@ TEST_CASE("ops:: kernels accept zero-size inputs") {
   ops::silu_mul(no_rows, no_rows, no_rows_out);
   Tensor no_cols = Tensor::zeros({0});
   ops::softmax(no_cols);
+}
+
+// ---------------------------------------------------------------------------
+// Q8_0 embedding tables (workflow 16). A row is dequantized, q * d, which is
+// exact in float, so the result must be bit for bit
+// ref::embedding(convert_to_f32(table), ...).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ops::embedding with a Q8_0 table is bit for bit ref:: on convert_to_f32(table)") {
+  for (const std::int64_t width : {std::int64_t{32}, std::int64_t{64}, kHidden}) {
+    const std::string at = " [50, " + std::to_string(width) + "]";
+    const Tensor table = random_q8_0_table(50, width, 140);
+    const Tensor reference = convert_to_f32(table);
+
+    // The first and last rows, repeats (adjacent and not), and the rest at random.
+    std::vector<std::int32_t> ids{0, 49, 7, 7, 0, 49, 23};
+    for (const std::int32_t id : random_ids(25, 50, 141)) ids.push_back(id);
+
+    Tensor expected = Tensor::zeros({static_cast<std::int64_t>(ids.size()), width});
+    Tensor actual = nan_filled({static_cast<std::int64_t>(ids.size()), width});
+    ref::embedding(reference, ids, expected);
+    ops::embedding(table, ids, actual);
+    assert_identical(actual, expected, "ops::embedding q8_0 vs ref" + at);
+  }
+
+  // One block at each extreme of the format: q = +-127 and 0 under scales of
+  // +-0, the smallest subnormal, the largest normal and a negative one.
+  Tensor table = Tensor::zeros({5, 32}, DType::Q8_0);
+  const std::uint16_t scales[] = {0x0000, 0x8000, 0x0001, 0x7bff, 0xbc00};
+  BlockQ8_0* blocks = table.data_as<BlockQ8_0>();
+  for (int r = 0; r < 5; ++r) {
+    blocks[r].d = scales[r];
+    for (int j = 0; j < 32; ++j) blocks[r].qs[j] = static_cast<std::int8_t>(j % 3 == 0 ? 127 : j % 3 == 1 ? -127 : 0);
+  }
+  const std::vector<std::int32_t> ids{0, 1, 2, 3, 4};
+  Tensor expected = Tensor::zeros({5, 32});
+  Tensor actual = nan_filled({5, 32});
+  ref::embedding(convert_to_f32(table), ids, expected);
+  ops::embedding(table, ids, actual);
+  assert_identical(actual, expected, "ops::embedding q8_0 extreme blocks");
+  CHECK(actual.f32()[3 * 32] == 127.0f * 65504.0f);
+  CHECK(std::signbit(actual.f32()[1 * 32 + 2]));  // 0 * -0 is -0
+}
+
+TEST_CASE("ops::embedding with a Q8_0 table validates its arguments") {
+  const doctest::Contains names_op("ops::embedding");
+  const Tensor table = random_q8_0_table(4, 64, 142);
+  Tensor one = Tensor::zeros({1, 64});
+
+  // Ids out of range throw std::out_of_range, before anything is written.
+  Tensor untouched = nan_filled({2, 64});
+  CHECK_THROWS_AS(ops::embedding(table, std::vector<std::int32_t>{0, 4}, untouched),
+                  std::out_of_range);
+  CHECK(std::isnan(untouched.f32()[0]));
+  CHECK_THROWS_AS(ops::embedding(table, std::vector<std::int32_t>{-1}, one), std::out_of_range);
+
+  // out must be [n_tokens, width], F32, contiguous.
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0, 1}, one), names_op,
+                       std::invalid_argument);
+  Tensor narrow = Tensor::zeros({1, 32});
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, narrow), names_op,
+                       std::invalid_argument);
+  Tensor out_q8 = Tensor::zeros({1, 64}, DType::Q8_0);
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, out_q8), names_op,
+                       std::invalid_argument);
+  Tensor out_bf16 = Tensor::zeros({1, 64}, DType::BF16);
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, out_bf16), names_op,
+                       std::invalid_argument);
+  Tensor out_view = Tensor::zeros({2, 128}).slice(1, 0, 64);
+  REQUIRE_FALSE(out_view.is_contiguous());
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0, 1}, out_view), names_op,
+                       std::invalid_argument);
+  Tensor out_rank1 = Tensor::zeros({64});
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, out_rank1), names_op,
+                       std::invalid_argument);
+
+  // The table must be a matrix.
+  CHECK_THROWS_WITH_AS(ops::embedding(Tensor::zeros({64}, DType::Q8_0),
+                                      std::vector<std::int32_t>{0}, one),
+                       names_op, std::invalid_argument);
+  CHECK_THROWS_WITH_AS(ops::embedding(Tensor::zeros({4, 1, 64}, DType::Q8_0),
+                                      std::vector<std::int32_t>{0}, one),
+                       names_op, std::invalid_argument);
+}
+
+TEST_CASE("ops::embedding with a Q8_0 table accepts zero-size inputs") {
+  // A wrap() of nullptr is a legal zero-width table; nothing may dereference it.
+  const Tensor null_table = Tensor::wrap(nullptr, {4, 0}, DType::Q8_0);
+  Tensor null_out = Tensor::wrap(nullptr, {1, 0});
+  ops::embedding(null_table, std::vector<std::int32_t>{3}, null_out);
+
+  Tensor no_ids = Tensor::zeros({0, kHidden});
+  ops::embedding(random_q8_0_table(4, kHidden, 143), std::span<const std::int32_t>{}, no_ids);
 }
