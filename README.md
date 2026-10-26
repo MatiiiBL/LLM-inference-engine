@@ -63,6 +63,39 @@ Run one module's tests directly for a faster loop:
 ctest --preset asan -R matmul               # via ctest
 ```
 
+## Running
+
+`minillm` is the command-line front end. Once `oracle/generate.py` has
+downloaded the checkpoint (see below):
+
+```sh
+./build/release/src/minillm --model models/SmolLM2-135M --prompt "The capital of France is"
+```
+
+It streams the continuation to stdout, and the load banner, timings and
+anything else to stderr. `--help` lists every flag.
+
+`--weights` chooses how the projections and the embedding are held in memory.
+The norms stay f32, and the arithmetic is f32 whichever format you choose.
+
+| `--weights` | Format | SmolLM2-135M | Weights computed with |
+| --- | --- | --- | --- |
+| `auto` (default) | bf16 where that is lossless, f32 otherwise | 269 MB (bf16) | the checkpoint's, unchanged |
+| `f32` | f32 | 538 MB | the checkpoint's, unchanged |
+| `bf16` | bf16, or an error where bf16 cannot hold a weight | 269 MB | the checkpoint's, unchanged |
+| `q8_0` | 8-bit values with an f16 scale per 32 | 143 MB | rounded to 8 bits, held to their own oracle and a KL budget |
+
+`auto` converts to bf16 only when every value it would convert is exact in
+bf16, as it is for any checkpoint stored in bf16, SmolLM2-135M's included.
+Otherwise it keeps f32, for example for a checkpoint stored in f32. Either
+way no weight changes, so the results match `f32` up to the order of the
+additions, and the greedy tokens are the fp32 oracle's. The load banner names
+the format and why `auto` chose it:
+
+```
+minillm: loaded models/SmolLM2-135M (llama, 30 layers, hidden 576, vocab 49152) in 0.15 s; bf16 weights (auto: exact in bf16), 269.1 MB; up to 10 threads, 4 for small calls
+```
+
 ## Generating the oracle
 
 The golden data is **not** committed — it is reproducible, and

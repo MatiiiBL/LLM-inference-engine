@@ -11,8 +11,11 @@
 //   3. End to end: the real binary on the real checkpoint, greedy, against
 //      oracle/data/model/p{i}_greedy_ids.npy id for id (under TSan, the
 //      first kTsanTokens of them), and its streamed stdout against a
-//      one-call decode of the same ids. One run with --weights q8_0 against
-//      oracle/data/model_q8_0/.
+//      one-call decode of the same ids. Those runs pass no --weights, so
+//      they run bf16 (--weights auto); one run with --weights f32 (not under
+//      TSan) is held to the same oracle, and one with --weights q8_0 to
+//      oracle/data/model_q8_0/. A tiny fabricated checkpoint stored in f32
+//      shows that auto falls back to f32 where bf16 cannot hold a weight.
 //
 // This target links the tokenizer and the sampler but not the model (see
 // tests/CMakeLists.txt), so the forward pass is only ever reached through the
@@ -229,13 +232,11 @@ std::optional<Tokenizer> load_tokenizer() {
   }
 }
 
-/// A tokenizer whose id b is the single byte b, for all 256 bytes: SmolLM2's
-/// configuration with no merges. decode() of such ids is the tokenizer's own
-/// lossy UTF-8 conversion of any byte string, so Utf8Stream is held to the
-/// real replacement rule on bytes SmolLM2's vocab has no token for (C0, C1,
-/// F5-FF), with no model files needed.
-const Tokenizer& byte_tokenizer() {
-  static const Tokenizer tok = [] {
+/// The tokenizer.json of a tokenizer whose id b is the single byte b, for
+/// all 256 bytes: SmolLM2's configuration with no merges. Written once per
+/// process.
+const fs::path& byte_tokenizer_file() {
+  static const fs::path tokenizer_json = [] {
     std::string vocab;
     char32_t next = 0x100;
     for (int b = 0; b < 256; ++b) {
@@ -265,8 +266,17 @@ const Tokenizer& byte_tokenizer() {
         vocab + R"(}, "merges": []}})";
     const fs::path file = make_temp_dir("byte_tokenizer") / "tokenizer.json";
     write_file(file, json);
-    return Tokenizer::from_file(file);
+    return file;
   }();
+  return tokenizer_json;
+}
+
+/// byte_tokenizer_file()'s tokenizer. decode() of its ids is the tokenizer's
+/// own lossy UTF-8 conversion of any byte string, so Utf8Stream is held to the
+/// real replacement rule on bytes SmolLM2's vocab has no token for (C0, C1,
+/// F5-FF), with no model files needed.
+const Tokenizer& byte_tokenizer() {
+  static const Tokenizer tok = Tokenizer::from_file(byte_tokenizer_file());
   return tok;
 }
 
@@ -595,6 +605,7 @@ struct EndToEnd {
   std::string skip_reason;          ///< non-empty: nothing ran
   std::array<RunResult, 3> oracle;  ///< kOraclePrompts, expected_greedy_ids() tokens, --ignore-eos
   RunResult stop_at_eos;            ///< kOraclePrompts[1] again, stopping at eos; not under TSan
+  RunResult f32;                    ///< kOraclePrompts[2] with --weights f32; not under TSan
   RunResult multibyte;              ///< kMultiBytePrompt
   RunResult threaded;               ///< kOraclePrompts[2] again, at threaded_count()
   RunResult q8_0;                   ///< kQ8_0Prompt with --weights q8_0, --threads 1
@@ -684,28 +695,36 @@ const EndToEnd& end_to_end() {
     }
 
     // The oracle never stops early, so --ignore-eos to match it token for token.
-    // Under TSan nothing generates far enough to reach eos, so that run is left out.
+    // Under TSan nothing generates far enough to reach eos, so that run is left
+    // out, and so is the f32 one: the model tests run the f32 kernels there.
     std::vector<std::vector<std::string>> batch;
+    std::vector<RunResult*> into;
+    const auto add = [&](RunResult& result, std::vector<std::string> args) {
+      batch.push_back(std::move(args));
+      into.push_back(&result);
+    };
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) {
-      batch.push_back(greedy_args(kOraclePrompts[i], n_tokens[i], true, 1));
+      add(r.oracle[i], greedy_args(kOraclePrompts[i], n_tokens[i], true, 1));
     }
-    if (!kTsan) batch.push_back(greedy_args(kOraclePrompts[1], n_tokens[1], false, 1));
-    batch.push_back(greedy_args(kMultiBytePrompt, kMultiByteTokens, false, 1));
-    batch.push_back(greedy_args(kOraclePrompts[kQ8_0Prompt],
-                                expected_greedy_ids(kQ8_0Prompt, "model_q8_0").size(), true, 1));
-    batch.back().insert(batch.back().end(), {"--weights", "q8_0"});
+    if (!kTsan) {
+      add(r.stop_at_eos, greedy_args(kOraclePrompts[1], n_tokens[1], false, 1));
+      std::vector<std::string> f32 = greedy_args(kOraclePrompts[2], n_tokens[2], true, 1);
+      f32.insert(f32.end(), {"--weights", "f32"});
+      add(r.f32, std::move(f32));
+    }
+    add(r.multibyte, greedy_args(kMultiBytePrompt, kMultiByteTokens, false, 1));
+    const std::size_t q8_0_tokens = expected_greedy_ids(kQ8_0Prompt, "model_q8_0").size();
+    std::vector<std::string> q8_0 = greedy_args(kOraclePrompts[kQ8_0Prompt], q8_0_tokens, true, 1);
+    q8_0.insert(q8_0.end(), {"--weights", "q8_0"});
+    add(r.q8_0, std::move(q8_0));
     std::vector<RunResult> results = run_all(batch, kRunsAtOnce);
-    for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) r.oracle[i] = std::move(results[i]);
-    if (!kTsan) r.stop_at_eos = std::move(results[3]);
-    r.q8_0 = std::move(results.back());
-    results.pop_back();
-    r.multibyte = std::move(results.back());
+    for (std::size_t i = 0; i < results.size(); ++i) *into[i] = std::move(results[i]);
     r.threaded = run_cli(greedy_args(kOraclePrompts[2], n_tokens[2], true, threaded_count()));
 
     // Until every module the binary uses is implemented, it stops at the
     // first stub it reaches and says so.
     for (const RunResult* run : {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos,
-                                 &r.multibyte, &r.threaded, &r.q8_0}) {
+                                 &r.f32, &r.multibyte, &r.threaded, &r.q8_0}) {
       if (run->exit_code != 0 && contains(run->err, "not implemented")) {
         r.skip_reason =
             "the engine is incomplete — " + line_containing(run->err, "not implemented");
@@ -731,6 +750,77 @@ std::vector<std::int32_t> generated_ids(const RunResult& run) {
   const std::optional<std::vector<std::int32_t>> ids = printed_ids(run.err, "generated ids");
   CHECK_MESSAGE(ids.has_value(), "no 'generated ids:' line on stderr:\n" << run.err);
   return ids.value_or(std::vector<std::int32_t>{});
+}
+
+// ---------------------------------------------------------------------------
+// A tiny fabricated checkpoint, for what --weights auto chooses
+// ---------------------------------------------------------------------------
+
+/// One decoder layer over byte_tokenizer_file()'s 256 ids: hidden 64, two
+/// query heads of 32 sharing one KV head, MLP 128, tied embeddings.
+constexpr std::string_view kTinyConfig =
+    R"({"model_type": "llama", "vocab_size": 256, "hidden_size": 64,)"
+    R"( "intermediate_size": 128, "num_hidden_layers": 1, "num_attention_heads": 2,)"
+    R"( "num_key_value_heads": 1, "head_dim": 32, "max_position_embeddings": 64,)"
+    R"( "rms_norm_eps": 1e-05, "rope_theta": 10000.0, "hidden_act": "silu",)"
+    R"( "tie_word_embeddings": true, "eos_token_id": 0})";
+
+/// Writes a model directory for kTinyConfig under scratch_dir() and returns
+/// it. Every tensor is stored as `dtype` ("F32" or "BF16"). The norms are 1;
+/// every other value is k / 512 for an integer |k| <= 127, which bf16 holds
+/// exactly, except element 0 of the tensor named `inexact`: 0.1, which it
+/// cannot. The tensor named `missing` is left out.
+fs::path write_tiny_checkpoint(std::string_view name, std::string_view dtype,
+                               std::string_view inexact = {}, std::string_view missing = {}) {
+  const std::vector<std::pair<std::string, std::vector<std::int64_t>>> tensors = {
+      {"model.embed_tokens.weight", {256, 64}},
+      {"model.layers.0.input_layernorm.weight", {64}},
+      {"model.layers.0.self_attn.q_proj.weight", {64, 64}},
+      {"model.layers.0.self_attn.k_proj.weight", {32, 64}},
+      {"model.layers.0.self_attn.v_proj.weight", {32, 64}},
+      {"model.layers.0.self_attn.o_proj.weight", {64, 64}},
+      {"model.layers.0.post_attention_layernorm.weight", {64}},
+      {"model.layers.0.mlp.gate_proj.weight", {128, 64}},
+      {"model.layers.0.mlp.up_proj.weight", {128, 64}},
+      {"model.layers.0.mlp.down_proj.weight", {64, 128}},
+      {"model.norm.weight", {64}},
+  };
+  std::string header = "{";
+  std::string data;
+  for (const auto& [tensor, shape] : tensors) {
+    if (tensor == missing) continue;
+    std::int64_t numel = 1;
+    std::string dims;
+    for (const std::int64_t d : shape) {
+      numel *= d;
+      dims += (dims.empty() ? "" : ",") + std::to_string(d);
+    }
+    const std::size_t begin = data.size();
+    for (std::int64_t i = 0; i < numel; ++i) {
+      const std::int64_t salt = static_cast<std::int64_t>(tensor.size()) * 11;
+      const auto k = static_cast<int>((i * 37 + salt) % 255) - 127;
+      float v = shape.size() == 1 ? 1.0f : static_cast<float>(k) / 512.0f;
+      if (i == 0 && tensor == inexact) v = 0.1f;
+      if (dtype == "BF16") {
+        const std::uint16_t bits = f32_to_bf16(v);
+        data.append(reinterpret_cast<const char*>(&bits), sizeof(bits));
+      } else {
+        data.append(reinterpret_cast<const char*>(&v), sizeof(v));
+      }
+    }
+    header += (header.size() > 1 ? ",\"" : "\"") + tensor + "\":{\"dtype\":\"" +
+              std::string(dtype) + "\",\"shape\":[" + dims + "],\"data_offsets\":[" +
+              std::to_string(begin) + "," + std::to_string(data.size()) + "]}";
+  }
+  header += "}";
+
+  const fs::path dir = make_temp_dir(name);
+  std::string file;
+  for (int i = 0; i < 8; ++i) file.push_back(static_cast<char>((header.size() >> (8 * i)) & 0xffu));
+  write_file(dir / "model.safetensors", file + header + data);
+  write_file(dir / "config.json", kTinyConfig);
+  fs::copy_file(byte_tokenizer_file(), dir / "tokenizer.json");
+  return dir;
 }
 
 // Every flag the CLI documents, and whether it takes a value.
@@ -771,7 +861,7 @@ TEST_CASE("parse_args: defaults are the documented ones") {
   CHECK(o.sampling.repetition_penalty == 1.0f);
   CHECK(o.sampling.seed == 42u);
   CHECK(o.threads == 0);
-  CHECK(o.weights == DType::F32);
+  CHECK_FALSE(o.weights.has_value());  // --weights auto
   CHECK_FALSE(o.ignore_eos);
   CHECK_FALSE(o.print_ids);
   CHECK_FALSE(o.help);
@@ -827,6 +917,18 @@ TEST_CASE("parse_args: a repeated flag keeps its last value") {
   CHECK(o.model_dir == fs::path("b"));
   CHECK(parse({"--model", "m", "--prompt", "p", "--weights", "q8_0", "--weights", "f32"}).weights ==
         DType::F32);
+  CHECK_FALSE(
+      parse({"--model", "m", "--prompt", "p", "--weights", "bf16", "--weights", "auto"}).weights);
+}
+
+TEST_CASE("parse_args: --weights takes auto, f32, bf16 or q8_0") {
+  const auto weights = [](std::string_view value) {
+    return parse({"--model", "m", "--prompt", "p", "--weights", value}).weights;
+  };
+  CHECK_FALSE(weights("auto").has_value());
+  CHECK(weights("f32") == DType::F32);
+  CHECK(weights("bf16") == DType::BF16);
+  CHECK(weights("q8_0") == DType::Q8_0);
 }
 
 TEST_CASE("parse_args: an unknown flag is rejected by name") {
@@ -900,10 +1002,13 @@ TEST_CASE("parse_args: malformed or out-of-range values name the flag and the va
       {"--threads", "-1", "an integer >= 0"},
       {"--threads", "4294967296", "an integer >= 0"},
       {"--threads", "many", "an integer >= 0"},
-      {"--weights", "q4_0", "f32 or q8_0"},
-      {"--weights", "Q8_0", "f32 or q8_0"},
-      {"--weights", "f16", "f32 or q8_0"},
-      {"--weights", "", "f32 or q8_0"},
+      {"--weights", "q4_0", "auto, f32, bf16 or q8_0"},
+      {"--weights", "Q8_0", "auto, f32, bf16 or q8_0"},
+      {"--weights", "BF16", "auto, f32, bf16 or q8_0"},
+      {"--weights", "bfloat16", "auto, f32, bf16 or q8_0"},
+      {"--weights", "Auto", "auto, f32, bf16 or q8_0"},
+      {"--weights", "f16", "auto, f32, bf16 or q8_0"},
+      {"--weights", "", "auto, f32, bf16 or q8_0"},
   };
   for (const Bad& c : cases) {
     const std::string arg = std::string(c.flag) + "=" + std::string(c.value);
@@ -957,7 +1062,7 @@ TEST_CASE("the usage text lists exactly the flags the parser accepts, with their
   const std::pair<std::string_view, std::string_view> defaults[] = {
       {"--max-tokens", "64"}, {"--temperature", "0"}, {"--top-k", "0"},  {"--top-p", "1"},
       {"--repetition-penalty", "1"}, {"--seed", "42"}, {"--threads", "0"},
-      {"--weights", "f32"},
+      {"--weights", "auto"},
   };
   for (const auto& [flag, value] : defaults) {
     const std::string line = line_containing(std::string(cli::kUsage), std::string(flag) + " ");
@@ -979,9 +1084,19 @@ TEST_CASE("the usage text says what --threads does") {
 
 TEST_CASE("the usage text says what --weights does") {
   const std::string usage(cli::kUsage);
-  CHECK(contains(line_containing(usage, "--weights "), "<f32|q8_0>"));
+  CHECK(contains(line_containing(usage, "--weights "), "auto, f32, bf16 or q8_0"));
+  CHECK(contains(usage, "--weights auto stores the projections and the embedding in bf16"));
+  CHECK(contains(usage, "when bf16 holds every value exactly"));
+  CHECK(contains(usage, "and in f32 otherwise, so no weight ever changes"));
+  CHECK(contains(usage, "--weights bf16 insists on bf16, and fails where it would round a value"));
   CHECK(contains(usage, "--weights q8_0 rounds the projections and the embedding to 8 bits"));
   CHECK(contains(usage, "arithmetic stays f32"));
+  // Every line fits an 80-column terminal.
+  std::istringstream lines(usage);
+  for (std::string line; std::getline(lines, line);) {
+    CAPTURE(line);
+    CHECK(line.size() < 80);
+  }
 }
 
 // ===========================================================================
@@ -1511,11 +1626,26 @@ TEST_CASE("end to end: --threads sizes the pool and leaves greedy output unchang
     // The load banner reports num_threads(), which only set_num_threads changes.
     const std::string banner = line_containing(r.run->err, "minillm: loaded ");
     CHECK(contains(banner, "; " + threads + " thread(s)"));
-    // No --weights is f32, at SmolLM2-135M's 538 MB.
-    CHECK(contains(banner, "; f32 weights, 538.1 MB; "));
+    // No --weights is auto, which picks bf16 for SmolLM2-135M's bf16
+    // checkpoint: 269 MB rather than f32's 538.
+    CHECK(contains(banner, "; bf16 weights (auto: exact in bf16), 269.1 MB; "));
     assert_equal(generated_ids(*r.run), oracle, "prompt 2 greedy ids at --threads " + threads);
   }
   CHECK(e2e->threaded.out == e2e->oracle[2].out);
+}
+
+// Not under TSan (see the batch in end_to_end()).
+TEST_CASE("end to end: --weights f32 still runs f32 weights, with the same tokens and text" *
+          doctest::skip(kTsan)) {
+  const EndToEnd* e2e = e2e_or_skip();
+  if (!e2e) return;
+  const RunResult& run = e2e->f32;
+  CHECK(contains(line_containing(run.err, "minillm: loaded "),
+                 "; f32 weights, 538.1 MB; 1 thread(s)"));
+  assert_equal(generated_ids(run), expected_greedy_ids(2),
+               "prompt 2 greedy ids with --weights f32");
+  // The default's bf16 weights are the same values, so the text is too.
+  CHECK(run.out == e2e->oracle[2].out);
 }
 
 TEST_CASE("end to end: --weights q8_0 reproduces the Q8_0 oracle's tokens") {
@@ -1534,6 +1664,63 @@ TEST_CASE("end to end: --weights q8_0 reproduces the Q8_0 oracle's tokens") {
                "q8_0 input ids");
   assert_equal(generated_ids(run), expected_greedy_ids(kQ8_0Prompt, "model_q8_0"),
                "prompt " + std::to_string(kQ8_0Prompt) + " greedy ids with --weights q8_0");
+}
+
+// The checkpoints are tiny, so this runs in full under TSan too.
+TEST_CASE("end to end: --weights auto keeps an f32-stored checkpoint bf16 cannot hold in f32") {
+  if (!have_cli()) return;
+  const std::string late = "model.layers.0.mlp.down_proj.weight";
+  const fs::path inexact = write_tiny_checkpoint("tiny_f32_inexact", "F32", late);
+  const fs::path exact = write_tiny_checkpoint("tiny_f32_exact", "F32");
+  const auto run = [](const fs::path& dir, std::initializer_list<std::string> extra) {
+    std::vector<std::string> args = {"--model",      dir.string(), "--prompt",  "hi",
+                                     "--max-tokens", "3",          "--threads", "1",
+                                     "--ignore-eos", "--print-ids"};
+    args.insert(args.end(), extra);
+    return run_cli(args);
+  };
+
+  // One value bf16 cannot hold, in the last tensor convert_weights_bf16
+  // checks: auto keeps every weight f32, and the banner says why.
+  const RunResult automatic = run(inexact, {});
+  CHECK(contains(line_containing(automatic.err, "minillm: loaded "),
+                 "; f32 weights (auto: tensor '" + late +
+                     "' is not exact in bf16), 0.2 MB; 1 thread(s)"));
+  // That is exactly --weights f32: the same weights through the same kernels.
+  const RunResult f32 = run(inexact, {"--weights", "f32"});
+  CHECK(contains(line_containing(f32.err, "minillm: loaded "),
+                 "; f32 weights, 0.2 MB; 1 thread(s)"));
+  const std::vector<std::int32_t> ids = generated_ids(automatic);
+  CHECK(ids.size() == 3);
+  CHECK(ids == generated_ids(f32));
+  CHECK(automatic.out == f32.out);
+
+  // --weights bf16 refuses to round, and says what would not.
+  const RunResult bf16 = run(inexact, {"--weights", "bf16"});
+  CHECK_FALSE(bf16.signaled);
+  CHECK(bf16.exit_code == 1);
+  CHECK(bf16.out.empty());
+  CHECK(bf16.err == "minillm: error: --weights bf16: convert_weights_bf16: tensor '" + late +
+                        "' is not exact in bf16; --weights f32 or auto keeps the weights as "
+                        "stored\n");
+
+  // Stored as f32 but every value exact: auto goes by the values, not by the
+  // stored dtype, and halves the projections and the embedding.
+  const RunResult converted = run(exact, {});
+  CHECK(contains(line_containing(converted.err, "minillm: loaded "),
+                 "; bf16 weights (auto: exact in bf16), 0.1 MB; 1 thread(s)"));
+  CHECK(generated_ids(converted).size() == 3);
+
+  // A tensor missing altogether fails as it does with --weights f32: the
+  // model names it, with the shape it expects.
+  const fs::path broken = write_tiny_checkpoint("tiny_missing", "F32", {}, late);
+  for (const std::initializer_list<std::string> weights :
+       {std::initializer_list<std::string>{}, {"--weights", "f32"}}) {
+    const RunResult r = run(broken, weights);
+    CHECK(r.exit_code == 1);
+    CHECK(r.err == "minillm: error: Model: missing tensor '" + late +
+                       "': expected f32[64, 128], the checkpoint has none\n");
+  }
 }
 
 // Not under TSan (see kTsanTokens): eos is 55 tokens into prompt 1, and stopping
@@ -1575,7 +1762,10 @@ TEST_CASE("end to end: streamed stdout is byte for byte a one-call decode of the
                              {"prompt 2", &e2e->oracle[2]},
                              {"multi-byte prompt", &e2e->multibyte},
                              {"prompt 2 with --weights q8_0", &e2e->q8_0}};
-  if (!kTsan) runs.push_back({"prompt 1 to eos", &e2e->stop_at_eos});
+  if (!kTsan) {
+    runs.push_back({"prompt 1 to eos", &e2e->stop_at_eos});
+    runs.push_back({"prompt 2 with --weights f32", &e2e->f32});
+  }
   for (const Named& n : runs) {
     CAPTURE(n.name);
     const std::vector<std::int32_t> ids = generated_ids(*n.run);

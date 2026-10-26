@@ -10,6 +10,12 @@
 //     every hidden state in layer order, the final logits, the 64-token
 //     greedy generation id for id, prefill-then-decode against one-shot
 //     prefill, reset(), and the post-RoPE keys the cache ends up holding.
+//   * BF16 weights (convert_weights_bf16): which tensors it replaces, that it
+//     refuses before replacing anything when bf16 cannot hold a value, and
+//     what the constructor accepts, on the tiny model; on SmolLM2, the same
+//     oracle comparisons against oracle/data/model/, the fp32 oracle itself,
+//     with the same tolerances and token-exact greedy ids: a BF16 weight is
+//     exactly the F32 weight it was converted from.
 //   * Q8_0 weights (quantize_weights_q8_0): which tensors it replaces and
 //     what the constructor accepts, on the tiny model; on SmolLM2, the C++
 //     quantizer's bytes against oracle/generate.py's for the whole
@@ -312,6 +318,19 @@ ModelConfig tiny_q8_0_config() {
   return c;
 }
 
+/// `w` with every tensor convert_weights_bf16 replaces (those of rank 2)
+/// rounded to bf16 and widened back: the F32 weights a bf16 checkpoint loads
+/// as, which convert_weights_bf16 accepts. The norms keep values bf16 cannot
+/// hold, since it never converts them.
+Weights bf16_rounded(const Weights& w) {
+  Weights out;
+  for (const std::string& name : w.names()) {
+    const Tensor& t = w.get(name);
+    out.insert(name, t.ndim() > 1 ? convert_to_f32(convert_to_bf16(t)) : t);
+  }
+  return out;
+}
+
 /// `w` with every Q8_0 tensor replaced by convert_to_f32 of it: the F32
 /// weights a Q8_0 model stands for (ops.h).
 Weights dequantized(const Weights& w) {
@@ -466,13 +485,26 @@ const Weights& smollm2_q8_0_weights() {
   return weights;
 }
 
+/// smollm2_weights() through convert_weights_bf16, once per process. The
+/// norms still share storage with smollm2_weights().
+const Weights& smollm2_bf16_weights() {
+  static const Weights weights = [] {
+    Weights w = smollm2_weights();
+    convert_weights_bf16(w, smollm2_config());
+    return w;
+  }();
+  return weights;
+}
+
 /// One weight format and the oracle section that holds its golden data.
 struct Format {
-  const char* name;     ///< "f32" or "q8_0", for messages
+  const char* name;     ///< "f32", "bf16" or "q8_0", for messages
   const char* section;  ///< "model" or "model_q8_0" under oracle/data/
   const Weights& (*weights)();
 };
 const Format kF32{"f32", "model", smollm2_weights};
+/// BF16 is held to the fp32 oracle itself: its weights are the F32 ones.
+const Format kBf16{"bf16", "model", smollm2_bf16_weights};
 const Format kQ8_0{"q8_0", "model_q8_0", smollm2_q8_0_weights};
 
 Model smollm2(const Format& format, std::int64_t max_seq_len = kMaxSeq) {
@@ -645,9 +677,9 @@ TEST_CASE("a tensor that is not f32, or not contiguous, is rejected by name") {
   const std::string name = "model.layers.1.self_attn.k_proj.weight";
   const Shape shape{cfg.kv_dim(), cfg.hidden_size};
 
-  const std::string bf16 =
-      constructor_error(cfg, edited(w, {name}, {{name, Tensor::zeros(shape, DType::BF16)}}));
-  CHECK(contains(bf16, "'" + name + "' is bf16"));
+  const std::string f16 =
+      constructor_error(cfg, edited(w, {name}, {{name, Tensor::zeros(shape, DType::F16)}}));
+  CHECK(contains(f16, "'" + name + "' is f16"));
 
   const Tensor strided = Tensor::zeros(Shape{cfg.kv_dim(), 2 * cfg.hidden_size})
                              .slice(1, 0, cfg.hidden_size);
@@ -846,6 +878,215 @@ TEST_CASE("the tiny model matches a ref:: forward pass, tied and untied, prefill
 }
 
 // ===========================================================================
+// BF16 weights, on the tiny model
+// ===========================================================================
+
+TEST_CASE("convert_weights_bf16 replaces the projections and the embedding, losslessly") {
+  for (const bool tied : {true, false}) {
+    CAPTURE(tied);
+    ModelConfig cfg = tiny_config();
+    cfg.tie_word_embeddings = tied;
+    const Weights f32 = bf16_rounded(random_weights(cfg));
+    Weights w = f32;
+    convert_weights_bf16(w, cfg);
+
+    REQUIRE(w.names() == f32.names());
+    std::size_t bytes = 0;
+    for (const auto& [name, shape] : tensor_shapes(cfg)) {
+      CAPTURE(name);
+      const Tensor& t = w.get(name);
+      CHECK(t.shape() == shape);
+      bytes += t.nbytes();
+      if (shape.ndim() == 1) {
+        // A norm weight: the very same tensor, although bf16 cannot hold it.
+        CHECK(t.dtype() == DType::F32);
+        CHECK(t.data() == f32.get(name).data());
+        CHECK_FALSE(bf16_exact(t));
+        continue;
+      }
+      REQUIRE(t.dtype() == DType::BF16);
+      CHECK(t.nbytes() == static_cast<std::size_t>(shape.numel()) * 2);
+      // Widening gives the F32 tensor back bit for bit.
+      const Tensor back = convert_to_f32(t);
+      CHECK(std::memcmp(back.data(), f32.get(name).data(), back.nbytes()) == 0);
+    }
+    CHECK(w.bytes() == bytes);
+    // replace() swapped this copy's handles; the original still holds F32.
+    CHECK(f32.get("model.embed_tokens.weight").dtype() == DType::F32);
+  }
+}
+
+TEST_CASE("convert_weights_bf16 names the first tensor bf16 cannot hold, and replaces nothing") {
+  /// Every tensor of `w` is still F32 and still the very storage `before` held.
+  const auto untouched = [](const Weights& w, const Weights& before) {
+    REQUIRE(w.names() == before.names());
+    for (const std::string& name : w.names()) {
+      CAPTURE(name);
+      CHECK(w.get(name).dtype() == DType::F32);
+      CHECK(w.get(name).data() == before.get(name).data());
+    }
+  };
+  for (const bool tied : {true, false}) {
+    CAPTURE(tied);
+    ModelConfig cfg = tiny_config();
+    cfg.tie_word_embeddings = tied;
+    const Weights exact = bf16_rounded(random_weights(cfg));
+
+    SUBCASE("one value one ulp off, late in the list, is enough") {
+      const std::string up = "model.layers.1.mlp.up_proj.weight";
+      const std::string later = tied ? "model.layers.1.mlp.down_proj.weight" : "lm_head.weight";
+      std::vector<std::pair<std::string, Tensor>> bad;
+      for (const std::string& name : {up, later}) {
+        Tensor t = exact.get(name).copy_contiguous();
+        t.f32()[t.numel() - 1] = std::nextafter(t.f32()[t.numel() - 1], 1.0f);
+        REQUIRE_FALSE(bf16_exact(t));
+        bad.emplace_back(name, std::move(t));
+      }
+      const Weights before = edited(exact, {}, std::move(bad));
+      Weights w = before;
+      const std::string msg = thrown<std::invalid_argument>([&] { convert_weights_bf16(w, cfg); });
+      CHECK(msg == "convert_weights_bf16: tensor '" + up + "' is not exact in bf16");
+      untouched(w, before);
+    }
+    SUBCASE("an f32 checkpoint fails at its first tensor, the embedding") {
+      const Weights before = random_weights(cfg);
+      Weights w = before;
+      CHECK(thrown<std::invalid_argument>([&] { convert_weights_bf16(w, cfg); }) ==
+            "convert_weights_bf16: tensor 'model.embed_tokens.weight' is not exact in bf16");
+      untouched(w, before);
+    }
+    SUBCASE("infinities and NaNs are exact in bf16") {
+      Tensor t = exact.get("model.layers.0.self_attn.v_proj.weight").copy_contiguous();
+      t.f32()[0] = std::numeric_limits<float>::infinity();
+      t.f32()[1] = std::numeric_limits<float>::quiet_NaN();
+      Weights w = edited(exact, {}, {{"model.layers.0.self_attn.v_proj.weight", t}});
+      convert_weights_bf16(w, cfg);
+      const Tensor back = convert_to_f32(w.get("model.layers.0.self_attn.v_proj.weight"));
+      CHECK(std::isinf(back.f32()[0]));
+      CHECK(std::isnan(back.f32()[1]));
+    }
+  }
+}
+
+TEST_CASE("convert_weights_bf16 names a tensor it cannot convert, or a missing one") {
+  const ModelConfig cfg = tiny_config();
+  const Weights exact = bf16_rounded(random_weights(cfg));
+
+  // Converting twice: the embedding is already bf16, and it says so.
+  Weights twice = exact;
+  convert_weights_bf16(twice, cfg);
+  const std::string msg = thrown<std::invalid_argument>([&] { convert_weights_bf16(twice, cfg); });
+  CHECK(contains(msg, "convert_weights_bf16: tensor 'model.embed_tokens.weight': bf16_exact: "));
+  CHECK(contains(msg, "only f32"));
+
+  const std::string gone = "model.layers.1.mlp.down_proj.weight";
+  Weights w = edited(exact, {gone});
+  CHECK(contains(thrown<std::runtime_error>([&] { convert_weights_bf16(w, cfg); }), gone));
+  for (const std::string& name : w.names()) {
+    CAPTURE(name);
+    CHECK(w.get(name).dtype() == DType::F32);
+  }
+
+  // Untied, lm_head.weight is one of the tensors it needs.
+  ModelConfig untied = cfg;
+  untied.tie_word_embeddings = false;
+  Weights u = edited(bf16_rounded(random_weights(untied)), {"lm_head.weight"});
+  CHECK(contains(thrown<std::runtime_error>([&] { convert_weights_bf16(u, untied); }),
+                 "lm_head.weight"));
+}
+
+TEST_CASE("the constructor takes each projection and the embedding as bf16 too, norms as f32") {
+  for (const bool tied : {true, false}) {
+    CAPTURE(tied);
+    ModelConfig cfg = tiny_config();
+    cfg.tie_word_embeddings = tied;
+    const Weights w = random_weights(cfg);
+    Weights all = bf16_rounded(w);
+    convert_weights_bf16(all, cfg);
+    CHECK_NOTHROW(Model(cfg, all, 16));
+
+    // One tensor at a time, the rest F32: every mix is a valid model.
+    for (const auto& [name, shape] : tensor_shapes(cfg)) {
+      CAPTURE(name);
+      Weights one = edited(w, {}, {{name, convert_to_bf16(w.get(name))}});
+      if (shape.ndim() > 1) {
+        CHECK_NOTHROW(Model(cfg, std::move(one), 16));
+      } else {
+        CHECK(contains(constructor_error(cfg, std::move(one)),
+                       "'" + name + "' is bf16" + shape.to_string() + ", expected f32" +
+                           shape.to_string()));
+      }
+    }
+  }
+
+  // BF16 and Q8_0 side by side: alternate projections in each format.
+  const ModelConfig cfg = tiny_q8_0_config();
+  const Weights w = random_weights(cfg);
+  std::vector<std::pair<std::string, Tensor>> mixed;
+  bool bf16 = true;
+  for (const auto& [name, shape] : tensor_shapes(cfg)) {
+    if (shape.ndim() == 1) continue;
+    mixed.emplace_back(name, bf16 ? convert_to_bf16(w.get(name)) : quantize_q8_0(w.get(name)));
+    bf16 = !bf16;
+  }
+  CHECK_NOTHROW(Model(cfg, edited(w, {}, std::move(mixed)), 16));
+}
+
+TEST_CASE("tied BF16 embeddings: a stray lm_head.weight is converted too, and must match it") {
+  const ModelConfig cfg = tiny_config();
+  REQUIRE(cfg.tie_word_embeddings);
+  const Weights w = bf16_rounded(random_weights(cfg));
+  const Tensor copy = w.get("model.embed_tokens.weight").copy_contiguous();
+
+  Weights both = edited(w, {}, {{"lm_head.weight", copy}});
+  convert_weights_bf16(both, cfg);
+  CHECK(both.get("lm_head.weight").dtype() == DType::BF16);
+  CHECK_NOTHROW(Model(cfg, both, 16));
+
+  Weights converted = w;
+  convert_weights_bf16(converted, cfg);
+  CHECK(contains(constructor_error(cfg, edited(converted, {}, {{"lm_head.weight", copy}})),
+                 "lm_head.weight is f32 and model.embed_tokens.weight bf16"));
+}
+
+TEST_CASE("the tiny BF16 model matches a ref:: forward pass on the f32 weights it came from") {
+  for (const bool tied : {true, false}) {
+    CAPTURE(tied);
+    ModelConfig cfg = tiny_config();
+    cfg.tie_word_embeddings = tied;
+    const Weights f32 = bf16_rounded(random_weights(cfg, tied ? 500 : 600));
+    Weights w = f32;
+    convert_weights_bf16(w, cfg);
+    const std::vector<std::int32_t> ids = random_ids(9, 40, 23);
+    const RefPass expected = ref_forward(cfg, f32, ids);
+
+    // One-shot prefill: every hidden state and the logits.
+    Model model(cfg, w, 16);
+    HookRecorder rec;
+    model.set_hidden_state_hook(rec.hook());
+    const std::span<const float> logits = model.forward(ids, 0);
+    REQUIRE(rec.states.size() == expected.hidden.size());
+    for (std::size_t j = 0; j < rec.states.size(); ++j) {
+      assert_allclose(rec.states[j], expected.hidden[j], tol::kHiddenState,
+                      "tiny bf16 " + hidden_state_name(static_cast<std::int64_t>(j), 2));
+    }
+    assert_allclose(logits, expected.logits, tol::kLogits, "tiny bf16 logits");
+    // The embedding is widened, not computed: hidden state 0 is exact.
+    CHECK(std::memcmp(rec.states[0].data(), expected.hidden[0].data(),
+                      expected.hidden[0].nbytes()) == 0);
+
+    // Prefill of 6, then three one-token decode steps: the m = 1 kernels.
+    Model stepped(cfg, w, 16);
+    stepped.forward(std::span(ids).first(6), 0);
+    std::span<const float> last;
+    for (std::int64_t t = 6; t < 9; ++t) {
+      last = stepped.forward(std::span(ids).subspan(static_cast<std::size_t>(t), 1), t);
+    }
+    assert_allclose(last, expected.logits, tol::kLogits, "tiny bf16 logits after decode");
+  }
+}
+
+// ===========================================================================
 // Q8_0 weights, on the tiny model
 // ===========================================================================
 
@@ -952,8 +1193,8 @@ TEST_CASE("a projection of the wrong dtype or shape is reported against what the
   const Weights w = random_weights(cfg);
   const std::string name = "model.layers.1.mlp.up_proj.weight";
   const Shape shape{cfg.intermediate_size, cfg.hidden_size};
-  CHECK(contains(constructor_error(cfg, edited(w, {}, {{name, Tensor::zeros(shape, DType::BF16)}})),
-                 "'" + name + "' is bf16[96, 64], expected f32 or q8_0[96, 64]"));
+  CHECK(contains(constructor_error(cfg, edited(w, {}, {{name, Tensor::zeros(shape, DType::F16)}})),
+                 "'" + name + "' is f16[96, 64], expected f32, bf16 or q8_0[96, 64]"));
   const Shape wrong{cfg.intermediate_size + 1, cfg.hidden_size};
   CHECK(contains(constructor_error(cfg, edited(w, {}, {{name, Tensor::zeros(wrong, DType::Q8_0)}})),
                  "'" + name + "' is q8_0[97, 64], expected q8_0[96, 64]"));
@@ -976,16 +1217,15 @@ TEST_CASE("tied Q8_0 embeddings: a stray lm_head.weight is quantized too, and mu
                  "lm_head.weight is f32 and model.embed_tokens.weight q8_0"));
 }
 
-TEST_CASE("from_dir takes f32 or q8_0, and rejects any other dtype before reading anything") {
+TEST_CASE("from_dir takes f32, bf16 or q8_0, and rejects any other dtype before reading anything") {
   // The directory does not exist: the dtype is checked first.
-  for (const DType dt : {DType::BF16, DType::F16}) {
+  const std::string msg = thrown<std::invalid_argument>(
+      [&] { Model::from_dir("/nonexistent/minillm-model", 16, DType::F16); });
+  CHECK(contains(msg, "weight_dtype must be f32, bf16 or q8_0, got f16"));
+  for (const DType dt : {DType::F32, DType::BF16, DType::Q8_0}) {
     CAPTURE(dtype_name(dt));
-    const std::string msg = thrown<std::invalid_argument>(
-        [&] { Model::from_dir("/nonexistent/minillm-model", 16, dt); });
-    CHECK(contains(msg, std::string("weight_dtype must be f32 or q8_0, got ") + dtype_name(dt)));
+    CHECK_THROWS_AS(Model::from_dir("/nonexistent/minillm-model", 16, dt), std::runtime_error);
   }
-  CHECK_THROWS_AS(Model::from_dir("/nonexistent/minillm-model", 16, DType::Q8_0),
-                  std::runtime_error);
 }
 
 TEST_CASE("the tiny Q8_0 model matches a ref:: forward pass on its dequantized weights") {
@@ -1255,6 +1495,62 @@ TEST_CASE("SmolLM2: a moved-to model keeps its weights, cache and position") {
   CHECK(moved.kv_cache().seq_len() == n - 1);
   const std::span<const float> got = moved.forward(std::span(ids).last(1), n - 1);
   CHECK(std::equal(got.begin(), got.end(), expected.begin(), expected.end()));
+}
+
+// ===========================================================================
+// SmolLM2-135M with BF16 weights, against the fp32 oracle
+// ===========================================================================
+
+TEST_CASE("SmolLM2 BF16: every projection and the embedding is bf16, at half the bytes") {
+  if (skip_without_checkpoint()) return;
+  const Weights& f32 = smollm2_weights();
+  const Weights& bf16 = smollm2_bf16_weights();
+  REQUIRE(bf16.names() == f32.names());
+  std::size_t converted = 0;
+  for (const std::string& name : bf16.names()) {
+    CAPTURE(name);
+    const Tensor& t = bf16.get(name);
+    if (f32.get(name).ndim() == 1) {
+      CHECK(t.dtype() == DType::F32);
+      CHECK(t.data() == f32.get(name).data());
+    } else {
+      CHECK(t.dtype() == DType::BF16);
+      ++converted;
+    }
+  }
+  CHECK(converted == 1 + 7 * static_cast<std::size_t>(smollm2_config().num_hidden_layers));
+  // What the CLI's banner reports: 538.1 MB as f32, 269.1 MB with bf16
+  // projections and embedding and f32 norms.
+  CHECK(f32.bytes() == 538060032u);
+  CHECK(bf16.bytes() == 269100288u);
+}
+
+TEST_CASE("SmolLM2 BF16: every hidden state matches the fp32 oracle, and so do the logits") {
+  if (skip_without_checkpoint()) return;
+  check_hidden_states_and_logits(kBf16);
+}
+
+TEST_CASE("SmolLM2 BF16: 64 greedy tokens reproduce the fp32 oracle's, id for id") {
+  if (skip_without_checkpoint()) return;
+  check_greedy_ids(kBf16);
+}
+
+TEST_CASE("SmolLM2 BF16: prefill then one decode step agrees with a one-shot prefill") {
+  if (skip_without_checkpoint()) return;
+  check_decode_against_prefill(kBf16);
+}
+
+TEST_CASE("SmolLM2 BF16: from_dir(..., BF16) loads the same model as convert_weights_bf16") {
+  if (skip_without_checkpoint()) return;
+  MINILLM_SKIP_WITHOUT_ORACLE({prompt_file(0, "input_ids")});
+  const std::vector<std::int32_t> ids = prompt_ids(0);
+
+  Model loaded = Model::from_dir(models_dir() / kModel, 64, DType::BF16);
+  const std::span<const float> a = loaded.forward(ids, 0);
+  const std::vector<float> from_dir(a.begin(), a.end());
+  Model shared = smollm2(kBf16, 64);
+  const std::span<const float> b = shared.forward(ids, 0);
+  CHECK(std::equal(b.begin(), b.end(), from_dir.begin(), from_dir.end()));
 }
 
 // ===========================================================================

@@ -807,6 +807,154 @@ TEST_CASE("convert_to_f32: f32 is copied, and strided input comes out contiguous
 }
 
 // ===========================================================================
+// BF16: convert_to_bf16 and bf16_exact
+// ===========================================================================
+
+namespace {
+
+std::uint32_t bits_of(float v) {
+  std::uint32_t bits;
+  std::memcpy(&bits, &v, sizeof(bits));
+  return bits;
+}
+
+float float_of(std::uint32_t bits) {
+  float v;
+  std::memcpy(&v, &bits, sizeof(v));
+  return v;
+}
+
+bool is_nan_bits(std::uint32_t bits) { return (bits & 0x7fffffffu) > 0x7f800000u; }
+
+/// Round to nearest even onto the top 16 bits, for a non-NaN f32, written
+/// independently of tensor.h's f32_to_bf16. A carry out of the mantissa bumps
+/// the exponent, so the largest floats round up to infinity.
+std::uint16_t reference_bf16(std::uint32_t bits) {
+  std::uint32_t upper = bits >> 16;
+  const std::uint32_t rest = bits & 0xffffu;
+  if (rest > 0x8000u || (rest == 0x8000u && (upper & 1u) != 0)) ++upper;
+  return static_cast<std::uint16_t>(upper);
+}
+
+/// Low halves that exercise every rounding case: exact, just above exact,
+/// just below the tie, the tie, just above it, and the most that rounds up.
+constexpr std::array<std::uint32_t, 6> kLowHalves = {0x0000, 0x0001, 0x7fff,
+                                                     0x8000, 0x8001, 0xffff};
+
+}  // namespace
+
+TEST_CASE("convert_to_bf16 rounds to nearest even, and bf16_exact says when that is lossless") {
+  // Every bf16 bit pattern as the top half, each low half in kLowHalves as
+  // the bottom: ties both ways, NaN payloads that truncating would turn into
+  // infinity (0x7f800001), the overflow of the largest floats, subnormals, -0.
+  std::vector<float> x;
+  for (std::uint32_t upper = 0; upper < 65536; ++upper) {
+    for (const std::uint32_t low : kLowHalves) x.push_back(float_of(upper << 16 | low));
+  }
+  const Tensor src = Tensor::wrap(x.data(), {65536, 6}, DType::F32);
+
+  const Tensor out = convert_to_bf16(src);
+  REQUIRE(out.dtype() == DType::BF16);
+  CHECK(out.shape() == src.shape());
+  CHECK(out.is_contiguous());
+  CHECK(out.owns_data());
+  CHECK(out.nbytes() == x.size() * 2);
+  const Tensor back = convert_to_f32(out);
+
+  std::int64_t not_rounded = 0, wrong_exact = 0, not_back = 0, nan_lost = 0;
+  const auto* bf = out.data_as<std::uint16_t>();
+  for (std::size_t i = 0; i < x.size(); ++i) {
+    const std::uint32_t bits = bits_of(x[i]);
+    const bool nan = is_nan_bits(bits);
+    if (bf[i] != (nan ? f32_to_bf16(x[i]) : reference_bf16(bits))) ++not_rounded;
+    // NaNs stay NaN, with their sign; the quiet bit may be set.
+    if (nan && (!std::isnan(bf16_to_f32(bf[i])) || (bf[i] >> 15) != (bits >> 31))) ++nan_lost;
+
+    float one = x[i];
+    const bool exact = (bits & 0xffffu) == 0 || nan;
+    if (bf16_exact(Tensor::wrap(&one, {1}, DType::F32)) != exact) ++wrong_exact;
+    // Exact means convert_to_f32 gives the value back bit for bit.
+    if (exact && !nan && bits_of(back.f32()[i]) != bits) ++not_back;
+  }
+  CHECK(not_rounded == 0);
+  CHECK(nan_lost == 0);
+  CHECK(wrong_exact == 0);
+  CHECK(not_back == 0);
+  CHECK_FALSE(bf16_exact(src));
+
+  // Spot values, independent of both roundings above.
+  const auto bf16_of = [](std::uint32_t bits) {
+    float v = float_of(bits);
+    return convert_to_bf16(Tensor::wrap(&v, {1}, DType::F32)).data_as<std::uint16_t>()[0];
+  };
+  CHECK(bf16_of(0x3f808000u) == 0x3f80);  // 1 + 2^-8, a tie: down to the even 1
+  CHECK(bf16_of(0x3f818000u) == 0x3f82);  // a tie above an odd mantissa: up
+  CHECK(bf16_of(0x3f807fffu) == 0x3f80);
+  CHECK(bf16_of(0x3f808001u) == 0x3f81);
+  CHECK(bf16_of(0x7f7fffffu) == 0x7f80);  // FLT_MAX rounds to infinity
+  CHECK(bf16_of(0x80000000u) == 0x8000);  // -0
+  CHECK(bf16_of(0x7f800001u) == 0x7fc0);  // a NaN, not the infinity truncation gives
+}
+
+TEST_CASE("bf16_exact finds one inexact value anywhere, and lets infinities and NaNs through") {
+  // Three chunks of bf16_exact's scan and a few elements more, all exact.
+  constexpr std::int64_t n = 3 * 4096 + 5;
+  Tensor t = convert_to_f32(convert_to_bf16(random_tensor({n}, 47)));
+  REQUIRE(bf16_exact(t));
+  float* v = t.f32();
+  for (const std::int64_t at : {std::int64_t{0}, std::int64_t{1}, std::int64_t{4095},
+                                std::int64_t{4096}, std::int64_t{8191}, n - 1}) {
+    for (const std::uint32_t low : {0x0001u, 0x8000u, 0xffffu}) {
+      CAPTURE(at);
+      CAPTURE(low);
+      const float saved = v[at];
+      v[at] = float_of(bits_of(saved) | low);
+      CHECK_FALSE(bf16_exact(t));
+      CHECK_FALSE(bf16_exact(t.reshape({1, n})));  // the shape does not matter
+      v[at] = saved;
+    }
+  }
+  REQUIRE(bf16_exact(t));
+  v[7] = std::numeric_limits<float>::infinity();
+  v[4100] = -std::numeric_limits<float>::infinity();
+  v[9000] = float_of(0x7f800001u);  // a NaN that bf16 holds only as a different NaN
+  v[n - 2] = float_of(0xffc0abcdu);
+  CHECK(bf16_exact(t));
+}
+
+TEST_CASE("convert_to_bf16 and bf16_exact reject what loader.h names, and pass empty tensors") {
+  using doctest::Contains;
+  for (const DType dt : {DType::BF16, DType::F16, DType::Q8_0}) {
+    CAPTURE(dtype_name(dt));
+    const Tensor x = Tensor::zeros({2, 32}, dt);
+    CHECK_THROWS_WITH_AS(convert_to_bf16(x), Contains("convert_to_bf16: "), std::invalid_argument);
+    CHECK_THROWS_WITH_AS(convert_to_bf16(x), Contains("only f32"), std::invalid_argument);
+    CHECK_THROWS_WITH_AS(bf16_exact(x), Contains("bf16_exact: "), std::invalid_argument);
+    CHECK_THROWS_WITH_AS(bf16_exact(x), Contains("only f32"), std::invalid_argument);
+  }
+  const Tensor wide = Tensor::zeros({4, 8});
+  const Tensor strided = wide.slice(1, 2, 4);
+  REQUIRE_FALSE(strided.is_contiguous());
+  CHECK_THROWS_WITH_AS(convert_to_bf16(strided), Contains("contiguous"), std::invalid_argument);
+  CHECK_THROWS_WITH_AS(bf16_exact(strided), Contains("contiguous"), std::invalid_argument);
+
+  // A dimension-0 slice is contiguous, and converts like its own rows.
+  const Tensor x = random_tensor({4, 8}, 48);
+  const Tensor rows = convert_to_bf16(x.slice(0, 1, 2));
+  const Tensor all = convert_to_bf16(x);
+  CHECK(rows.shape() == Shape{2, 8});
+  CHECK(std::memcmp(rows.data(), all.data_as<std::uint16_t>() + 8, rows.nbytes()) == 0);
+  CHECK(all.data() != x.data());
+
+  CHECK(convert_to_bf16(Tensor()).is_empty());
+  CHECK(bf16_exact(Tensor()));
+  const Tensor none = convert_to_bf16(Tensor::zeros({0, 4}));
+  CHECK(none.dtype() == DType::BF16);
+  CHECK(none.shape() == Shape{0, 4});
+  CHECK(bf16_exact(Tensor::zeros({0, 4})));
+}
+
+// ===========================================================================
 // Q8_0: quantize_q8_0, and convert_to_f32 back
 // ===========================================================================
 
@@ -1821,4 +1969,41 @@ TEST_CASE("SmolLM2-135M: every projection and the embedding quantize within the 
           << ", d in [" << proj.min_d << ", " << proj.max_d << "]; embedding max ratio "
           << embed.max_err_over_d << ", relative Frobenius error " << embed.rel_frobenius()
           << ", d in [" << embed.min_d << ", " << embed.max_d << "]");
+}
+
+TEST_CASE("SmolLM2-135M is stored in bf16: every tensor is exact, and converts back to its bytes") {
+  if (skip_without_model({"model.safetensors"})) return;
+  const fs::path file = model_file("model.safetensors");
+  const std::vector<TensorInfo> infos = read_safetensors_header(file);
+  const Weights& w = smollm2_weights();
+
+  std::ifstream in(file, std::ios::binary);
+  std::uint64_t header_len = 0;
+  in.read(reinterpret_cast<char*>(&header_len), sizeof(header_len));  // little-endian host
+  REQUIRE(in.good());
+  const std::uint64_t data_start = sizeof(header_len) + header_len;
+
+  std::size_t tensors = 0, differ = 0;
+  std::string stored;
+  for (const TensorInfo& info : infos) {
+    CAPTURE(info.name);
+    // What --weights auto relies on: the checkpoint is bf16 through and
+    // through, so the f32 the loader widened it to narrows back losslessly.
+    REQUIRE(info.dtype == DType::BF16);
+    const Tensor& t = w.get(info.name);
+    CHECK(bf16_exact(t));
+    const Tensor bf16 = convert_to_bf16(t);
+    stored.resize(info.data_end - info.data_begin);
+    in.seekg(static_cast<std::streamoff>(data_start + info.data_begin));
+    in.read(stored.data(), static_cast<std::streamsize>(stored.size()));
+    REQUIRE(in.good());
+    REQUIRE(bf16.nbytes() == stored.size());
+    if (std::memcmp(bf16.data(), stored.data(), stored.size()) != 0) {
+      ++differ;
+      FAIL_CHECK("'" << info.name << "': convert_to_bf16 does not give back the stored bytes");
+    }
+    ++tensors;
+  }
+  CHECK(tensors == 272);
+  CHECK(differ == 0);
 }
