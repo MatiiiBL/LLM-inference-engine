@@ -210,8 +210,29 @@ stage_tsan() {
   test_preset tsan
 }
 
+# The Q8_0 quality gate (tests/model, proposal 14 §5.3 layer 4) runs only
+# from a release build: it pushes about 4000 teacher-forced positions through
+# an fp32 and a Q8_0 engine, which no sanitizer stage could afford. The bench
+# stage builds release anyway, so the gate runs here. Every stage that gets
+# this far has the oracle and the checkpoint, so a skip fails like a failure,
+# and so does a filter that no longer matches the test.
+run_q8_0_kl_gate() {
+  log "Q8_0 KL gate (release)"
+  local out=build/release/q8_0-kl-gate-output.txt
+  local start=$SECONDS
+  build/release/tests/test_model --test-case='SmolLM2 Q8_0: KL from the fp32 engine*' 2>&1 |
+    tee "$out" || die "the Q8_0 KL gate failed; see the output above"
+  if grep -qE '^\[minillm\] [0-9]+ check\(s\) skipped' "$out"; then
+    die "the Q8_0 KL gate skipped its checks; it needs oracle/data/ and models/"
+  fi
+  grep -qE 'test cases: +1 \| +1 passed \| +0 failed' "$out" ||
+    die "the Q8_0 KL gate did not run exactly one test case; has it been renamed?"
+  printf '\nQ8_0 KL gate: passed in %ss\n' "$((SECONDS - start))"
+}
+
 stage_bench() {
   build_preset release
+  run_q8_0_kl_gate
   log "bench"
   local out=build/release/bench-output.txt
   # A failed run must not leave the previous run's results behind to be
