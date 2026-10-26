@@ -35,7 +35,9 @@ struct Options {
   std::int64_t max_tokens = 64;
   SamplingParams sampling;
   int threads = 0;
-  DType weights = DType::F32;  ///< F32 or Q8_0 (quantize_weights_q8_0 at load)
+  /// F32, BF16 (convert_weights_bf16 at load) or Q8_0 (quantize_weights_q8_0);
+  /// unset is --weights auto: BF16 where that is lossless, F32 otherwise.
+  std::optional<DType> weights;
   bool ignore_eos = false;
   bool print_ids = false;
   bool help = false;
@@ -61,7 +63,7 @@ inline constexpr std::string_view kUsage =
     "  --repetition-penalty <f>                            (default 1)\n"
     "  --seed <n>                                          (default 42)\n"
     "  --threads <n>              threads to use, 0 = auto (default 0)\n"
-    "  --weights <f32|q8_0>       weight format            (default f32)\n"
+    "  --weights <format>         auto, f32, bf16 or q8_0  (default auto)\n"
     "  --ignore-eos               keep generating past the end-of-text token\n"
     "  --print-ids                print prompt and generated token ids to stderr\n"
     "  --help\n"
@@ -72,6 +74,10 @@ inline constexpr std::string_view kUsage =
     "silicon), only work big enough to gain from the efficiency cores, such as a\n"
     "long prompt, uses more threads than the performance cores have. The output\n"
     "is the same at any --threads; only the speed changes.\n"
+    "--weights auto stores the projections and the embedding in bf16 (269 MB\n"
+    "instead of 538 MB for SmolLM2-135M) when bf16 holds every value exactly, as\n"
+    "for a bf16 checkpoint, and in f32 otherwise, so no weight ever changes.\n"
+    "--weights bf16 insists on bf16, and fails where it would round a value.\n"
     "--weights q8_0 rounds the projections and the embedding to 8 bits at load\n"
     "(143 MB instead of 538 MB for SmolLM2-135M); arithmetic stays f32.\n";
 
@@ -190,12 +196,17 @@ inline Options parse_args(std::span<const std::string_view> args) {
       opts.threads = detail::parse_number<int>(flag, value(), "an integer >= 0", non_negative);
     } else if (flag == "--weights") {
       const std::string_view v = value();
-      if (v == "f32") {
+      if (v == "auto") {
+        opts.weights.reset();
+      } else if (v == "f32") {
         opts.weights = DType::F32;
+      } else if (v == "bf16") {
+        opts.weights = DType::BF16;
       } else if (v == "q8_0") {
         opts.weights = DType::Q8_0;
       } else {
-        throw UsageError("--weights must be f32 or q8_0, got '" + std::string(v) + "'");
+        throw UsageError("--weights must be auto, f32, bf16 or q8_0, got '" + std::string(v) +
+                         "'");
       }
     } else if (flag == "--ignore-eos") {
       no_value();

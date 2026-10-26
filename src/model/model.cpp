@@ -6,11 +6,12 @@
 //
 // Memory: the weights are held by handle (Tensor copies share storage, so
 // nothing is copied, including the tied LM head). The projections and the
-// embedding may be Q8_0 (quantize_weights_q8_0); forward() never looks at a
-// dtype, because ops::matmul and ops::embedding dispatch on it. The KV cache
-// and one Arena are allocated in the constructor, both sized for
-// max_seq_len; forward() rewinds the arena and carves its buffers from it
-// (src/model/scratch.h), so a pass never touches the heap.
+// embedding may be BF16 or Q8_0 (convert_weights_bf16, quantize_weights_q8_0);
+// forward() never looks at a dtype, because ops::matmul and ops::embedding
+// dispatch on it. The KV cache and one Arena are allocated in the
+// constructor, both sized for max_seq_len; forward() rewinds the arena and
+// carves its buffers from it (src/model/scratch.h), so a pass never touches
+// the heap.
 //
 // Keys and values are projected straight into the cache: positions
 // [start_pos, start_pos + n) of one layer are a contiguous [n, kv_dim] block,
@@ -62,8 +63,8 @@ std::int64_t checked_max_seq_len(const ModelConfig& cfg, std::int64_t max_seq_le
 }
 
 /// What a tensor may be stored as: norms are always F32, while the
-/// projections, the embedding and an untied LM head may also be Q8_0.
-enum class Stored { kF32, kF32OrQ8_0 };
+/// projections, the embedding and an untied LM head may also be BF16 or Q8_0.
+enum class Stored { kF32, kWeight };
 
 /// Looks tensors up by name and checks each against the shape `cfg` implies,
 /// remembering which names it has handed out so that leftovers can be
@@ -104,11 +105,12 @@ class TensorBinder {
   /// dtype; a disallowed dtype against every dtype the slot takes.
   static void check(const std::string& name, const Tensor& t, const Shape& shape, Stored stored) {
     const bool dtype_ok =
-        t.dtype() == DType::F32 || (stored == Stored::kF32OrQ8_0 && t.dtype() == DType::Q8_0);
+        t.dtype() == DType::F32 ||
+        (stored == Stored::kWeight && (t.dtype() == DType::BF16 || t.dtype() == DType::Q8_0));
     if (!dtype_ok || t.shape() != shape) {
-      const char* expected = dtype_ok                       ? dtype_name(t.dtype())
-                             : stored == Stored::kF32OrQ8_0 ? "f32 or q8_0"
-                                                            : "f32";
+      const char* expected = dtype_ok                    ? dtype_name(t.dtype())
+                             : stored == Stored::kWeight ? "f32, bf16 or q8_0"
+                                                         : "f32";
       fail("tensor '" + name + "' is " + dtype_name(t.dtype()) + t.shape().to_string() +
            ", expected " + expected + shape.to_string());
     }
@@ -161,7 +163,7 @@ Model::Model(ModelConfig cfg, Weights weights, std::int64_t max_seq_len) {
   // a bad checkpoint fails before claiming any more memory.
   const std::int64_t hidden = cfg.hidden_size;
   const std::int64_t inter = cfg.intermediate_size;
-  constexpr Stored kWeight = Stored::kF32OrQ8_0;
+  constexpr Stored kWeight = Stored::kWeight;
   TensorBinder bind(weights);
   Tensor embed_tokens =
       bind.require("model.embed_tokens.weight", Shape{cfg.vocab_size, hidden}, kWeight);
@@ -185,10 +187,10 @@ Model::Model(ModelConfig cfg, Weights weights, std::int64_t max_seq_len) {
   // copy. A tied checkpoint may still carry an lm_head.weight (some exporters
   // write the shared matrix twice). transformers would quietly ignore it; we
   // accept it only if it is bit for bit embed_tokens, in the same dtype
-  // (quantize_weights_q8_0 quantizes both, to the same bytes), because
-  // anything else means the config and the checkpoint disagree about the
-  // model, and picking either one silently computes plausible but wrong
-  // logits. An accepted copy is dropped with the rest of `weights` when the
+  // (convert_weights_bf16 and quantize_weights_q8_0 convert both, to the same
+  // bytes), because anything else means the config and the checkpoint
+  // disagree about the model, and picking either one silently computes
+  // plausible but wrong logits. An accepted copy is dropped with the rest of `weights` when the
   // constructor returns.
   Tensor lm_head;
   const std::string lm_head_name = "lm_head.weight";
@@ -230,11 +232,14 @@ Model::~Model() = default;
 Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
 
-void convert_weights_bf16(Weights&, const ModelConfig&) {
-  throw std::logic_error("not implemented: convert_weights_bf16 (workflow 21)");
-}
+namespace {
 
-void quantize_weights_q8_0(Weights& weights, const ModelConfig& cfg) {
+/// The tensors convert_weights_bf16 and quantize_weights_q8_0 replace, in the
+/// order they check them: the embedding, each layer's seven projections, then
+/// lm_head.weight. Untied, lm_head is required; tied, a stray copy is
+/// converted too, so the constructor still finds it equal to the converted
+/// embed_tokens.
+std::vector<std::string> replaced_weight_names(const Weights& weights, const ModelConfig& cfg) {
   std::vector<std::string> names = {"model.embed_tokens.weight"};
   for (std::int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
     const std::string p = "model.layers." + std::to_string(i) + ".";
@@ -243,13 +248,37 @@ void quantize_weights_q8_0(Weights& weights, const ModelConfig& cfg) {
       names.push_back(p + proj + ".weight");
     }
   }
-  // Untied, lm_head is required; tied, a stray copy is quantized too, so the
-  // constructor still finds it equal to the quantized embed_tokens.
   if (!cfg.tie_word_embeddings || weights.has("lm_head.weight")) names.push_back("lm_head.weight");
-
   // A missing tensor is reported before anything is replaced.
   for (const std::string& name : names) weights.get(name);
+  return names;
+}
+
+}  // namespace
+
+void convert_weights_bf16(Weights& weights, const ModelConfig& cfg) {
+  const std::vector<std::string> names = replaced_weight_names(weights, cfg);
+  // Every tensor is checked before the first is replaced, so a checkpoint
+  // bf16 cannot hold is left exactly as it was.
   for (const std::string& name : names) {
+    bool exact = false;
+    try {
+      exact = bf16_exact(weights.get(name));
+    } catch (const std::invalid_argument& e) {
+      throw std::invalid_argument("convert_weights_bf16: tensor '" + name + "': " + e.what());
+    }
+    if (!exact) {
+      throw std::invalid_argument("convert_weights_bf16: tensor '" + name +
+                                  "' is not exact in bf16");
+    }
+  }
+  // Each replace() drops that tensor's F32 storage, so the weights never take
+  // more than the F32 checkpoint plus one BF16 tensor.
+  for (const std::string& name : names) weights.replace(name, convert_to_bf16(weights.get(name)));
+}
+
+void quantize_weights_q8_0(Weights& weights, const ModelConfig& cfg) {
+  for (const std::string& name : replaced_weight_names(weights, cfg)) {
     Tensor quantized;
     try {
       quantized = quantize_q8_0(weights.get(name));
@@ -264,8 +293,8 @@ void quantize_weights_q8_0(Weights& weights, const ModelConfig& cfg) {
 
 Model Model::from_dir(const std::filesystem::path& model_dir, std::int64_t max_seq_len,
                       DType weight_dtype) {
-  if (weight_dtype != DType::F32 && weight_dtype != DType::Q8_0) {
-    bad_argument("from_dir: weight_dtype must be f32 or q8_0, got " +
+  if (weight_dtype != DType::F32 && weight_dtype != DType::BF16 && weight_dtype != DType::Q8_0) {
+    bad_argument("from_dir: weight_dtype must be f32, bf16 or q8_0, got " +
                  std::string(dtype_name(weight_dtype)));
   }
   ModelConfig cfg = ModelConfig::from_json_file(model_dir / "config.json");
@@ -273,6 +302,7 @@ Model Model::from_dir(const std::filesystem::path& model_dir, std::int64_t max_s
   // A bad argument should not wait on reading the weights.
   checked_max_seq_len(cfg, max_seq_len);
   Weights weights = load_checkpoint(model_dir);
+  if (weight_dtype == DType::BF16) convert_weights_bf16(weights, cfg);
   if (weight_dtype == DType::Q8_0) quantize_weights_q8_0(weights, cfg);
   return Model(std::move(cfg), std::move(weights), max_seq_len);
 }

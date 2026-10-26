@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <exception>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,47 @@ void print_ids(const char* label, std::span<const std::int32_t> ids) {
   std::fprintf(stderr, "\n");
 }
 
+/// The weight format the model runs with, and for --weights auto, why: the
+/// banner's " (auto: ...)".
+struct WeightChoice {
+  minillm::DType format;
+  std::string why;
+};
+
+/// Converts the loaded F32 weights to the format --weights asks for. Unset
+/// (auto) tries bf16 and keeps f32 if any weight is not exact in bf16, which
+/// convert_weights_bf16 reports by throwing before it replaces anything.
+WeightChoice choose_weights(std::optional<minillm::DType> requested, minillm::Weights& weights,
+                            const minillm::ModelConfig& cfg) {
+  using namespace minillm;
+  if (!requested) {
+    try {
+      convert_weights_bf16(weights, cfg);
+      return {DType::BF16, " (auto: exact in bf16)"};
+    } catch (const std::invalid_argument& e) {
+      std::string_view reason = e.what();
+      if (reason.starts_with("convert_weights_bf16: ")) {
+        reason.remove_prefix(std::string_view("convert_weights_bf16: ").size());
+      }
+      return {DType::F32, " (auto: " + std::string(reason) + ")"};
+    } catch (const std::runtime_error&) {
+      // A missing tensor. Left f32, the Model constructor reports it as it
+      // would have without auto, with the shape it expects.
+      return {DType::F32, ""};
+    }
+  }
+  if (*requested == DType::BF16) {
+    try {
+      convert_weights_bf16(weights, cfg);
+    } catch (const std::invalid_argument& e) {
+      throw std::runtime_error(std::string("--weights bf16: ") + e.what() +
+                               "; --weights f32 or auto keeps the weights as stored");
+    }
+  }
+  if (*requested == DType::Q8_0) quantize_weights_q8_0(weights, cfg);
+  return {*requested, ""};
+}
+
 int run(const minillm::cli::Options& opts) {
   using namespace minillm;
 
@@ -83,9 +125,10 @@ int run(const minillm::cli::Options& opts) {
       opts.ignore_eos ? -1 : (cfg.eos_token_id >= 0 ? cfg.eos_token_id : tokenizer.eos_id());
 
   Weights weights = load_checkpoint(opts.model_dir);
-  // Each tensor's F32 storage is freed as soon as its Q8_0 copy replaces it,
-  // so quantizing raises the F32 load's peak by one Q8_0 tensor at most.
-  if (opts.weights == DType::Q8_0) quantize_weights_q8_0(weights, cfg);
+  // Each tensor's F32 storage is freed as soon as its BF16 or Q8_0 copy
+  // replaces it, so the weights never take more than the F32 checkpoint plus
+  // one converted tensor.
+  const auto [format, why] = choose_weights(opts.weights, weights, cfg);
   const std::size_t weight_bytes = weights.bytes();
   Model model(std::move(cfg), std::move(weights), n_prompt + opts.max_tokens);
   const ModelConfig& mc = model.config();
@@ -100,11 +143,11 @@ int run(const minillm::cli::Options& opts) {
           : std::to_string(threads) + " thread(s)";
   std::fprintf(stderr,
                "minillm: loaded %s (%s, %lld layers, hidden %lld, vocab %lld) in %.2f s; "
-               "%s weights, %.1f MB; %s\n",
+               "%s weights%s, %.1f MB; %s\n",
                opts.model_dir.string().c_str(), mc.model_type.c_str(),
                static_cast<long long>(mc.num_hidden_layers),
                static_cast<long long>(mc.hidden_size), static_cast<long long>(mc.vocab_size),
-               seconds_between(t_load, Clock::now()), dtype_name(opts.weights),
+               seconds_between(t_load, Clock::now()), dtype_name(format), why.c_str(),
                static_cast<double>(weight_bytes) / 1e6, thread_count.c_str());
   if (opts.print_ids) print_ids("prompt ids", prompt_ids);
 
