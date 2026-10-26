@@ -84,6 +84,18 @@ Tensor random_q8_0_table(std::int64_t rows, std::int64_t width, std::uint64_t se
   return t;
 }
 
+/// An owning BF16 [rows, width] table of uniformly random bit patterns:
+/// zeros, subnormals, infinities and NaNs (quiet and signalling) included.
+/// Embedding is exact, so the whole range is fair game.
+Tensor random_bf16_table(std::int64_t rows, std::int64_t width, std::uint64_t seed) {
+  Tensor t = Tensor::empty({rows, width}, DType::BF16);
+  std::mt19937_64 rng(seed);
+  std::uniform_int_distribution<int> bits(0, 0xffff);
+  std::uint16_t* p = t.data_as<std::uint16_t>();
+  for (std::int64_t i = 0; i < t.numel(); ++i) p[i] = static_cast<std::uint16_t>(bits(rng));
+  return t;
+}
+
 }  // namespace
 
 TEST_CASE("ops::rmsnorm agrees with ref::rmsnorm") {
@@ -609,7 +621,9 @@ TEST_CASE("ops:: kernels validate their arguments") {
                   std::invalid_argument);
   CHECK_THROWS_AS(ops::embedding(table, std::vector<std::int32_t>{0}, narrow),
                   std::invalid_argument);
-  CHECK_THROWS_AS(ops::embedding(Tensor::zeros({4, 5}, DType::BF16), std::vector<std::int32_t>{0},
+  // The table may also be Q8_0 or BF16, the weight formats (their cases are
+  // below), but no other dtype.
+  CHECK_THROWS_AS(ops::embedding(Tensor::zeros({4, 5}, DType::F16), std::vector<std::int32_t>{0},
                                  one),
                   std::invalid_argument);
 
@@ -727,4 +741,133 @@ TEST_CASE("ops::embedding with a Q8_0 table accepts zero-size inputs") {
 
   Tensor no_ids = Tensor::zeros({0, kHidden});
   ops::embedding(random_q8_0_table(4, kHidden, 143), std::span<const std::int32_t>{}, no_ids);
+}
+
+// ---------------------------------------------------------------------------
+// BF16 embedding tables (workflow 20). A row is widened, which is exact, so
+// the result must be bit for bit ref::embedding(convert_to_f32(table), ...),
+// NaN payloads included. The kernel widens 8 values at a time, then one.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ops::embedding with a BF16 table is bit for bit ref:: on convert_to_f32(table)") {
+  std::vector<std::int64_t> widths(std::begin(kAwkwardWidths), std::end(kAwkwardWidths));
+  for (const std::int64_t width : {std::int64_t{8}, std::int64_t{9}, std::int64_t{32}, kHidden}) {
+    widths.push_back(width);
+  }
+  for (const std::int64_t width : widths) {
+    const std::string at = " [50, " + std::to_string(width) + "]";
+    const Tensor table = random_bf16_table(50, width, 150);
+    const Tensor reference = convert_to_f32(table);
+
+    // The first and last rows, repeats (adjacent and not), and the rest at random.
+    std::vector<std::int32_t> ids{0, 49, 7, 7, 0, 49, 23};
+    for (const std::int32_t id : random_ids(25, 50, 151)) ids.push_back(id);
+
+    Tensor expected = Tensor::zeros({static_cast<std::int64_t>(ids.size()), width});
+    Tensor actual = nan_filled({static_cast<std::int64_t>(ids.size()), width});
+    ref::embedding(reference, ids, expected);
+    ops::embedding(table, ids, actual);
+    assert_identical(actual, expected, "ops::embedding bf16 vs ref" + at);
+  }
+
+  // The model's whole vocabulary, first and last ids included.
+  const Tensor table = random_bf16_table(kVocab, kHidden, 152);
+  std::vector<std::int32_t> ids{0, static_cast<std::int32_t>(kVocab - 1), 0};
+  for (const std::int32_t id : random_ids(13, static_cast<std::int32_t>(kVocab), 153)) {
+    ids.push_back(id);
+  }
+  Tensor expected = Tensor::zeros({static_cast<std::int64_t>(ids.size()), kHidden});
+  Tensor actual = nan_filled({static_cast<std::int64_t>(ids.size()), kHidden});
+  ref::embedding(convert_to_f32(table), ids, expected);
+  ops::embedding(table, ids, actual);
+  assert_identical(actual, expected, "ops::embedding bf16 vs ref, the model's table");
+}
+
+TEST_CASE("ops::embedding with a BF16 table widens every class of value exactly") {
+  // One row of named bit patterns, checked against the floats they stand for.
+  const std::uint16_t bits[] = {
+      0x0000,  // +0
+      0x8000,  // -0
+      0x0001,  // the smallest subnormal
+      0x807f,  // the largest negative subnormal
+      0x0080,  // the smallest normal
+      0x3f80,  // 1
+      0xbfc0,  // -1.5
+      0x7f7f,  // the largest finite
+      0x7f80,  // +inf
+      0xff80,  // -inf
+      0x7fc0,  // the quiet NaN
+      0x7f81,  // a signalling NaN
+      0xffff,  // a negative NaN with every payload bit set
+  };
+  constexpr std::int64_t kWidth = static_cast<std::int64_t>(std::size(bits));
+  Tensor table = Tensor::empty({1, kWidth}, DType::BF16);
+  std::memcpy(table.data(), bits, sizeof(bits));
+  Tensor actual = nan_filled({1, kWidth});
+  ops::embedding(table, std::vector<std::int32_t>{0}, actual);
+  for (std::int64_t j = 0; j < kWidth; ++j) {
+    std::uint32_t got;
+    std::memcpy(&got, actual.f32() + j, sizeof(got));
+    CHECK_MESSAGE(got == static_cast<std::uint32_t>(bits[j]) << 16, "element " << j);
+  }
+  CHECK(actual.f32()[5] == 1.0f);
+  CHECK(actual.f32()[6] == -1.5f);
+  CHECK(actual.f32()[7] == 0x1.fep+127f);  // (2 - 2^-7) * 2^127
+  CHECK(std::signbit(actual.f32()[1]));
+}
+
+TEST_CASE("ops::embedding with a BF16 table validates its arguments") {
+  const doctest::Contains names_op("ops::embedding");
+  const Tensor table = random_bf16_table(4, 64, 154);
+  Tensor one = Tensor::zeros({1, 64});
+
+  // Ids out of range throw std::out_of_range, before anything is written.
+  Tensor untouched = nan_filled({2, 64});
+  CHECK_THROWS_AS(ops::embedding(table, std::vector<std::int32_t>{0, 4}, untouched),
+                  std::out_of_range);
+  CHECK(std::isnan(untouched.f32()[0]));
+  CHECK_THROWS_AS(ops::embedding(table, std::vector<std::int32_t>{-1}, one), std::out_of_range);
+
+  // out must be [n_tokens, width], F32, contiguous.
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0, 1}, one), names_op,
+                       std::invalid_argument);
+  Tensor narrow = Tensor::zeros({1, 32});
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, narrow), names_op,
+                       std::invalid_argument);
+  Tensor out_bf16 = Tensor::zeros({1, 64}, DType::BF16);
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, out_bf16), names_op,
+                       std::invalid_argument);
+  Tensor out_q8 = Tensor::zeros({1, 64}, DType::Q8_0);
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, out_q8), names_op,
+                       std::invalid_argument);
+  Tensor out_view = Tensor::zeros({2, 128}).slice(1, 0, 64);
+  REQUIRE_FALSE(out_view.is_contiguous());
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0, 1}, out_view), names_op,
+                       std::invalid_argument);
+  Tensor out_rank1 = Tensor::zeros({64});
+  CHECK_THROWS_WITH_AS(ops::embedding(table, std::vector<std::int32_t>{0}, out_rank1), names_op,
+                       std::invalid_argument);
+
+  // The table must be a contiguous matrix. Unlike a Q8_0 one, a BF16 table
+  // can be sliced along its rows' width.
+  CHECK_THROWS_WITH_AS(ops::embedding(Tensor::zeros({64}, DType::BF16),
+                                      std::vector<std::int32_t>{0}, one),
+                       names_op, std::invalid_argument);
+  CHECK_THROWS_WITH_AS(ops::embedding(Tensor::zeros({4, 1, 64}, DType::BF16),
+                                      std::vector<std::int32_t>{0}, one),
+                       names_op, std::invalid_argument);
+  const Tensor table_view = random_bf16_table(4, 128, 155).slice(1, 0, 64);
+  REQUIRE_FALSE(table_view.is_contiguous());
+  CHECK_THROWS_WITH_AS(ops::embedding(table_view, std::vector<std::int32_t>{0}, one), names_op,
+                       std::invalid_argument);
+}
+
+TEST_CASE("ops::embedding with a BF16 table accepts zero-size inputs") {
+  // A wrap() of nullptr is a legal zero-width table; nothing may dereference it.
+  const Tensor null_table = Tensor::wrap(nullptr, {4, 0}, DType::BF16);
+  Tensor null_out = Tensor::wrap(nullptr, {1, 0});
+  ops::embedding(null_table, std::vector<std::int32_t>{3}, null_out);
+
+  Tensor no_ids = Tensor::zeros({0, kHidden});
+  ops::embedding(random_bf16_table(4, kHidden, 156), std::span<const std::int32_t>{}, no_ids);
 }
