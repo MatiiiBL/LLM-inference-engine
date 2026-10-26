@@ -11,7 +11,8 @@
 //   3. End to end: the real binary on the real checkpoint, greedy, against
 //      oracle/data/model/p{i}_greedy_ids.npy id for id (under TSan, the
 //      first kTsanTokens of them), and its streamed stdout against a
-//      one-call decode of the same ids.
+//      one-call decode of the same ids. One run with --weights q8_0 against
+//      oracle/data/model_q8_0/.
 //
 // This target links the tokenizer and the sampler but not the model (see
 // tests/CMakeLists.txt), so the forward pass is only ever reached through the
@@ -596,13 +597,21 @@ struct EndToEnd {
   RunResult stop_at_eos;            ///< kOraclePrompts[1] again, stopping at eos; not under TSan
   RunResult multibyte;              ///< kMultiBytePrompt
   RunResult threaded;               ///< kOraclePrompts[2] again, at threaded_count()
+  RunResult q8_0;                   ///< kQ8_0Prompt with --weights q8_0, --threads 1
 };
 
-/// What the end-to-end run of kOraclePrompts[i] must generate: the oracle's
-/// greedy ids, only the first kTsanTokens of them under TSan.
-std::vector<std::int32_t> expected_greedy_ids(std::size_t i) {
+/// The prompt of the --weights q8_0 run. Prompt 2 is the one whose Q8_0
+/// continuation leaves the fp32 one (at token 20, where fp32's top two logits
+/// are 0.11 apart), so outside TSan the ids also tell the two formats apart.
+constexpr std::size_t kQ8_0Prompt = 2;
+
+/// What the end-to-end run of kOraclePrompts[i] must generate: the greedy ids
+/// of the oracle `section` (model/ for f32, model_q8_0/ for --weights q8_0),
+/// only the first kTsanTokens of them under TSan.
+std::vector<std::int32_t> expected_greedy_ids(std::size_t i,
+                                              const std::string& section = "model") {
   std::vector<std::int32_t> ids =
-      oracle_npy("model/p" + std::to_string(i) + "_greedy_ids.npy").as_i32_narrowing();
+      oracle_npy(section + "/p" + std::to_string(i) + "_greedy_ids.npy").as_i32_narrowing();
   if (kTsan && ids.size() > kTsanTokens) ids.resize(kTsanTokens);
   return ids;
 }
@@ -645,14 +654,20 @@ const EndToEnd& end_to_end() {
                       " — build the minillm_cli target";
       return r;
     }
-    std::string missing;
+    std::vector<std::string> needed;
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) {
       for (const char* kind : {"input_ids", "greedy_ids"}) {
-        const std::string rel = "model/p" + std::to_string(i) + "_" + kind + ".npy";
-        if (oracle_has(rel)) continue;
-        if (!missing.empty()) missing += ", ";
-        missing += rel;
+        needed.push_back("model/p" + std::to_string(i) + "_" + kind + ".npy");
       }
+    }
+    for (const char* kind : {"input_ids", "greedy_ids"}) {
+      needed.push_back("model_q8_0/p" + std::to_string(kQ8_0Prompt) + "_" + kind + ".npy");
+    }
+    std::string missing;
+    for (const std::string& rel : needed) {
+      if (oracle_has(rel)) continue;
+      if (!missing.empty()) missing += ", ";
+      missing += rel;
     }
     if (!missing.empty()) {
       r.skip_reason = "missing oracle data: " + missing + " — run `python oracle/generate.py`";
@@ -676,16 +691,21 @@ const EndToEnd& end_to_end() {
     }
     if (!kTsan) batch.push_back(greedy_args(kOraclePrompts[1], n_tokens[1], false, 1));
     batch.push_back(greedy_args(kMultiBytePrompt, kMultiByteTokens, false, 1));
+    batch.push_back(greedy_args(kOraclePrompts[kQ8_0Prompt],
+                                expected_greedy_ids(kQ8_0Prompt, "model_q8_0").size(), true, 1));
+    batch.back().insert(batch.back().end(), {"--weights", "q8_0"});
     std::vector<RunResult> results = run_all(batch, kRunsAtOnce);
     for (std::size_t i = 0; i < kOraclePrompts.size(); ++i) r.oracle[i] = std::move(results[i]);
     if (!kTsan) r.stop_at_eos = std::move(results[3]);
+    r.q8_0 = std::move(results.back());
+    results.pop_back();
     r.multibyte = std::move(results.back());
     r.threaded = run_cli(greedy_args(kOraclePrompts[2], n_tokens[2], true, threaded_count()));
 
     // Until every module the binary uses is implemented, it stops at the
     // first stub it reaches and says so.
     for (const RunResult* run : {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos,
-                                 &r.multibyte, &r.threaded}) {
+                                 &r.multibyte, &r.threaded, &r.q8_0}) {
       if (run->exit_code != 0 && contains(run->err, "not implemented")) {
         r.skip_reason =
             "the engine is incomplete — " + line_containing(run->err, "not implemented");
@@ -718,7 +738,7 @@ struct FlagSpec {
   std::string_view name;
   bool takes_value;
 };
-constexpr std::array<FlagSpec, 12> kFlags = {{
+constexpr std::array<FlagSpec, 13> kFlags = {{
     {"--model", true},
     {"--prompt", true},
     {"--max-tokens", true},
@@ -728,6 +748,7 @@ constexpr std::array<FlagSpec, 12> kFlags = {{
     {"--repetition-penalty", true},
     {"--seed", true},
     {"--threads", true},
+    {"--weights", true},
     {"--ignore-eos", false},
     {"--print-ids", false},
     {"--help", false},
@@ -750,6 +771,7 @@ TEST_CASE("parse_args: defaults are the documented ones") {
   CHECK(o.sampling.repetition_penalty == 1.0f);
   CHECK(o.sampling.seed == 42u);
   CHECK(o.threads == 0);
+  CHECK(o.weights == DType::F32);
   CHECK_FALSE(o.ignore_eos);
   CHECK_FALSE(o.print_ids);
   CHECK_FALSE(o.help);
@@ -766,6 +788,7 @@ TEST_CASE("parse_args: every flag round-trips, as two arguments or as --flag=val
     CHECK(o.sampling.repetition_penalty == 1.3f);
     CHECK(o.sampling.seed == 18446744073709551615ull);
     CHECK(o.threads == 4);
+    CHECK(o.weights == DType::Q8_0);
     CHECK(o.ignore_eos);
     CHECK(o.print_ids);
     CHECK_FALSE(o.help);
@@ -773,8 +796,9 @@ TEST_CASE("parse_args: every flag round-trips, as two arguments or as --flag=val
   check_all(parse({"--model", "/m", "--prompt", "東京 = Tokyo", "--max-tokens", "7",
                    "--temperature", "0.7", "--top-k", "40", "--top-p", "0.9",
                    "--repetition-penalty", "1.3", "--seed", "18446744073709551615", "--threads",
-                   "4", "--ignore-eos", "--print-ids"}));
-  check_all(parse({"--print-ids", "--ignore-eos", "--threads=4", "--seed=18446744073709551615",
+                   "4", "--weights", "q8_0", "--ignore-eos", "--print-ids"}));
+  check_all(parse({"--print-ids", "--ignore-eos", "--weights=q8_0", "--threads=4",
+                   "--seed=18446744073709551615",
                    "--repetition-penalty=1.3", "--top-p=0.9", "--top-k=40", "--temperature=0.7",
                    "--max-tokens=7", "--prompt=東京 = Tokyo", "--model=/m"}));
 }
@@ -801,6 +825,8 @@ TEST_CASE("parse_args: a repeated flag keeps its last value") {
              "b"});
   CHECK(o.max_tokens == 2);
   CHECK(o.model_dir == fs::path("b"));
+  CHECK(parse({"--model", "m", "--prompt", "p", "--weights", "q8_0", "--weights", "f32"}).weights ==
+        DType::F32);
 }
 
 TEST_CASE("parse_args: an unknown flag is rejected by name") {
@@ -874,6 +900,10 @@ TEST_CASE("parse_args: malformed or out-of-range values name the flag and the va
       {"--threads", "-1", "an integer >= 0"},
       {"--threads", "4294967296", "an integer >= 0"},
       {"--threads", "many", "an integer >= 0"},
+      {"--weights", "q4_0", "f32 or q8_0"},
+      {"--weights", "Q8_0", "f32 or q8_0"},
+      {"--weights", "f16", "f32 or q8_0"},
+      {"--weights", "", "f32 or q8_0"},
   };
   for (const Bad& c : cases) {
     const std::string arg = std::string(c.flag) + "=" + std::string(c.value);
@@ -927,6 +957,7 @@ TEST_CASE("the usage text lists exactly the flags the parser accepts, with their
   const std::pair<std::string_view, std::string_view> defaults[] = {
       {"--max-tokens", "64"}, {"--temperature", "0"}, {"--top-k", "0"},  {"--top-p", "1"},
       {"--repetition-penalty", "1"}, {"--seed", "42"}, {"--threads", "0"},
+      {"--weights", "f32"},
   };
   for (const auto& [flag, value] : defaults) {
     const std::string line = line_containing(std::string(cli::kUsage), std::string(flag) + " ");
@@ -944,6 +975,13 @@ TEST_CASE("the usage text says what --threads does") {
   CHECK_FALSE(contains(line, "no effect"));
   CHECK_FALSE(contains(usage, "not used"));
   CHECK(contains(usage, "--threads 0 uses one thread per hardware thread"));
+}
+
+TEST_CASE("the usage text says what --weights does") {
+  const std::string usage(cli::kUsage);
+  CHECK(contains(line_containing(usage, "--weights "), "<f32|q8_0>"));
+  CHECK(contains(usage, "--weights q8_0 rounds the projections and the embedding to 8 bits"));
+  CHECK(contains(usage, "arithmetic stays f32"));
 }
 
 // ===========================================================================
@@ -1471,10 +1509,31 @@ TEST_CASE("end to end: --threads sizes the pool and leaves greedy output unchang
     const std::string threads = std::to_string(r.threads);
     CAPTURE(threads);
     // The load banner reports num_threads(), which only set_num_threads changes.
-    CHECK(contains(line_containing(r.run->err, "minillm: loaded "), "; " + threads + " thread(s)"));
+    const std::string banner = line_containing(r.run->err, "minillm: loaded ");
+    CHECK(contains(banner, "; " + threads + " thread(s)"));
+    // No --weights is f32, at SmolLM2-135M's 538 MB.
+    CHECK(contains(banner, "; f32 weights, 538.1 MB; "));
     assert_equal(generated_ids(*r.run), oracle, "prompt 2 greedy ids at --threads " + threads);
   }
   CHECK(e2e->threaded.out == e2e->oracle[2].out);
+}
+
+TEST_CASE("end to end: --weights q8_0 reproduces the Q8_0 oracle's tokens") {
+  const EndToEnd* e2e = e2e_or_skip();
+  if (!e2e) return;
+  const RunResult& run = e2e->q8_0;
+  // The banner names the format and what the weights now take: the seven
+  // projections and the embedding at 34 bytes per 32 values, the norms f32.
+  CHECK(contains(line_containing(run.err, "minillm: loaded "),
+                 "; q8_0 weights, 143.0 MB; 1 thread(s)"));
+  const std::optional<std::vector<std::int32_t>> prompt_ids = printed_ids(run.err, "prompt ids");
+  REQUIRE_MESSAGE(prompt_ids.has_value(), "no 'prompt ids:' line on stderr:\n" << run.err);
+  assert_equal(*prompt_ids,
+               oracle_npy("model_q8_0/p" + std::to_string(kQ8_0Prompt) + "_input_ids.npy")
+                   .as_i32_narrowing(),
+               "q8_0 input ids");
+  assert_equal(generated_ids(run), expected_greedy_ids(kQ8_0Prompt, "model_q8_0"),
+               "prompt " + std::to_string(kQ8_0Prompt) + " greedy ids with --weights q8_0");
 }
 
 // Not under TSan (see kTsanTokens): eos is 55 tokens into prompt 1, and stopping
@@ -1514,7 +1573,8 @@ TEST_CASE("end to end: streamed stdout is byte for byte a one-call decode of the
   std::vector<Named> runs = {{"prompt 0", &e2e->oracle[0]},
                              {"prompt 1", &e2e->oracle[1]},
                              {"prompt 2", &e2e->oracle[2]},
-                             {"multi-byte prompt", &e2e->multibyte}};
+                             {"multi-byte prompt", &e2e->multibyte},
+                             {"prompt 2 with --weights q8_0", &e2e->q8_0}};
   if (!kTsan) runs.push_back({"prompt 1 to eos", &e2e->stop_at_eos});
   for (const Named& n : runs) {
     CAPTURE(n.name);

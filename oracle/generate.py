@@ -123,6 +123,15 @@ class Writer:
             {"file": rel, "shape": None, "dtype": "json", "description": description}
         )
 
+    def text(self, rel: str, lines: list[str], description: str) -> None:
+        """A plain text file, one entry per line, for tests that cannot parse JSON."""
+        path = self.out_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(line + "\n" for line in lines), encoding="utf-8")
+        self.entries.append(
+            {"file": rel, "shape": None, "dtype": "text", "description": description}
+        )
+
     def finish(self, header: dict[str, Any]) -> None:
         manifest = dict(header)
         manifest["entries"] = sorted(self.entries, key=lambda e: e["file"])
@@ -723,8 +732,22 @@ def gen_attention(w: Writer, model: Any, cfg: Any, tokenizer: Any, rot: Any) -> 
 # --------------------------------------------------------------------------
 
 
-def gen_model(w: Writer, model: Any, cfg: Any, tokenizer: Any, n_generate: int = 64) -> None:
-    print("model/")
+def gen_model(
+    w: Writer,
+    model: Any,
+    cfg: Any,
+    tokenizer: Any,
+    section: str = "model",
+    weights_note: str = "",
+    n_generate: int = 64,
+) -> None:
+    """Writes <section>/: every hidden state, the logits and greedy ids per prompt.
+
+    `section` "model" is the checkpoint as is; gen_model_q8_0 calls this again
+    with "model_q8_0" after rounding the weights, so both sections are written
+    by exactly the same code.
+    """
+    print(f"{section}/")
     prompt_records = []
 
     for i, prompt in enumerate(PROMPTS):
@@ -739,14 +762,18 @@ def gen_model(w: Writer, model: Any, cfg: Any, tokenizer: Any, n_generate: int =
             f"expected {cfg.num_hidden_layers + 1} hidden states, got {len(hidden_states)}"
         )
 
-        w.array(f"model/p{i}_input_ids.npy", np.asarray(ids, dtype=np.int64), f"prompt {i} ids")
+        w.array(f"{section}/p{i}_input_ids.npy", np.asarray(ids, dtype=np.int64), f"prompt {i} ids")
         for j, h in enumerate(hidden_states):
             if j < cfg.num_hidden_layers:
                 what = f"input to decoder layer {j}" + (" (embedding output)" if j == 0 else "")
             else:
                 what = "after the final norm"
-            w.array(f"model/p{i}_hidden_{j}.npy", h.squeeze(0), f"prompt {i}: {what}")
-        w.array(f"model/p{i}_logits.npy", out.logits.squeeze(0), f"prompt {i}: logits [n, vocab]")
+            w.array(f"{section}/p{i}_hidden_{j}.npy", h.squeeze(0), f"prompt {i}: {what}{weights_note}")
+        w.array(
+            f"{section}/p{i}_logits.npy",
+            out.logits.squeeze(0),
+            f"prompt {i}: logits [n, vocab]{weights_note}",
+        )
 
         # Greedy continuation, one token at a time with the KV cache, exactly
         # what the engine does. argmax over the last position's logits.
@@ -767,9 +794,9 @@ def gen_model(w: Writer, model: Any, cfg: Any, tokenizer: Any, n_generate: int =
                 generated.append(next_id)
 
         w.array(
-            f"model/p{i}_greedy_ids.npy",
+            f"{section}/p{i}_greedy_ids.npy",
             np.asarray(generated, dtype=np.int64),
-            f"prompt {i}: {n_generate} greedy tokens (argmax, KV cache, no sampling)",
+            f"prompt {i}: {n_generate} greedy tokens (argmax, KV cache, no sampling){weights_note}",
         )
         prompt_records.append(
             {
@@ -785,19 +812,162 @@ def gen_model(w: Writer, model: Any, cfg: Any, tokenizer: Any, n_generate: int =
         print(f"  prompt {i}: {len(ids)} tokens, {len(hidden_states)} hidden states")
 
     w.json(
-        "model/prompts.json",
+        f"{section}/prompts.json",
         {
             "note": (
                 "hidden_{j} indices match transformers' output_hidden_states: "
                 "j in [0, num_hidden_layers) is the INPUT to decoder layer j "
                 "(j = 0 is the embedding output) and j = num_hidden_layers is "
                 "the post-final-norm hidden state."
+                + (f" Weights:{weights_note}." if weights_note else "")
             ),
             "n_generate": n_generate,
             "prompts": prompt_records,
         },
-        "prompt texts, ids and greedy continuations",
+        "prompt texts, ids and greedy continuations" + weights_note,
     )
+
+
+# --------------------------------------------------------------------------
+# model_q8_0/: the same, on Q8_0-rounded weights
+# --------------------------------------------------------------------------
+
+Q8_0_BLOCK = 32
+
+# One block as include/minillm/tensor.h lays out BlockQ8_0: the f16 scale's
+# bits, little-endian, then 32 int8 values. 34 bytes, no padding.
+BLOCK_Q8_0 = np.dtype([("d", "<u2"), ("qs", "i1", (Q8_0_BLOCK,))])
+assert BLOCK_Q8_0.itemsize == 34
+
+
+def quantize_q8_0(x: np.ndarray) -> np.ndarray:
+    """src/loader/quantize.cpp's quantize_q8_0, byte for byte.
+
+    loader.h specifies the quantizer as five float32 roundings per block of 32
+    values x, and this repeats each one as a single float32 numpy operation
+    (numpy rounds every float32 op exactly, as IEEE-754 asks):
+
+      1. amax / 127          float32 division
+      2. to f16              astype(float16): nearest, ties to even
+      3. 1 / d               float32 division (f16 -> f32 is exact)
+      4. x * (1 / d)         float32 multiply
+      5. round               halves away from zero, built from trunc
+
+    Step 5 is where float32 code usually goes wrong: numpy's round is half to
+    even, and floor(|v| + 0.5) rounds 0.49999997 up, because the addition
+    itself rounds to 1.0. trunc(v) and v - trunc(v) are both exact, so the
+    comparison with 0.5 sees the true fraction.
+
+    A block whose scale rounds to 0 in f16 is all zeros; a non-finite value or
+    a scale that overflows f16 raises, as in C++. Returns BLOCK_Q8_0 records,
+    one per block, in row-major order.
+    """
+    if x.dtype != np.float32 or x.ndim == 0 or x.shape[-1] % Q8_0_BLOCK != 0:
+        raise ValueError(f"quantize_q8_0: cannot quantize {x.dtype}{list(x.shape)}")
+    b = np.ascontiguousarray(x).reshape(-1, Q8_0_BLOCK)
+    if not np.isfinite(b).all():
+        raise ValueError("quantize_q8_0: only finite values can be quantized")
+    amax = np.abs(b).max(axis=1)
+    with np.errstate(over="ignore"):
+        d16 = (amax / np.float32(127.0)).astype(np.float16)
+    if np.isinf(d16).any():
+        raise ValueError("quantize_q8_0: amax / 127 overflows the f16 scale")
+    d = d16.astype(np.float32)
+    zero = d == 0
+    inv = np.float32(1.0) / np.where(zero, np.float32(1.0), d)
+    inv[zero] = 0  # every value of the block quantizes to 0
+    v = b * inv[:, None]
+    t = np.trunc(v)
+    q = t + np.sign(v) * (np.abs(v - t) >= np.float32(0.5)).astype(np.float32)
+    q = np.clip(q, np.float32(-127.0), np.float32(127.0))
+
+    blocks = np.empty(b.shape[0], dtype=BLOCK_Q8_0)
+    blocks["d"] = d16.view(np.uint16)
+    blocks["qs"] = q.astype(np.int8)
+    return blocks
+
+
+def dequantize_q8_0(blocks: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    """convert_to_f32 of a Q8_0 tensor: q * d in float32, which is exact."""
+    d = blocks["d"].view(np.float16).astype(np.float32)
+    return (blocks["qs"].astype(np.float32) * d[:, None]).reshape(shape)
+
+
+def q8_0_weight_names(cfg: Any) -> list[str]:
+    """What quantize_weights_q8_0 (include/minillm/model.h) replaces: the seven
+    projections of every layer and the embedding, plus lm_head when untied."""
+    names = ["model.embed_tokens.weight"]
+    for i in range(cfg.num_hidden_layers):
+        names += [
+            f"model.layers.{i}.self_attn.{p}_proj.weight" for p in ("q", "k", "v", "o")
+        ] + [f"model.layers.{i}.mlp.{p}_proj.weight" for p in ("gate", "up", "down")]
+    if not cfg.tie_word_embeddings:
+        names.append("lm_head.weight")
+    return names
+
+
+def gen_model_q8_0(w: Writer, model: Any, cfg: Any, tokenizer: Any) -> dict[str, Any]:
+    """Rounds the model's weights to Q8_0 IN PLACE, then writes model_q8_0/.
+
+    Every tensor quantize_weights_q8_0 replaces becomes dequantize(quantize(W)),
+    so the model is the F32 matrix a Q8_0 weight stands for (ops.h), and
+    torch's forward pass on it is the golden data for the engine's Q8_0 path.
+    The tied embedding is rounded once, so the lookup and lm_head both see the
+    rounded table, as in the engine. Call this last: the model stays rounded.
+
+    model_q8_0/blocks.sha256 lists the SHA-256 of each tensor's blocks, in
+    sha256sum's format, so tests/model can check that the C++ quantizer writes
+    these exact bytes for the whole checkpoint. Returns the summary for the
+    manifest.
+    """
+    import hashlib
+
+    print("model_q8_0/ (quantizing the weights in place)")
+    if cfg.tie_word_embeddings and (
+        model.lm_head.weight.data_ptr() != model.model.embed_tokens.weight.data_ptr()
+    ):
+        raise RuntimeError("tie_word_embeddings is set, but lm_head does not share embed_tokens")
+
+    digests: dict[str, str] = {}
+    everything = hashlib.sha256()
+    n_blocks = 0
+    with torch.no_grad():
+        for name in q8_0_weight_names(cfg):
+            param = model.get_parameter(name)
+            x = param.detach().cpu().numpy()
+            blocks = quantize_q8_0(x)
+            digests[name] = hashlib.sha256(blocks.tobytes()).hexdigest()
+            n_blocks += blocks.shape[0]
+            param.copy_(torch.from_numpy(dequantize_q8_0(blocks, x.shape)))
+    for name in sorted(digests):
+        everything.update(bytes.fromhex(digests[name]))
+
+    w.text(
+        "model_q8_0/blocks.sha256",
+        [f"{digests[name]}  {name}" for name in sorted(digests)],
+        "sha256 of each Q8_0 tensor's blocks (34 bytes each: f16 scale little-endian, "
+        "then 32 int8), as quantize_q8_0 writes them, in sha256sum format",
+    )
+    print(f"  {len(digests)} tensors, {n_blocks} blocks")
+
+    gen_model(
+        w,
+        model,
+        cfg,
+        tokenizer,
+        section="model_q8_0",
+        weights_note=" (Q8_0 weights: dequantize(quantize_q8_0(W)) for every tensor in blocks.sha256)",
+    )
+    return {
+        "tensors": len(digests),
+        "blocks": n_blocks,
+        "sha256_of_tensor_digests": everything.hexdigest(),
+        "note": (
+            "model_q8_0/ is model/ with dequantize(quantize_q8_0(W)) for the tensors in "
+            "model_q8_0/blocks.sha256; sha256_of_tensor_digests hashes their digests "
+            "(raw 32-byte values) in sorted name order"
+        ),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -869,11 +1039,19 @@ def main(argv: Iterable[str] | None = None) -> int:
     gen_weights(w, model_dir, cfg)
     gen_attention(w, model, cfg, tokenizer, rot)
     gen_model(w, model, cfg, tokenizer)
+    # Last: it rounds the model's weights in place.
+    q8_0 = gen_model_q8_0(w, model, cfg, tokenizer)
 
     w.finish(
         {
             "model_id": args.model_id,
-            "model_dir": str(model_dir.relative_to(REPO_ROOT)),
+            # Absolute when --models-dir is outside the repo (a worktree
+            # reading the main checkout's models/).
+            "model_dir": str(
+                model_dir.resolve().relative_to(REPO_ROOT)
+                if model_dir.resolve().is_relative_to(REPO_ROOT)
+                else model_dir.resolve()
+            ),
             "generated_with": {
                 "python": platform.python_version(),
                 "torch": torch.__version__,
@@ -903,6 +1081,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "gqa": "query head h uses kv head h // (n_heads // n_kv_heads)",
                 "compute_dtype": "float32",
             },
+            "q8_0": q8_0,
         }
     )
     print(f"done: {args.out_dir}")
