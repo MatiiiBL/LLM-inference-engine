@@ -22,6 +22,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -99,11 +100,15 @@ int settled_thread_count() {
   return last;
 }
 
-/// What n <= 0 resolves to, worked out independently of the pool: the
-/// hardware threads of the performance cores where the OS reports them
-/// (Apple silicon's hw.perflevel0), otherwise std::thread::hardware_concurrency().
-int expected_default_threads() {
-  const int all = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+/// What set_num_threads resolves n <= 0 to: every hardware thread.
+int hardware_threads() { return static_cast<int>(std::max(1u, std::thread::hardware_concurrency())); }
+
+/// What ThreadPool resolves n <= 0 to, and the most threads a kernel call
+/// without a large work size runs on, worked out independently of the pool:
+/// the hardware threads of the performance cores where the OS reports them
+/// (Apple silicon's hw.perflevel0), otherwise hardware_threads().
+int expected_performance_threads() {
+  const int all = hardware_threads();
 #if defined(__APPLE__)
   int fast = 0;
   std::size_t size = sizeof fast;
@@ -182,10 +187,32 @@ Cover check_cover(ThreadPool& pool, Index n, Index grain) {
       pool.size(), n, grain);
 }
 
-/// check_cover for kernel_parallel_for at the current num_threads().
-Cover check_kernel_cover(Index n, Index grain) {
-  return check_cover(kernel_parallel_for, num_threads(), n, grain);
+/// kernel_parallel_for with `work`, or without a work size for nullopt.
+void kernel_call(Index n, Index grain, std::optional<Index> work, const Body& body) {
+  if (work) {
+    kernel_parallel_for(n, grain, *work, body);
+  } else {
+    kernel_parallel_for(n, grain, body);
+  }
 }
+
+/// check_cover for kernel_parallel_for with `work`, or without a work size,
+/// allowed to run on `size` threads.
+Cover check_kernel_cover(Index n, Index grain, std::optional<Index> work, int size) {
+  return check_cover(
+      [&](Index n_, Index grain_, const Body& body) { kernel_call(n_, grain_, work, body); },
+      size, n, grain);
+}
+
+/// check_kernel_cover without a work size, on up to num_threads() threads.
+Cover check_kernel_cover(Index n, Index grain) {
+  return check_kernel_cover(n, grain, std::nullopt, num_threads());
+}
+
+/// Work sizes, in multiply-adds, on either side of wherever the pool puts
+/// the line between a small call and a large one.
+constexpr Index kSmallWork = 1;
+constexpr Index kLargeWork = Index{1} << 50;
 
 /// Sets the kernel thread count for one test and restores it afterwards,
 /// pass or fail.
@@ -212,7 +239,7 @@ constexpr int kThreadCounts[] = {1, 2, 3, 4, 10};
 // ---------------------------------------------------------------------------
 
 TEST_CASE("ThreadPool size counts the calling thread") {
-  const int def = expected_default_threads();
+  const int def = expected_performance_threads();
   CHECK(ThreadPool(1).size() == 1);
   CHECK(ThreadPool(2).size() == 2);
   CHECK(ThreadPool(5).size() == 5);
@@ -222,8 +249,8 @@ TEST_CASE("ThreadPool size counts the calling thread") {
 }
 
 TEST_CASE("the default thread count is the performance cores, or every hardware thread") {
-  const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
-  const int def = expected_default_threads();
+  const int hw = hardware_threads();
+  const int def = expected_performance_threads();
   MESSAGE("default thread count " << def << " of " << hw << " hardware threads");
   CHECK(def >= 1);
   CHECK(def <= hw);
@@ -661,13 +688,21 @@ TEST_CASE("an idle pool burns no CPU") {
     CHECK(cpu < allowed);
   }
 
-  KernelThreads guard(4);
-  const auto cpu = cpu_during_idle([&] {
-    for (int call = 0; call < 200; ++call) kernel_parallel_for(1000, 1, touch);
-  });
-  const double cpu_ms = std::chrono::duration<double, std::milli>(cpu).count();
-  CAPTURE(cpu_ms);
-  CHECK(cpu < allowed);
+  // The kernel pool at 4 threads, and at its default, every hardware thread,
+  // after calls that use them all and calls that use the performance cores.
+  for (const int threads : {4, 0}) {
+    CAPTURE(threads);
+    KernelThreads guard(threads);
+    const auto cpu = cpu_during_idle([&] {
+      for (int call = 0; call < 200; ++call) {
+        kernel_parallel_for(1000, 1, touch);
+        kernel_parallel_for(1000, 1, kLargeWork, touch);
+      }
+    });
+    const double cpu_ms = std::chrono::duration<double, std::milli>(cpu).count();
+    CAPTURE(cpu_ms);
+    CHECK(cpu < allowed);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -948,8 +983,8 @@ TEST_CASE("arena scratch can be filled by a thread pool") {
 // kernel_parallel_for and the process-wide pool
 // ---------------------------------------------------------------------------
 
-TEST_CASE("set_num_threads resolves n <= 0 to the default, and num_threads reports it") {
-  const int def = expected_default_threads();
+TEST_CASE("set_num_threads resolves n <= 0 to every hardware thread, and num_threads reports it") {
+  const int def = hardware_threads();
   KernelThreads guard(3);
   CHECK(num_threads() == 3);
   set_num_threads(0);
@@ -978,6 +1013,116 @@ TEST_CASE("kernel_parallel_for covers [0, n) exactly once at every thread count"
         }
       }
     }
+  }
+}
+
+TEST_CASE("kernel_parallel_for with a work size covers [0, n) exactly once at every thread count") {
+  const std::thread::id caller = std::this_thread::get_id();
+  for (const int threads : kThreadCounts) {
+    KernelThreads guard(threads);
+    for (const Index work : {Index{-5}, Index{0}, kSmallWork, kLargeWork}) {
+      CAPTURE(work);
+      for (const Index n : {1, 2, 7, 100, 1000, 49152}) {
+        for (const Index grain : {1, 3, 64}) {
+          const Cover cover = check_kernel_cover(n, grain, work, threads);
+          if (threads == 1 || n / grain <= 1) {
+            CHECK(cover.chunks == 1);
+            CHECK(cover.threads == std::set<std::thread::id>{caller});
+          } else {
+            CHECK(cover.chunks > 1);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_CASE("a work size <= 0 splits a call exactly as no work size does") {
+  // runtime.h: "`work` <= 0 means unknown, as in the call without it". The
+  // chunks are a pure function of the call, so the same chunks means the
+  // same call.
+  const auto chunk_ends = [](Index n, Index grain, std::optional<Index> work) {
+    std::vector<Index> ends(static_cast<std::size_t>(n), -1);  // by first index
+    kernel_call(n, grain, work, [&](Index begin, Index end) {
+      ends[static_cast<std::size_t>(begin)] = end;
+    });
+    return ends;
+  };
+  for (const int threads : kThreadCounts) {
+    CAPTURE(threads);
+    KernelThreads guard(threads);
+    for (const Index n : {2, 100, 49152}) {
+      for (const Index grain : {1, 3}) {
+        CAPTURE(n);
+        CAPTURE(grain);
+        const std::vector<Index> blind = chunk_ends(n, grain, std::nullopt);
+        CHECK(chunk_ends(n, grain, 0) == blind);
+        CHECK(chunk_ends(n, grain, -1) == blind);
+        CHECK(chunk_ends(n, grain, std::numeric_limits<Index>::min()) == blind);
+      }
+    }
+  }
+}
+
+TEST_CASE("a call without a large work size runs on at most the performance cores' threads") {
+  // Where cores differ, only a large call may use the efficiency cores'
+  // threads too. A worker woken late for a large call must not help with
+  // the call after it either. So each round lets the workers fall asleep,
+  // makes a large call that ends somewhere in the time they take to wake,
+  // and then, at once, a small call long enough for a late one to turn up.
+  using clock = std::chrono::steady_clock;
+  const auto busy_wait = [](std::chrono::nanoseconds ns) {
+    const auto until = clock::now() + ns;
+    while (clock::now() < until) {
+    }
+  };
+  // Where every core is a performance core there is no limit to check.
+  const int fast = expected_performance_threads() < hardware_threads()
+                       ? expected_performance_threads()
+                       : std::numeric_limits<int>::max();
+  for (const int threads : kThreadCounts) {
+    CAPTURE(threads);
+    KernelThreads guard(threads);
+    const int cap = std::min(num_threads(), fast);
+    // Where nothing is capped there is nothing a late worker could break.
+    const int rounds = cap < num_threads() ? 300 : 3;
+    for (int round = 0; round < rounds; ++round) {
+      std::this_thread::sleep_for(std::chrono::microseconds(200));  // past the spin
+      const auto chunk_time = std::chrono::microseconds(round % 60);
+      kernel_parallel_for(num_threads(), 1, kLargeWork, [&](Index, Index) { busy_wait(chunk_time); });
+      const std::optional<Index> work = round % 3 == 0   ? std::optional<Index>{}
+                                        : round % 3 == 1 ? std::optional<Index>{0}
+                                                         : std::optional<Index>{kSmallWork};
+      check_cover(
+          [&](Index n, Index grain, const Body& body) {
+            kernel_call(n, grain, work, [&](Index begin, Index end) {
+              busy_wait(std::chrono::nanoseconds(100) * (end - begin));
+              body(begin, end);
+            });
+          },
+          cap, 4096, 16);
+    }
+  }
+}
+
+TEST_CASE("a call with a large work size can run on every thread") {
+  // Every item waits until all of them have started. That can only finish if
+  // num_threads() chunks really are in flight at once, one on each thread.
+  using clock = std::chrono::steady_clock;
+  for (const int threads : {2, 3, 10}) {
+    CAPTURE(threads);
+    KernelThreads guard(threads);
+    std::atomic<int> arrived{0};
+    std::vector<char> met(static_cast<std::size_t>(threads), 0);
+    kernel_parallel_for(threads, 1, kLargeWork, [&](Index begin, Index end) {
+      for (Index i = begin; i < end; ++i) {
+        arrived.fetch_add(1);
+        const auto deadline = clock::now() + std::chrono::seconds(10);
+        while (arrived.load() < threads && clock::now() < deadline) std::this_thread::yield();
+        met[static_cast<std::size_t>(i)] = arrived.load() >= threads;
+      }
+    });
+    CHECK(std::count(met.begin(), met.end(), 1) == threads);
   }
 }
 

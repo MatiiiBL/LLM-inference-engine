@@ -171,7 +171,7 @@ runs it with:
 | `ops::`, `ref::` | median time per call over the samples (5 by default) |
 | `+/-` | half the spread of the samples: (max − min) / 2 / median |
 | `calls` | samples × calls per sample; fast ops are batched so each sample lasts ≥ 50 ms |
-| `thr` | the kernel thread count `ops::` ran with (`--threads`; `0`, the default, resolves to the performance cores on Apple silicon and to every hardware thread elsewhere) |
+| `thr` | the kernel thread count `ops::` ran with (`--threads`; `0`, the default, resolves to every hardware thread; on Apple silicon only calls big enough to gain from the efficiency cores use more than the performance cores' threads) |
 | `speedup` | `ref::` / `ops::`, measured on interleaved pairs of samples, median over the pairs; > 1 means `ops::` is faster |
 | `scaling` | with several `--threads` counts: `ops::` at the first count / `ops::` at `thr`, over the same interleaved samples |
 

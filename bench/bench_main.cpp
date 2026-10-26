@@ -12,7 +12,8 @@
 //     ceiling
 //   * prefill and decode tokens/s for the whole model
 //   * peak resident memory
-//   * what one kernel_parallel_for costs the thread pool, hot and cold
+//   * what one kernel_parallel_for costs the thread pool, hot and cold, and
+//     with a work size large enough to use every thread
 // each at one or more kernel thread counts (--threads), so the scaling of the
 // threaded kernels is measured the same way as their speedup over ref::.
 //
@@ -27,6 +28,9 @@
 // implemented yet, 1 on any error, 2 when the model directory is missing.
 
 #include <sys/resource.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -1023,13 +1027,16 @@ int run_model_benches(const Options& opt, Report& report) {
 /// The pool's own cost per kernel_parallel_for, at each thread count: handing
 /// out the job, waking workers, and waiting for the last chunk. The body does
 /// next to nothing, so that is all there is to time. `hot` calls back to back,
-/// as a forward pass does about 240 times per decode step; `cold` calls once
-/// the workers have gone to sleep, as the first call after a pause does.
+/// as a forward pass does about 240 times per decode step; `large` is the
+/// same with a work size that lets the call use every thread, as a prefill
+/// matmul does; `cold` calls once the workers have gone to sleep, as the
+/// first call after a pause does.
 /// Returns how many benchmarks matched the filter.
 int run_runtime_benches(const Options& opt, Report& report) {
   const bool want_hot = selected(opt, "runtime.parallel_for.hot");
+  const bool want_large = selected(opt, "runtime.parallel_for.large");
   const bool want_cold = selected(opt, "runtime.parallel_for.cold");
-  if (!want_hot && !want_cold) return 0;
+  if (!want_hot && !want_large && !want_cold) return 0;
 
   // Enough items for several chunks on every thread.
   constexpr std::int64_t kItems = 1024;
@@ -1042,6 +1049,11 @@ int run_runtime_benches(const Options& opt, Report& report) {
   };
   const auto call = [&] {
     kernel_parallel_for(kItems, 1, std::ref(body));
+    keep_alive(sink.data());
+  };
+  // The same call saying it is far too large for the performance cores alone.
+  const auto large_call = [&] {
+    kernel_parallel_for(kItems, 1, std::int64_t{1} << 40, std::ref(body));
     keep_alive(sink.data());
   };
 
@@ -1058,16 +1070,16 @@ int run_runtime_benches(const Options& opt, Report& report) {
   };
 
   int matched = 0;
-  if (want_hot) {
+  const auto hot = [&](const std::string& name, const std::function<void()>& fn) {
     ++matched;
     std::vector<Contender> contenders;
-    for (const int threads : opt.threads) contenders.push_back({use_threads(threads), call});
+    for (const int threads : opt.threads) contenders.push_back({use_threads(threads), fn});
     Rounds rounds;
     const std::vector<Timing> t = time_round_robin(contenders, opt, rounds);
-    for (std::size_t i = 0; i < t.size(); ++i) {
-      row("runtime.parallel_for.hot", opt.threads[i], t[i]);
-    }
-  }
+    for (std::size_t i = 0; i < t.size(); ++i) row(name, opt.threads[i], t[i]);
+  };
+  if (want_hot) hot("runtime.parallel_for.hot", call);
+  if (want_large) hot("runtime.parallel_for.large", large_call);
   if (want_cold) {
     ++matched;
     // Each sample is the median of kColdCalls single calls, each made after
@@ -1096,6 +1108,35 @@ int run_runtime_benches(const Options& opt, Report& report) {
 
 // ---------------------------------------------------------------------------
 
+/// What the kernel pool's default resolves to on this machine, and the core
+/// types the OS reports, for reading results from other machines (CI's).
+std::string describe_pool() {
+  const int hw = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
+  // ThreadPool's default is the performance cores' hardware threads, which
+  // is also the most a kernel call below the large-work size uses.
+  const int fast = ThreadPool().size();
+  std::string types = "no core types reported";
+#if defined(__APPLE__)
+  int levels = 0;
+  std::size_t size = sizeof levels;
+  if (sysctlbyname("hw.nperflevels", &levels, &size, nullptr, 0) == 0) {
+    types = "hw.nperflevels " + std::to_string(levels) + ", " + std::to_string(fast) + " of " +
+            std::to_string(hw) + " hardware threads in the fastest";
+  }
+#endif
+  const int saved = num_threads();
+  set_num_threads(0);
+  const int def = num_threads();
+  set_num_threads(saved);
+  std::string s = "--threads 0 resolves to " + std::to_string(def) + "; ";
+  if (fast < hw) {
+    s += "calls below the large-work size use at most " + std::to_string(fast);
+  } else {
+    s += "every call may use them all";
+  }
+  return s + " (" + types + ")";
+}
+
 int run(const Options& opt) {
   const ModelConfig cfg = ModelConfig::from_json_file(opt.model_dir / "config.json");
 
@@ -1107,6 +1148,7 @@ int run(const Options& opt) {
     counts += (counts.empty() ? "" : ", ") + std::to_string(threads);
   }
   std::printf("threads kernels run on %s thread(s) (--threads)\n", counts.c_str());
+  std::printf("pool    %s\n", describe_pool().c_str());
   std::printf("model   %s: %lld layers, hidden %lld, mlp %lld, heads %lld/%lld x %lld, vocab %lld\n",
               opt.model_dir.string().c_str(), static_cast<long long>(cfg.num_hidden_layers),
               static_cast<long long>(cfg.hidden_size), static_cast<long long>(cfg.intermediate_size),

@@ -68,9 +68,10 @@ inline constexpr std::string_view kUsage =
     "\n"
     "The continuation is streamed to stdout; everything else goes to stderr.\n"
     "Any flag that takes a value also accepts --flag=value.\n"
-    "--threads 0 uses one thread per hardware thread of the performance cores, or\n"
-    "of every core where all cores are alike. The output is the same at any\n"
-    "--threads; only the speed changes.\n"
+    "--threads 0 uses one thread per hardware thread. Where cores differ (Apple\n"
+    "silicon), only work big enough to gain from the efficiency cores, such as a\n"
+    "long prompt, uses more threads than the performance cores have. The output\n"
+    "is the same at any --threads; only the speed changes.\n"
     "--weights q8_0 rounds the projections and the embedding to 8 bits at load\n"
     "(143 MB instead of 538 MB for SmolLM2-135M); arithmetic stays f32.\n";
 

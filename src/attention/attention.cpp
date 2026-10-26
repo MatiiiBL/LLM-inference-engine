@@ -394,7 +394,7 @@ void attention(const Tensor& q, const Tensor& k_cache, const Tensor& v_cache,
   const std::int64_t unit_macs =
       std::max<std::int64_t>(1, 2 * group * head_dim * (start_pos + (n_tokens + 1) / 2));
   kernel_parallel_for(n_tokens * n_kv_heads, (kMinChunkMacs + unit_macs - 1) / unit_macs,
-                      std::ref(run));
+                      unit_macs * n_tokens * n_kv_heads, std::ref(run));
 }
 
 }  // namespace minillm::ops
