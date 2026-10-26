@@ -20,6 +20,16 @@
 
 namespace minillm {
 
+/// Replaces, in place, the tensors quantize_weights_q8_0 replaces (below)
+/// with convert_to_bf16 copies; norm weights stay F32. Lossless by contract:
+/// if any of those tensors holds a value bf16 cannot represent (bf16_exact is
+/// false, as for an F32-stored checkpoint), it throws std::invalid_argument
+/// naming the first such tensor before replacing anything, so a BF16 model
+/// computes exactly the matrices the F32 one does. Each F32 tensor is freed
+/// as soon as its BF16 copy replaces it. Throws std::runtime_error if a
+/// required tensor is missing.
+void convert_weights_bf16(Weights& weights, const ModelConfig& cfg);
+
 /// Replaces, in place, the seven projections of every layer (q, k, v, o,
 /// gate, up, down) and model.embed_tokens.weight with quantize_q8_0 copies;
 /// lm_head.weight too when it is present (untied). With tied embeddings the
@@ -45,8 +55,9 @@ class Model {
   /// pass itself can assume consistency.
   ///
   /// The projections and the embedding (and an untied lm_head) may each be
-  /// F32 or Q8_0, as quantize_weights_q8_0 leaves them; every other tensor
-  /// must be F32. A tensor of any other dtype is a std::runtime_error.
+  /// F32, BF16 or Q8_0, as convert_weights_bf16 and quantize_weights_q8_0
+  /// leave them; every other tensor must be F32. A tensor of any other dtype
+  /// is a std::runtime_error.
   Model(ModelConfig cfg, Weights weights, std::int64_t max_seq_len);
   ~Model();
 
@@ -56,9 +67,10 @@ class Model {
   Model& operator=(const Model&) = delete;
 
   /// Loads config.json + the safetensors checkpoint from a model directory.
-  /// `weight_dtype` F32 (the default) keeps the weights as loaded; Q8_0 runs
-  /// quantize_weights_q8_0 on them first. Any other dtype throws
-  /// std::invalid_argument before anything is read.
+  /// `weight_dtype` F32 (the default) keeps the weights as loaded; BF16 runs
+  /// convert_weights_bf16 on them first (and so throws for a checkpoint that
+  /// bf16 cannot hold exactly), Q8_0 quantize_weights_q8_0. Any other dtype
+  /// throws std::invalid_argument before anything is read.
   static Model from_dir(const std::filesystem::path& model_dir, std::int64_t max_seq_len,
                         DType weight_dtype = DType::F32);
 

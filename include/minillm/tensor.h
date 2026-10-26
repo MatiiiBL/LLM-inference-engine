@@ -8,9 +8,9 @@
 //   * Row-major. strides() are in ELEMENTS, not bytes.
 //   * Rank is 1..4. Rank 0 means "no tensor" (default-constructed, is_empty()).
 //     Scalars are not modelled; use shape {1}.
-//   * All compute happens in F32. BF16/F16 exist only so the loader can read
-//     checkpoint bytes before converting. Q8_0 stores quantized weights (see
-//     BlockQ8_0); ops.h says which op arguments accept it.
+//   * All compute happens in F32. F16 exists only so the loader can read
+//     checkpoint bytes before converting. BF16 and Q8_0 also store weights
+//     (Q8_0 as BlockQ8_0); ops.h says which op arguments accept them.
 //   * Deliberately absent: broadcasting, autograd, arithmetic operator
 //     overloading, lazy evaluation, device/stream abstraction, type erasure
 //     beyond the dtype tag. Ops are free functions in ops.h.
@@ -35,7 +35,7 @@ namespace minillm {
 /// also accept Q8_0.
 enum class DType : int {
   F32 = 0,   ///< IEEE-754 binary32, the compute type.
-  BF16 = 1,  ///< bfloat16, as stored in HF safetensors checkpoints.
+  BF16 = 1,  ///< bfloat16, as stored in HF safetensors checkpoints; also a weight format.
   F16 = 2,   ///< IEEE-754 binary16, accepted by the loader.
   Q8_0 = 3,  ///< Blocks of 32 elements along the last dimension; see BlockQ8_0.
 };
@@ -85,8 +85,9 @@ inline float bf16_to_f32(std::uint16_t v) {
   return out;
 }
 
-/// f32 -> bf16, round-to-nearest-even. Only used by tests that fabricate
-/// checkpoint bytes; the inference path never narrows.
+/// f32 -> bf16, round-to-nearest-even. Exact for every value a bf16 can hold;
+/// convert_to_bf16 (loader.h) uses it, and tests fabricate checkpoint bytes
+/// with it.
 inline std::uint16_t f32_to_bf16(float v) {
   std::uint32_t bits;
   std::memcpy(&bits, &v, sizeof(bits));

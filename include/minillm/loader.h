@@ -1,9 +1,9 @@
 // minillm — loader.h
 //
 // Reads safetensors checkpoints into named fp32 tensors. Everything is
-// converted to F32 at load time: the rest of the engine never sees bf16/f16.
-// Q8_0 tensors exist only where a caller replaces loaded F32 weights with
-// quantize_q8_0's output (model.h: quantize_weights_q8_0).
+// converted to F32 at load time. BF16 and Q8_0 weights exist only where a
+// caller replaces loaded F32 ones with convert_to_bf16's or quantize_q8_0's
+// output (model.h: convert_weights_bf16, quantize_weights_q8_0).
 //
 // Expected tensor names (Hugging Face Llama):
 //   model.embed_tokens.weight                      [vocab_size, hidden_size]
@@ -38,7 +38,7 @@
 namespace minillm {
 
 /// A bag of named tensors, each contiguous and owning its storage. All F32 as
-/// loaded; a caller may replace some with other dtypes (Q8_0 today).
+/// loaded; a caller may replace some with other dtypes (BF16 or Q8_0).
 class Weights {
  public:
   Weights() = default;
@@ -71,6 +71,20 @@ class Weights {
 /// copied unchanged. Q8_0 is dequantized: element j of a block is
 /// float(qs[j]) * f16_to_f32(d), which is exact in float.
 Tensor convert_to_f32(const Tensor& src);
+
+/// Converts a contiguous F32 tensor to a new BF16 tensor of the same shape,
+/// rounding each value with f32_to_bf16 (nearest even). The conversion is
+/// exact, so that convert_to_f32 gives the input back bit for bit, exactly
+/// when every value is representable in bf16, as every value loaded from a
+/// bf16 checkpoint is; bf16_exact() tells. Throws std::invalid_argument for a
+/// non-F32 or non-contiguous input.
+Tensor convert_to_bf16(const Tensor& src);
+
+/// True if every element of an F32 tensor is representable in bf16, so that
+/// convert_to_bf16 is lossless: each value's low 16 bits are zero (NaNs
+/// count as representable). Throws std::invalid_argument for a non-F32 or
+/// non-contiguous input.
+bool bf16_exact(const Tensor& src);
 
 /// Quantizes a contiguous F32 tensor whose last dimension is a multiple of 32
 /// into a new Q8_0 tensor of the same shape. For each block of 32 values x:

@@ -32,6 +32,7 @@
 #endif
 
 #include "minillm/ops.h"
+#include "bf16.h"
 #include "minillm/runtime.h"
 #include "q8_0.h"
 
@@ -166,6 +167,10 @@ void panel(const float* x, const float* w, float* out, std::int64_t m, std::int6
 void matmul(const Tensor& x, const Tensor& w, Tensor& out) {
   if (w.dtype() == DType::Q8_0) {
     detail::matmul_q8_0(x, w, out);
+    return;
+  }
+  if (w.dtype() == DType::BF16) {
+    detail::matmul_bf16(x, w, out);
     return;
   }
   require_matrix("x", x);

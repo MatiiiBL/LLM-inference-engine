@@ -230,6 +230,10 @@ Model::~Model() = default;
 Model::Model(Model&&) noexcept = default;
 Model& Model::operator=(Model&&) noexcept = default;
 
+void convert_weights_bf16(Weights&, const ModelConfig&) {
+  throw std::logic_error("not implemented: convert_weights_bf16 (workflow 21)");
+}
+
 void quantize_weights_q8_0(Weights& weights, const ModelConfig& cfg) {
   std::vector<std::string> names = {"model.embed_tokens.weight"};
   for (std::int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
