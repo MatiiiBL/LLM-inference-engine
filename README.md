@@ -187,7 +187,8 @@ status 2 if that is missing.
 
 **Whole model** comes first: prefill and decode throughput in tokens/s in each
 weight format, f32, bf16 (what `--weights auto` picks for SmolLM2-135M) and
-q8_0, then the f32 model's peak RSS.
+q8_0, then the f32 model's peak RSS. A format the checkpoint cannot be
+converted to, such as bf16 for one stored in f32, is reported as skipped.
 
 - *Prefill* is one forward pass over a 128-token synthetic prompt, starting
   from an empty cache.

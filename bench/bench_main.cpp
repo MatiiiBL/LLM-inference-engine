@@ -1087,6 +1087,7 @@ constexpr ModelFormat kModelFormats[] = {
 int run_model_benches(const Options& opt, Report& report) {
   int matched = 0;
   bool printed_header = false;
+  std::optional<double> f32_rss;  ///< printed after every format's rows
   for (const ModelFormat& format : kModelFormats) {
     const std::string prefill_name = std::string("model.prefill") + format.suffix;
     const std::string decode_name = std::string("model.decode") + format.suffix;
@@ -1101,6 +1102,15 @@ int run_model_benches(const Options& opt, Report& report) {
     try {
       model.emplace(
           Model::from_dir(opt.model_dir, opt.prompt_tokens + opt.decode_tokens, format.dtype));
+    } catch (const std::invalid_argument& e) {
+      // convert_weights_bf16 refuses a checkpoint bf16 cannot hold exactly,
+      // such as one stored in f32, and quantize_weights_q8_0 one with a
+      // non-finite weight; the CLI's --weights auto falls back to f32 for the
+      // first reason too. That format has no numbers then, but the rest of
+      // the run does.
+      if (is_f32) throw;
+      report.skip(prefill_name + ", " + decode_name, e.what());
+      continue;
     } catch (const std::logic_error& e) {
       if (!is_not_implemented(e)) throw;
       report.skip(prefill_name + ", " + decode_name + (is_f32 ? ", memory.peak_rss.model" : ""),
@@ -1192,13 +1202,15 @@ int run_model_benches(const Options& opt, Report& report) {
                     decode.min(), decode.max()});
       }
     }
-    if (is_f32) {
-      // Peak RSS covers the runs at every count; it is filed under the largest.
-      const int most = *std::max_element(opt.threads.begin(), opt.threads.end());
-      std::printf("%-26s %8.1f MiB  (f32: load + prefill + decode)\n", "peak RSS", rss);
-      report.add_value("memory.peak_rss.model", most, rss, "MiB", 1);
-    }
+    if (is_f32) f32_rss = rss;
     std::fflush(stdout);
+  }
+  if (f32_rss) {
+    // Peak RSS covers the runs at every count; it is filed under the largest.
+    const int most = *std::max_element(opt.threads.begin(), opt.threads.end());
+    std::printf("%-26s %8.1f MiB  (f32: load + prefill + decode)\n", "peak RSS", *f32_rss);
+    std::fflush(stdout);
+    report.add_value("memory.peak_rss.model", most, *f32_rss, "MiB", 1);
   }
   return matched;
 }
