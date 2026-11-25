@@ -408,6 +408,16 @@ TEST_CASE("ops::attention gives keys whose score overflows to -inf weight 0, as 
       const Tensor v = random_tensor({n_kv, 3, 64}, 460 + static_cast<std::uint64_t>(n_kv));
       check_against_ref(q, k, v, n_kv - 1, 0.125f,
                         std::to_string(n_inf) + " of " + std::to_string(n_kv) + " keys at -inf");
+      // One of them scores NaN instead (1e40 overflows to +inf in dimension
+      // 0, -inf in the others): the whole row is NaN, as in ref::, wherever
+      // the block boundary falls.
+      const std::int64_t nan_key = n_inf / 2;
+      k.f32()[nan_key * 3 * 64] = 1e20f;
+      k.f32()[nan_key * 3 * 64 + 64] = 1e20f;
+      k.f32()[nan_key * 3 * 64 + 128] = 1e20f;
+      check_against_ref(q, k, v, n_kv - 1, 0.125f,
+                        std::to_string(n_inf) + " of " + std::to_string(n_kv) +
+                            " keys at -inf, one at NaN");
     }
   }
 }
