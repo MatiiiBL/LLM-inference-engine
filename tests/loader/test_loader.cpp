@@ -625,21 +625,22 @@ TEST_CASE("unreadable config.json is a runtime_error naming the source") {
   CHECK(ModelConfig::from_json_file(good).hidden_size == 64);
 }
 
-TEST_CASE("config.json nested more than 128 deep is rejected, not a stack overflow") {
+TEST_CASE("config.json nested more than 127 deep is rejected, not a stack overflow") {
   const auto nested = [](int n) { return std::string(n, '[') + std::string(n, ']'); };
   // The root object is one level, so a value of n nested arrays makes the
-  // document 1 + n deep. At 128 the value is still quoted in the error.
+  // document 1 + n deep. At 127, the most the reference loaders accept, the
+  // value is still quoted in the error.
   CHECK_THROWS_WITH_AS(
-      ModelConfig::from_json_string(config_json({{"rope_scaling", nested(127)}})),
+      ModelConfig::from_json_string(config_json({{"rope_scaling", nested(126)}})),
       doctest::Contains("\"rope_scaling\" is [[["), std::runtime_error);
   CHECK_THROWS_WITH_AS(
-      ModelConfig::from_json_string(config_json({{"rope_scaling", nested(128)}})),
-      doctest::Contains("nests JSON more than 128 levels deep"), std::runtime_error);
+      ModelConfig::from_json_string(config_json({{"rope_scaling", nested(127)}})),
+      doctest::Contains("nests JSON more than 127 levels deep"), std::runtime_error);
   // Quoting either of these in its error message overflowed the stack.
   for (const char* key : {"rope_scaling", "vocab_size"}) {
     CAPTURE(key);
     CHECK_THROWS_WITH_AS(ModelConfig::from_json_string(config_json({{key, nested(100000)}})),
-                         doctest::Contains("more than 128 levels deep"), std::runtime_error);
+                         doctest::Contains("more than 127 levels deep"), std::runtime_error);
   }
   TempDir dir;
   const fs::path file = dir.write("config.json", config_json({{"vocab_size", nested(100000)}}));
@@ -1613,21 +1614,22 @@ TEST_CASE("safetensors: __metadata__ must map strings to strings") {
   }
 }
 
-TEST_CASE("safetensors: a header nested more than 128 deep is rejected, not a stack overflow") {
+TEST_CASE("safetensors: a header nested more than 127 deep is rejected, not a stack overflow") {
   TempDir dir;
   const auto nested = [](int n) { return std::string(n, '[') + std::string(n, ']'); };
   // The root object and the entry are two levels, so a key the loader
-  // ignores, holding n nested arrays, makes the header 2 + n deep.
+  // ignores, holding n nested arrays, makes the header 2 + n deep. The
+  // safetensors library loads 127 levels and rejects 128.
   const auto with_extra = [&](int n) {
     return one_tensor_file(
         R"({"extra":)" + nested(n) + R"(,"dtype":"F32","shape":[1],"data_offsets":[0,4]})",
         bytes_of(std::vector<float>{1.0f}));
   };
-  const fs::path at_limit = dir.write("128.safetensors", with_extra(126));
+  const fs::path at_limit = dir.write("127.safetensors", with_extra(125));
   CHECK(load_safetensors(at_limit).get("w").f32()[0] == 1.0f);
-  const fs::path over = dir.write("129.safetensors", with_extra(127));
+  const fs::path over = dir.write("128.safetensors", with_extra(126));
   CHECK_THROWS_WITH_AS(read_safetensors_header(over),
-                       doctest::Contains("the header nests JSON more than 128 levels deep"),
+                       doctest::Contains("the header nests JSON more than 127 levels deep"),
                        std::runtime_error);
   CHECK_THROWS_WITH_AS(read_safetensors_header(over), doctest::Contains(over.string().c_str()),
                        std::runtime_error);
@@ -1644,7 +1646,7 @@ TEST_CASE("safetensors: a header nested more than 128 deep is rejected, not a st
   for (std::size_t i = 0; i < std::size(headers); ++i) {
     CAPTURE(i);
     const fs::path p = dir.write("deep.safetensors", safetensors_file(headers[i], std::string(4, 'x')));
-    CHECK_THROWS_WITH_AS(load_safetensors(p), doctest::Contains("more than 128 levels deep"),
+    CHECK_THROWS_WITH_AS(load_safetensors(p), doctest::Contains("more than 127 levels deep"),
                          std::runtime_error);
   }
 }
@@ -1843,12 +1845,12 @@ TEST_CASE("load_checkpoint rejects an index that disagrees with its shards") {
     CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(index.string().c_str()),
                          std::runtime_error);
   }
-  SUBCASE("an index nested more than 128 deep") {
+  SUBCASE("an index nested more than 127 deep") {
     const fs::path index = dir.write("model.safetensors.index.json",
                                      R"({"weight_map": {"a": )" + std::string(100000, '[') +
                                          std::string(100000, ']') + "}}");
     CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()),
-                         doctest::Contains("nests JSON more than 128 levels deep"),
+                         doctest::Contains("nests JSON more than 127 levels deep"),
                          std::runtime_error);
     CHECK_THROWS_WITH_AS(load_checkpoint(dir.path()), doctest::Contains(index.string().c_str()),
                          std::runtime_error);

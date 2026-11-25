@@ -270,12 +270,12 @@ std::string token_bytes(std::string_view token) {
 }
 
 /// Containers a tokenizer.json or tokenizer_config.json may nest, the root
-/// included: serde_json's default recursion limit, which the reference
-/// tokenizers library parses with. Real files nest about five deep.
+/// included: as many as the reference tokenizers library accepts, whose
+/// serde_json fails at the 128th level. Real files nest about five deep.
 /// nlohmann parses any depth, but the error messages below quote rejected
 /// values with dump(), which recurses once per level: 100000 nested arrays
 /// as the normalizer overflowed the stack instead of throwing.
-constexpr int kMaxJsonDepth = 128;
+constexpr int kMaxJsonDepth = 127;
 
 json read_json(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);

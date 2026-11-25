@@ -6,8 +6,9 @@
 // for an error message. A 100 KB safetensors header or config.json of nested
 // empty arrays therefore overflowed the stack, a SIGSEGV where loader.h and
 // config.h promise a std::runtime_error. Real files nest three or four levels
-// deep. The cap is serde_json's default recursion limit, 128, which the
-// reference safetensors and tokenizers loaders parse with.
+// deep. The cap is what the reference safetensors and tokenizers loaders
+// accept: serde_json's default recursion limit of 128 lets 127 levels
+// through and fails at the 128th.
 
 #ifndef MINILLM_SRC_LOADER_JSON_DEPTH_H
 #define MINILLM_SRC_LOADER_JSON_DEPTH_H
@@ -17,7 +18,7 @@
 namespace minillm::loader_detail {
 
 /// Containers a document may nest, the root included.
-constexpr int kMaxJsonDepth = 128;
+constexpr int kMaxJsonDepth = 127;
 
 /// For a parser callback: true at the event that opens a container nested
 /// more than kMaxJsonDepth deep. nlohmann's `depth` counts the containers
