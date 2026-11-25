@@ -654,8 +654,11 @@ std::vector<std::string> greedy_args(std::string_view prompt, std::size_t max_to
 /// Tokens each sampled run generates.
 constexpr std::size_t kSampledTokens = 16;
 
-/// A sampled run of kOraclePrompts[0] with every sampling flag set, so that
-/// each must reach the sampler for the runs to come out as the test expects.
+/// A sampled run of kOraclePrompts[0] with every sampling flag set. The test
+/// compares these runs with each other and with greedy, which catches a
+/// --temperature, --seed or --repetition-penalty that never reaches the
+/// sampler; nothing pins --top-k or --top-p, or the sampler keeping its
+/// random state from one step to the next.
 std::vector<std::string> sampled_args(int seed, int threads, bool penalty) {
   std::vector<std::string> args = {"--model",      checkpoint_dir().string(),
                                    "--prompt",     std::string(kOraclePrompts[0]),

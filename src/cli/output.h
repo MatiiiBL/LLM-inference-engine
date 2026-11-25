@@ -2,9 +2,11 @@
 //
 // The continuation is the program's output: `minillm ... > out.txt && use
 // out.txt` must never see a truncated file and an exit status of 0. Once a
-// write fails (a full disk, a file size limit, a closed or read-only stdout)
-// nothing that follows can reach the file either, so the first failure stops
-// generation and main() reports it with exit status 1.
+// write fails (a full disk, a closed or read-only stdout) nothing that
+// follows can reach the file either, so the first failure stops generation
+// and main() reports it with exit status 1. (Past a file size limit the
+// process gets SIGXFSZ, which ends it before a write could fail, unless the
+// signal is ignored.)
 
 #ifndef MINILLM_SRC_CLI_OUTPUT_H
 #define MINILLM_SRC_CLI_OUTPUT_H
