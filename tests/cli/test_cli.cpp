@@ -616,6 +616,11 @@ struct EndToEnd {
   RunResult multibyte;              ///< kMultiBytePrompt
   RunResult threaded;               ///< kOraclePrompts[2] again, at threaded_count()
   RunResult q8_0;                   ///< kQ8_0Prompt with --weights q8_0, --threads 1
+  // sampled_args() runs of kOraclePrompts[0], none under TSan:
+  RunResult sampled;      ///< --seed 7
+  RunResult resampled;    ///< --seed 7 again, at threaded_count()
+  RunResult other_seed;   ///< --seed 8
+  RunResult no_penalty;   ///< --seed 7 without --repetition-penalty
 };
 
 /// The prompt of the --weights q8_0 run. Prompt 2 is the one whose Q8_0
@@ -643,6 +648,25 @@ std::vector<std::string> greedy_args(std::string_view prompt, std::size_t max_to
                                    "--threads",     std::to_string(threads),
                                    "--print-ids"};
   if (ignore_eos) args.emplace_back("--ignore-eos");
+  return args;
+}
+
+/// Tokens each sampled run generates.
+constexpr std::size_t kSampledTokens = 16;
+
+/// A sampled run of kOraclePrompts[0] with every sampling flag set, so that
+/// each must reach the sampler for the runs to come out as the test expects.
+std::vector<std::string> sampled_args(int seed, int threads, bool penalty) {
+  std::vector<std::string> args = {"--model",      checkpoint_dir().string(),
+                                   "--prompt",     std::string(kOraclePrompts[0]),
+                                   "--max-tokens", std::to_string(kSampledTokens),
+                                   "--temperature", "0.8",
+                                   "--top-k",      "40",
+                                   "--top-p",      "0.9",
+                                   "--seed",       std::to_string(seed),
+                                   "--threads",    std::to_string(threads),
+                                   "--ignore-eos", "--print-ids"};
+  if (penalty) args.insert(args.end(), {"--repetition-penalty", "1.2"});
   return args;
 }
 
@@ -724,14 +748,24 @@ const EndToEnd& end_to_end() {
     std::vector<std::string> q8_0 = greedy_args(kOraclePrompts[kQ8_0Prompt], q8_0_tokens, true, 1);
     q8_0.insert(q8_0.end(), {"--weights", "q8_0"});
     add(r.q8_0, std::move(q8_0));
+    // Every other run is greedy, which ignores the sampling flags. Under TSan
+    // these would add model loads to its tightest test, and the threaded
+    // kernels they run are the greedy runs' too.
+    if (!kTsan) {
+      add(r.sampled, sampled_args(7, 1, true));
+      add(r.other_seed, sampled_args(8, 1, true));
+      add(r.no_penalty, sampled_args(7, 1, false));
+    }
     std::vector<RunResult> results = run_all(batch, kRunsAtOnce);
     for (std::size_t i = 0; i < results.size(); ++i) *into[i] = std::move(results[i]);
     r.threaded = run_cli(greedy_args(kOraclePrompts[2], n_tokens[2], true, threaded_count()));
+    if (!kTsan) r.resampled = run_cli(sampled_args(7, threaded_count(), true));
 
     // Until every module the binary uses is implemented, it stops at the
     // first stub it reaches and says so.
-    for (const RunResult* run : {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos,
-                                 &r.f32, &r.multibyte, &r.threaded, &r.q8_0}) {
+    for (const RunResult* run :
+         {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos, &r.f32, &r.multibyte,
+          &r.threaded, &r.q8_0, &r.sampled, &r.resampled, &r.other_seed, &r.no_penalty}) {
       if (run->exit_code != 0 && contains(run->err, "not implemented")) {
         r.skip_reason =
             "the engine is incomplete — " + line_containing(run->err, "not implemented");
@@ -1671,6 +1705,25 @@ TEST_CASE("end to end: --threads sizes the pool and leaves greedy output unchang
 }
 
 // Not under TSan (see the batch in end_to_end()).
+TEST_CASE("end to end: a sampled run follows its flags and its seed, at any --threads" *
+          doctest::skip(kTsan)) {
+  const EndToEnd* e2e = e2e_or_skip();
+  if (!e2e) return;
+  const std::vector<std::int32_t> ids = generated_ids(e2e->sampled);
+  CHECK(ids.size() == kSampledTokens);
+  // The seed fixes the run, whatever --threads is.
+  assert_equal(generated_ids(e2e->resampled), ids, "--seed 7 at --threads 1 and N");
+  CHECK(e2e->resampled.out == e2e->sampled.out);
+  // And each flag changes it. A run that ignored --temperature would be the
+  // greedy one, one that ignored --seed the same for both seeds, and one
+  // that ignored --repetition-penalty the same with and without it.
+  std::vector<std::int32_t> greedy = expected_greedy_ids(0);
+  greedy.resize(std::min(greedy.size(), kSampledTokens));
+  CHECK(ids != greedy);
+  CHECK(generated_ids(e2e->other_seed) != ids);
+  CHECK(generated_ids(e2e->no_penalty) != ids);
+}
+
 TEST_CASE("end to end: --weights f32 still runs f32 weights, with the same tokens and text" *
           doctest::skip(kTsan)) {
   const EndToEnd* e2e = e2e_or_skip();
