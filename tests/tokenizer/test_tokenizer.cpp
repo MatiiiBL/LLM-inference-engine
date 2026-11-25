@@ -14,6 +14,7 @@
 
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -604,6 +605,65 @@ TEST_CASE("SmolLM2 matches tokenizers where the obvious implementation would not
   // the byte: U+0004 does not survive encode/decode, in HF either.
   check_ids(tok->encode("a\x04" "b"), {81, 82}, "a U+0004 b");
   CHECK(tok->encode("\x04").empty());
+}
+
+TEST_CASE("SmolLM2 matches tokenizers on every White_Space code point, and on look-alikes") {
+  const Tokenizer* tok = smollm();
+  if (!tok) return;
+
+  // "a", two spaces, c, "b". The regex's \s+(?!\S) keeps the two spaces one
+  // pre-token, ĠĠ (256), exactly when c is \s, Oniguruma's White_Space
+  // property; otherwise the first space stands alone as Ġ (216). The corpus
+  // only has five of the 25 White_Space code points, so a missing or extra
+  // one in is_space() would pass every other test. The look-alikes are \s in
+  // Python (U+001C..U+001F), formerly White_Space (U+180E), or blank but not
+  // spaces (U+200B, U+FEFF). Ids from tokenizers 0.23.3.
+  struct Case {
+    char32_t c;
+    Ids ids;
+  };
+  const Case cases[] = {
+      {0x0009, {81, 256, 197, 82}},
+      {0x000A, {81, 256, 198, 82}},
+      {0x000B, {81, 256, 199, 82}},
+      {0x000C, {81, 256, 200, 82}},
+      {0x000D, {81, 256, 201, 82}},
+      {0x0020, {81, 256, 278}},
+      {0x0085, {81, 256, 141, 223, 82}},
+      {0x00A0, {81, 256, 15442, 82}},
+      {0x1680, {81, 256, 172, 244, 218, 82}},
+      {0x2000, {81, 256, 321, 218, 82}},
+      {0x2001, {81, 256, 321, 219, 82}},
+      {0x2002, {81, 256, 321, 220, 82}},
+      {0x2003, {81, 256, 321, 221, 82}},
+      {0x2004, {81, 256, 321, 222, 82}},
+      {0x2005, {81, 256, 321, 223, 82}},
+      {0x2006, {81, 256, 321, 224, 82}},
+      {0x2007, {81, 256, 321, 225, 82}},
+      {0x2008, {81, 256, 321, 226, 82}},
+      {0x2009, {81, 256, 321, 227, 82}},
+      {0x200A, {81, 256, 321, 228, 82}},
+      {0x2028, {81, 256, 321, 118, 82}},
+      {0x2029, {81, 256, 321, 119, 82}},
+      {0x202F, {81, 256, 321, 124, 82}},
+      {0x205F, {81, 256, 32571, 249, 82}},
+      {0x3000, {81, 256, 12109, 218, 82}},
+      {0x001C, {81, 216, 216, 213, 82}},
+      {0x001D, {81, 216, 216, 82}},
+      {0x001E, {81, 216, 216, 214, 82}},
+      {0x001F, {81, 216, 216, 215, 82}},
+      {0x180E, {81, 216, 15822, 250, 232, 82}},
+      {0x200B, {81, 216, 459, 229, 82}},
+      {0xFEFF, {81, 216, 216, 186, 136, 140, 82}},
+  };
+  for (const Case& k : cases) {
+    std::string text = "a  ";
+    append_utf8(text, k.c);
+    text += "b";
+    char label[16];
+    std::snprintf(label, sizeof(label), "U+%04X", static_cast<unsigned>(k.c));
+    check_ids(tok->encode(text), k.ids, label);
+  }
 }
 
 // --------------------------------------------------------------------------
