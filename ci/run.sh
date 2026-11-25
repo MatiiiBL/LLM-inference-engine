@@ -3,20 +3,22 @@
 #
 # One command, from a clean clone:
 #
-#   ci/run.sh               every stage: oracle asan tsan bench
+#   ci/run.sh               every stage: oracle asan tsan release bench
 #   ci/run.sh asan bench    just these stages, in this order
 #
 # .github/workflows/ci.yml runs exactly these stages, so a green local run is
 # a green CI run on the same compiler.
 #
 # Stages:
-#   oracle  generate oracle/data/ and models/ (python oracle/generate.py)
-#           unless they are already there
-#   asan    build the asan preset with zero warnings, run ctest, and fail if
-#           any check was skipped other than those pending another workflow
-#   tsan    the same for the tsan preset
-#   bench   build the release preset with zero warnings and run minillm_bench;
-#           results land in build/release/bench-{output.txt,results.jsonl}
+#   oracle   generate oracle/data/ and models/ (python oracle/generate.py)
+#            unless they are already there
+#   asan     build the asan preset with zero warnings, run ctest, and fail if
+#            any check was skipped other than those pending another workflow
+#   tsan     the same for the tsan preset
+#   release  the same for the release preset, the build that users run and
+#            timings are quoted from, then check that the Q8_0 KL gate ran
+#   bench    build the release preset with zero warnings and run minillm_bench;
+#            results land in build/release/bench-{output.txt,results.jsonl}
 #
 # Environment:
 #   MINILLM_ALLOW_ORACLE_SKIPS=1  report those skips instead of failing
@@ -212,27 +214,32 @@ stage_tsan() {
 
 # The Q8_0 quality gate (tests/model, proposal 14 §5.3 layer 4) runs only
 # from a release build: it pushes about 4000 teacher-forced positions through
-# an fp32 and a Q8_0 engine, which no sanitizer stage could afford. The bench
-# stage builds release anyway, so the gate runs here. Every stage that gets
-# this far has the oracle and the checkpoint, so a skip fails like a failure,
-# and so does a filter that no longer matches the test.
-run_q8_0_kl_gate() {
-  log "Q8_0 KL gate (release)"
-  local out=build/release/q8_0-kl-gate-output.txt
-  local start=$SECONDS
-  build/release/tests/test_model --test-case='SmolLM2 Q8_0: KL from the fp32 engine*' 2>&1 |
-    tee "$out" || die "the Q8_0 KL gate failed; see the output above"
-  if grep -qE '^\[minillm\] [0-9]+ check\(s\) skipped' "$out"; then
-    die "the Q8_0 KL gate skipped its checks; it needs oracle/data/ and models/"
-  fi
-  grep -qE 'test cases: +1 \| +1 passed \| +0 failed' "$out" ||
-    die "the Q8_0 KL gate did not run exactly one test case; has it been renamed?"
-  printf '\nQ8_0 KL gate: passed in %ss\n' "$((SECONDS - start))"
+# an fp32 and a Q8_0 engine, which no sanitizer stage could afford. It is a
+# test case of test_model, so the release ctest has just run it, and a
+# failure has already failed the stage. What ctest cannot see is the gate not
+# running at all: skipped, renamed out of the release build, or emptied, it
+# would leave the suite green. So this checks that it reported its three KL
+# means, one per evaluation set; anything else fails, naming itself.
+check_q8_0_kl_gate() {
+  local test_log=build/release/Testing/Temporary/LastTest.log
+  local re='MESSAGE: q8_0 vs f32, .*: [0-9]+ positions, KL mean '
+  local n
+  n=$(grep -cE "$re" "$test_log" 2>/dev/null || true)
+  n=${n:-0}
+  [[ $n -eq 3 ]] ||
+    die "the Q8_0 KL gate reported $n KL mean(s), not 3; did its test case in tests/model stop running in release?"
+  printf '\nQ8_0 KL gate: passed\n'
+  grep -E "$re" "$test_log" | sed 's/.*MESSAGE: /  /'
+}
+
+stage_release() {
+  build_preset release
+  test_preset release
+  check_q8_0_kl_gate
 }
 
 stage_bench() {
   build_preset release
-  run_q8_0_kl_gate
   log "bench"
   local out=build/release/bench-output.txt
   # A failed run must not leave the previous run's results behind to be
@@ -248,12 +255,12 @@ stage_bench() {
 
 main() {
   local stages=("$@")
-  [[ ${#stages[@]} -gt 0 ]] || stages=(oracle asan tsan bench)
+  [[ ${#stages[@]} -gt 0 ]] || stages=(oracle asan tsan release bench)
   local stage
   for stage in "${stages[@]}"; do
     case $stage in
-      oracle | asan | tsan | bench) ;;
-      *) die "unknown stage '$stage' (stages: oracle asan tsan bench)" ;;
+      oracle | asan | tsan | release | bench) ;;
+      *) die "unknown stage '$stage' (stages: oracle asan tsan release bench)" ;;
     esac
   done
   require_tools cmake ninja ctest curl tar awk

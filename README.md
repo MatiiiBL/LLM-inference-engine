@@ -137,7 +137,7 @@ stage of [`ci/run.sh`](ci/run.sh), so the same pipeline runs locally from a
 clean clone with one command:
 
 ```sh
-ci/run.sh              # oracle -> asan -> tsan -> bench
+ci/run.sh              # oracle -> asan -> tsan -> release -> bench
 ci/run.sh asan         # or any subset of stages, in the order given
 ```
 
@@ -147,7 +147,11 @@ A run fails on:
   become errors through `CMAKE_COMPILE_WARNING_AS_ERROR`, which stays set in
   that build tree afterwards, so an incremental build cannot hide one. The
   build log is also grepped for linker and CMake warnings.
-- A failing test under ASan+UBSan or under TSan.
+- A failing test under ASan+UBSan, under TSan, or in the `release` build. The
+  release run is the one that checks the optimized code users run: the
+  tolerances were measured there, and the Q8_0 KL gate (`tests/model`) runs
+  only there. The stage also fails if that gate did not report all three of
+  its KL means, so a gate that silently stopped running cannot pass.
 - **Any skipped oracle check.** With `oracle/data/` and `models/` in place there
   are none, so a skip means one of them is missing or broken. That should be a
   red run, not a suspiciously fast green one. Skips that are pending another
