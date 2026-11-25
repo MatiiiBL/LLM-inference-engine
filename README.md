@@ -111,7 +111,7 @@ oracle/.venv/bin/python oracle/generate.py
 
 One command, idempotent, fixed seeds. It downloads the checkpoint (~270 MB)
 into `models/SmolLM2-135M/`, loads it with transformers in float32 with
-`attn_implementation="eager"`, and writes ~215 files into `oracle/data/`:
+`attn_implementation="eager"`, and writes 320 files into `oracle/data/`:
 
 | Directory | What |
 | --- | --- |
@@ -120,6 +120,7 @@ into `models/SmolLM2-135M/`, loads it with transformers in float32 with
 | `weights/` | per-layer-type samples: shape, stored dtype, first 16 values, fp32 sum |
 | `attention/` | layers 0 and 15 stage by stage: q/k/v projections, post-RoPE q/k, attention output, o_proj |
 | `model/` | 3 prompts: input ids, all 31 hidden states, logits, 64-token greedy generation |
+| `model_q8_0/` | the same 3 prompts with every projection and the embedding rounded to Q8_0, `dequantize(quantize_q8_0(W))`, plus `blocks.sha256`: the SHA-256 of each tensor's Q8_0 blocks, which the C++ quantizer must reproduce |
 | `manifest.json` | every file with its shape, dtype and description, plus the versions used |
 
 Use `--skip-download` to regenerate from an already-downloaded checkpoint
