@@ -256,6 +256,17 @@ void softmax_block(float* s, std::int64_t n, float scale, bool first_block, floa
     running_max = block_max;
   }
 
+  // Every score so far is -inf, as when finite q and k have a dot product
+  // that overflows. s - m would be -inf - -inf = NaN, and the NaN would
+  // survive every later block. Next to the max over all the keys, which is
+  // what ref:: takes, these keys weigh exactly 0, and a later block with a
+  // finite max rescales this zero sum by exp(-inf) = 0. If no block has one,
+  // the final division is 0 / 0 = NaN, as in ref::.
+  if (running_max == -std::numeric_limits<float>::infinity()) [[unlikely]] {
+    std::fill_n(s, n, 0.0f);
+    return;
+  }
+
   // Weights, four lanes at a time. The last partial vector is padded with
   // -inf, whose weight is exactly 0.
   const float m = running_max;
