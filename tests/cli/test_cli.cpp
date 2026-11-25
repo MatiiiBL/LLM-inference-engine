@@ -57,6 +57,7 @@
 
 #include "../../src/cli/args.h"
 #include "../../src/cli/generate.h"
+#include "../../src/cli/output.h"
 #include "../../src/cli/utf8_stream.h"
 #include "common/allclose.h"
 #include "common/oracle.h"
@@ -387,7 +388,10 @@ struct Child {
   fs::path err_path;
 };
 
-Child spawn(const fs::path& exe, const std::vector<std::string>& args) {
+/// Starts `exe` with `args`. With `writable_stdout` false, the child's stdout
+/// is opened read-only, so that every write to it fails with EBADF.
+Child spawn(const fs::path& exe, const std::vector<std::string>& args,
+            bool writable_stdout = true) {
   static int counter = 0;
   Child child;
   const std::string tag = std::to_string(counter++);
@@ -404,7 +408,8 @@ Child spawn(const fs::path& exe, const std::vector<std::string>& args) {
   posix_spawn_file_actions_init(&actions);
   posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
   posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, child.out_path.c_str(),
-                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                   (writable_stdout ? O_WRONLY : O_RDONLY) | O_CREAT | O_TRUNC,
+                                   0644);
   posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, child.err_path.c_str(),
                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
   const int rc = posix_spawn(&child.pid, argv[0], &actions, nullptr, argv.data(), environ);
@@ -460,7 +465,9 @@ bool have_cli() {
   return false;
 }
 
-RunResult run_cli(const std::vector<std::string>& args) { return wait_for(spawn(cli_exe(), args)); }
+RunResult run_cli(const std::vector<std::string>& args, bool writable_stdout = true) {
+  return wait_for(spawn(cli_exe(), args, writable_stdout));
+}
 
 /// Runs minillm once per argument list, at most `at_once` at a time, and
 /// returns the results in the same order.
@@ -1371,6 +1378,27 @@ TEST_CASE("Utf8Stream: long random byte strings cut at random add up to decode()
 // 1d. The generation loop, with a fake model
 // ===========================================================================
 
+TEST_CASE("write_flushed writes and flushes, and throws when the stream cannot take the bytes") {
+  const fs::path dir = make_temp_dir("cli_write_flushed");
+  const fs::path file = dir / "out.txt";
+  {
+    std::FILE* out = std::fopen(file.c_str(), "wb");
+    REQUIRE(out != nullptr);
+    cli::write_flushed(out, "the capital");
+    cli::write_flushed(out, "");
+    // Flushed, so the bytes are in the file while it is still open.
+    CHECK(read_file(file) == "the capital");
+    std::fclose(out);
+  }
+  // A stream opened for reading takes no writes, like a read-only stdout.
+  std::FILE* in = std::fopen(file.c_str(), "rb");
+  REQUIRE(in != nullptr);
+  CHECK_THROWS_WITH_AS(cli::write_flushed(in, "x"), doctest::Contains("writing to stdout failed"),
+                       std::runtime_error);
+  CHECK_NOTHROW(cli::write_flushed(in, ""));
+  std::fclose(in);
+}
+
 TEST_CASE("generate: prefill once at position 0, then one token per call at the cache length") {
   const LoopRun run = run_loop({11, 12, 13, 14}, 4, -1);
   assert_equal(run.gen.ids, std::vector<std::int32_t>{11, 12, 13, 14}, "generated ids");
@@ -1589,6 +1617,14 @@ TEST_CASE("minillm turns a failure inside the engine into a message, not an esca
   CHECK(r.err.starts_with("minillm: error: "));
 }
 
+TEST_CASE("minillm --help exits 1 when its stdout cannot be written") {
+  if (!have_cli()) return;
+  const RunResult r = run_cli({"--help"}, /*writable_stdout=*/false);
+  CHECK_FALSE(r.signaled);
+  CHECK(r.exit_code == 1);
+  CHECK(r.err.starts_with("minillm: error: writing to stdout failed: "));
+}
+
 // ===========================================================================
 // 3. End to end
 // ===========================================================================
@@ -1745,6 +1781,18 @@ TEST_CASE("end to end: generation stops at eos, which is neither printed nor cou
   assert_equal(generated_ids(run), expected, "prompt 1 up to eos");
   CHECK(contains(run.err, "stopped at eos after " + std::to_string(expected.size()) + " tokens"));
   CHECK(run.out == tok->decode(expected) + "\n");
+}
+
+// Not under TSan, where every extra model load costs CI time and nothing
+// here is threaded: the write fails on the first token, on one thread.
+TEST_CASE("end to end: a failed write to stdout stops generation with exit status 1" *
+          doctest::skip(kTsan)) {
+  if (!e2e_or_skip()) return;
+  const RunResult r = run_cli(greedy_args(kOraclePrompts[0], 4, true, 1), /*writable_stdout=*/false);
+  CHECK_FALSE(r.signaled);
+  CHECK(r.exit_code == 1);
+  CHECK(contains(r.err, "\nminillm: error: writing to stdout failed: "));
+  CHECK_FALSE(contains(r.err, "minillm: stopped at"));
 }
 
 TEST_CASE("end to end: streamed stdout is byte for byte a one-call decode of the ids") {
