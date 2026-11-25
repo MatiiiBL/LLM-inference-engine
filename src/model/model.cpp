@@ -140,11 +140,13 @@ struct LayerWeights {
 struct Model::Impl {
   Impl(ModelConfig cfg, std::int64_t max_seq_len)
       : config(std::move(cfg)),
+        max_seq_len(max_seq_len),
         cache(KVCache::for_model(config, max_seq_len)),
         arena(model_detail::scratch_bytes(config, max_seq_len)),
         attention_scale(config.attention_scale()) {}
 
   ModelConfig config;
+  std::int64_t max_seq_len;  ///< positions the arena holds scratch for
   Tensor embed_tokens;  ///< [vocab, hidden]
   std::vector<LayerWeights> layers;
   Tensor final_norm;  ///< [hidden]
@@ -321,6 +323,22 @@ std::span<const float> Model::forward(std::span<const std::int32_t> tokens, std:
       bad_argument("forward: token id " + std::to_string(tokens[t]) + " at index " +
                    std::to_string(t) + " is outside [0, " + std::to_string(cfg.vocab_size) + ")");
     }
+  }
+  // kv_cache() hands the cache out by reference, and a KVCache can be
+  // assigned, so it need not be the one the constructor built. The k and v
+  // projections write straight into it at this model's geometry, and the
+  // arena holds scratch for max_seq_len positions, so a cache that disagrees
+  // would be written, or carved for, out of bounds.
+  if (cache.n_layers() != cfg.num_hidden_layers || cache.n_kv_heads() != cfg.num_key_value_heads ||
+      cache.head_dim() != cfg.head_dim || cache.max_seq_len() > m.max_seq_len) {
+    bad_argument("forward: the KV cache has " + std::to_string(cache.n_layers()) + " layers, " +
+                 std::to_string(cache.max_seq_len()) + " positions, " +
+                 std::to_string(cache.n_kv_heads()) + " KV heads and head_dim " +
+                 std::to_string(cache.head_dim()) + "; this model needs " +
+                 std::to_string(cfg.num_hidden_layers) + " layers, at most " +
+                 std::to_string(m.max_seq_len) + " positions, " +
+                 std::to_string(cfg.num_key_value_heads) + " KV heads and head_dim " +
+                 std::to_string(cfg.head_dim));
   }
   if (start_pos < 0) bad_argument("forward: start_pos " + std::to_string(start_pos) + " is negative");
   // Attention reads every position before start_pos, so they must all have
