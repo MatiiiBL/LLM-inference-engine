@@ -57,6 +57,7 @@
 
 #include "../../src/cli/args.h"
 #include "../../src/cli/generate.h"
+#include "../../src/cli/output.h"
 #include "../../src/cli/utf8_stream.h"
 #include "common/allclose.h"
 #include "common/oracle.h"
@@ -387,7 +388,10 @@ struct Child {
   fs::path err_path;
 };
 
-Child spawn(const fs::path& exe, const std::vector<std::string>& args) {
+/// Starts `exe` with `args`. With `writable_stdout` false, the child's stdout
+/// is opened read-only, so that every write to it fails with EBADF.
+Child spawn(const fs::path& exe, const std::vector<std::string>& args,
+            bool writable_stdout = true) {
   static int counter = 0;
   Child child;
   const std::string tag = std::to_string(counter++);
@@ -404,7 +408,8 @@ Child spawn(const fs::path& exe, const std::vector<std::string>& args) {
   posix_spawn_file_actions_init(&actions);
   posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
   posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, child.out_path.c_str(),
-                                   O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                                   (writable_stdout ? O_WRONLY : O_RDONLY) | O_CREAT | O_TRUNC,
+                                   0644);
   posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, child.err_path.c_str(),
                                    O_WRONLY | O_CREAT | O_TRUNC, 0644);
   const int rc = posix_spawn(&child.pid, argv[0], &actions, nullptr, argv.data(), environ);
@@ -460,7 +465,9 @@ bool have_cli() {
   return false;
 }
 
-RunResult run_cli(const std::vector<std::string>& args) { return wait_for(spawn(cli_exe(), args)); }
+RunResult run_cli(const std::vector<std::string>& args, bool writable_stdout = true) {
+  return wait_for(spawn(cli_exe(), args, writable_stdout));
+}
 
 /// Runs minillm once per argument list, at most `at_once` at a time, and
 /// returns the results in the same order.
@@ -609,6 +616,11 @@ struct EndToEnd {
   RunResult multibyte;              ///< kMultiBytePrompt
   RunResult threaded;               ///< kOraclePrompts[2] again, at threaded_count()
   RunResult q8_0;                   ///< kQ8_0Prompt with --weights q8_0, --threads 1
+  // sampled_args() runs of kOraclePrompts[0], none under TSan:
+  RunResult sampled;      ///< --seed 7
+  RunResult resampled;    ///< --seed 7 again, at threaded_count()
+  RunResult other_seed;   ///< --seed 8
+  RunResult no_penalty;   ///< --seed 7 without --repetition-penalty
 };
 
 /// The prompt of the --weights q8_0 run. Prompt 2 is the one whose Q8_0
@@ -636,6 +648,28 @@ std::vector<std::string> greedy_args(std::string_view prompt, std::size_t max_to
                                    "--threads",     std::to_string(threads),
                                    "--print-ids"};
   if (ignore_eos) args.emplace_back("--ignore-eos");
+  return args;
+}
+
+/// Tokens each sampled run generates.
+constexpr std::size_t kSampledTokens = 16;
+
+/// A sampled run of kOraclePrompts[0] with every sampling flag set. The test
+/// compares these runs with each other and with greedy, which catches a
+/// --temperature, --seed or --repetition-penalty that never reaches the
+/// sampler; nothing pins --top-k or --top-p, or the sampler keeping its
+/// random state from one step to the next.
+std::vector<std::string> sampled_args(int seed, int threads, bool penalty) {
+  std::vector<std::string> args = {"--model",      checkpoint_dir().string(),
+                                   "--prompt",     std::string(kOraclePrompts[0]),
+                                   "--max-tokens", std::to_string(kSampledTokens),
+                                   "--temperature", "0.8",
+                                   "--top-k",      "40",
+                                   "--top-p",      "0.9",
+                                   "--seed",       std::to_string(seed),
+                                   "--threads",    std::to_string(threads),
+                                   "--ignore-eos", "--print-ids"};
+  if (penalty) args.insert(args.end(), {"--repetition-penalty", "1.2"});
   return args;
 }
 
@@ -717,14 +751,24 @@ const EndToEnd& end_to_end() {
     std::vector<std::string> q8_0 = greedy_args(kOraclePrompts[kQ8_0Prompt], q8_0_tokens, true, 1);
     q8_0.insert(q8_0.end(), {"--weights", "q8_0"});
     add(r.q8_0, std::move(q8_0));
+    // Every other run is greedy, which ignores the sampling flags. Under TSan
+    // these would add model loads to its tightest test, and the threaded
+    // kernels they run are the greedy runs' too.
+    if (!kTsan) {
+      add(r.sampled, sampled_args(7, 1, true));
+      add(r.other_seed, sampled_args(8, 1, true));
+      add(r.no_penalty, sampled_args(7, 1, false));
+    }
     std::vector<RunResult> results = run_all(batch, kRunsAtOnce);
     for (std::size_t i = 0; i < results.size(); ++i) *into[i] = std::move(results[i]);
     r.threaded = run_cli(greedy_args(kOraclePrompts[2], n_tokens[2], true, threaded_count()));
+    if (!kTsan) r.resampled = run_cli(sampled_args(7, threaded_count(), true));
 
     // Until every module the binary uses is implemented, it stops at the
     // first stub it reaches and says so.
-    for (const RunResult* run : {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos,
-                                 &r.f32, &r.multibyte, &r.threaded, &r.q8_0}) {
+    for (const RunResult* run :
+         {&r.oracle[0], &r.oracle[1], &r.oracle[2], &r.stop_at_eos, &r.f32, &r.multibyte,
+          &r.threaded, &r.q8_0, &r.sampled, &r.resampled, &r.other_seed, &r.no_penalty}) {
       if (run->exit_code != 0 && contains(run->err, "not implemented")) {
         r.skip_reason =
             "the engine is incomplete — " + line_containing(run->err, "not implemented");
@@ -1371,6 +1415,27 @@ TEST_CASE("Utf8Stream: long random byte strings cut at random add up to decode()
 // 1d. The generation loop, with a fake model
 // ===========================================================================
 
+TEST_CASE("write_flushed writes and flushes, and throws when the stream cannot take the bytes") {
+  const fs::path dir = make_temp_dir("cli_write_flushed");
+  const fs::path file = dir / "out.txt";
+  {
+    std::FILE* out = std::fopen(file.c_str(), "wb");
+    REQUIRE(out != nullptr);
+    cli::write_flushed(out, "the capital");
+    cli::write_flushed(out, "");
+    // Flushed, so the bytes are in the file while it is still open.
+    CHECK(read_file(file) == "the capital");
+    std::fclose(out);
+  }
+  // A stream opened for reading takes no writes, like a read-only stdout.
+  std::FILE* in = std::fopen(file.c_str(), "rb");
+  REQUIRE(in != nullptr);
+  CHECK_THROWS_WITH_AS(cli::write_flushed(in, "x"), doctest::Contains("writing to stdout failed"),
+                       std::runtime_error);
+  CHECK_NOTHROW(cli::write_flushed(in, ""));
+  std::fclose(in);
+}
+
 TEST_CASE("generate: prefill once at position 0, then one token per call at the cache length") {
   const LoopRun run = run_loop({11, 12, 13, 14}, 4, -1);
   assert_equal(run.gen.ids, std::vector<std::int32_t>{11, 12, 13, 14}, "generated ids");
@@ -1589,6 +1654,14 @@ TEST_CASE("minillm turns a failure inside the engine into a message, not an esca
   CHECK(r.err.starts_with("minillm: error: "));
 }
 
+TEST_CASE("minillm --help exits 1 when its stdout cannot be written") {
+  if (!have_cli()) return;
+  const RunResult r = run_cli({"--help"}, /*writable_stdout=*/false);
+  CHECK_FALSE(r.signaled);
+  CHECK(r.exit_code == 1);
+  CHECK(r.err.starts_with("minillm: error: writing to stdout failed: "));
+}
+
 // ===========================================================================
 // 3. End to end
 // ===========================================================================
@@ -1635,6 +1708,25 @@ TEST_CASE("end to end: --threads sizes the pool and leaves greedy output unchang
 }
 
 // Not under TSan (see the batch in end_to_end()).
+TEST_CASE("end to end: a sampled run follows its flags and its seed, at any --threads" *
+          doctest::skip(kTsan)) {
+  const EndToEnd* e2e = e2e_or_skip();
+  if (!e2e) return;
+  const std::vector<std::int32_t> ids = generated_ids(e2e->sampled);
+  CHECK(ids.size() == kSampledTokens);
+  // The seed fixes the run, whatever --threads is.
+  assert_equal(generated_ids(e2e->resampled), ids, "--seed 7 at --threads 1 and N");
+  CHECK(e2e->resampled.out == e2e->sampled.out);
+  // And each flag changes it. A run that ignored --temperature would be the
+  // greedy one, one that ignored --seed the same for both seeds, and one
+  // that ignored --repetition-penalty the same with and without it.
+  std::vector<std::int32_t> greedy = expected_greedy_ids(0);
+  greedy.resize(std::min(greedy.size(), kSampledTokens));
+  CHECK(ids != greedy);
+  CHECK(generated_ids(e2e->other_seed) != ids);
+  CHECK(generated_ids(e2e->no_penalty) != ids);
+}
+
 TEST_CASE("end to end: --weights f32 still runs f32 weights, with the same tokens and text" *
           doctest::skip(kTsan)) {
   const EndToEnd* e2e = e2e_or_skip();
@@ -1745,6 +1837,18 @@ TEST_CASE("end to end: generation stops at eos, which is neither printed nor cou
   assert_equal(generated_ids(run), expected, "prompt 1 up to eos");
   CHECK(contains(run.err, "stopped at eos after " + std::to_string(expected.size()) + " tokens"));
   CHECK(run.out == tok->decode(expected) + "\n");
+}
+
+// Not under TSan, where every extra model load costs CI time and nothing
+// here is threaded: the write fails on the first token, on one thread.
+TEST_CASE("end to end: a failed write to stdout stops generation with exit status 1" *
+          doctest::skip(kTsan)) {
+  if (!e2e_or_skip()) return;
+  const RunResult r = run_cli(greedy_args(kOraclePrompts[0], 4, true, 1), /*writable_stdout=*/false);
+  CHECK_FALSE(r.signaled);
+  CHECK(r.exit_code == 1);
+  CHECK(contains(r.err, "\nminillm: error: writing to stdout failed: "));
+  CHECK_FALSE(contains(r.err, "minillm: stopped at"));
 }
 
 TEST_CASE("end to end: streamed stdout is byte for byte a one-call decode of the ids") {

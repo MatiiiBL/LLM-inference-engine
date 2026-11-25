@@ -780,6 +780,49 @@ TEST_CASE("forward() rejects bad arguments and leaves the cache and the last log
   }
 }
 
+TEST_CASE("forward() rejects a KV cache it cannot write, rather than writing past it") {
+  const ModelConfig cfg = tiny_config();  // 2 layers, 2 KV heads, head_dim 4
+  Model model(cfg, random_weights(cfg), 8);
+  const std::vector<std::int32_t> ids = random_ids(4, 40, 6);
+  const std::span<const float> l = model.forward(ids, 0);
+  const std::vector<float> expected(l.begin(), l.end());
+
+  // kv_cache() returns the cache by reference, so a caller can assign it
+  // another one. Before this check, the first wrote 4 tokens' keys into a
+  // cache with room for 1 float per position, and the last made the arena
+  // run out of scratch for a 20-token prompt the 32-position cache allowed.
+  struct Case {
+    const char* what;
+    KVCache cache;
+  };
+  // KVCache(n_layers, max_seq_len, n_kv_heads, head_dim): each case but the
+  // overflow one differs from the model in one field only.
+  Case cases[] = {
+      {"fewer layers", KVCache(1, 8, 2, 4)},
+      {"more layers", KVCache(3, 8, 2, 4)},
+      {"fewer KV heads", KVCache(2, 8, 1, 4)},
+      {"a smaller head_dim", KVCache(2, 8, 2, 2)},
+      {"one float per position", KVCache(2, 4, 1, 1)},
+      {"more positions than the scratch holds", KVCache::for_model(cfg, 32)},
+  };
+  for (Case& c : cases) {
+    CAPTURE(c.what);
+    model.kv_cache() = std::move(c.cache);
+    CHECK(contains(forward_error(model, ids, 0), "forward: the KV cache has "));
+    CHECK(contains(forward_error(model, std::vector<std::int32_t>(20, 1), 0),
+                   "this model needs 2 layers, at most 8 positions, 2 KV heads and head_dim 4"));
+    CHECK(model.kv_cache().seq_len() == 0);
+  }
+
+  // A cache it can write runs as the constructor's own does, a shorter one too.
+  for (const std::int64_t positions : {8, 4}) {
+    CAPTURE(positions);
+    model.kv_cache() = KVCache::for_model(cfg, positions);
+    const std::span<const float> got = model.forward(ids, 0);
+    CHECK(std::equal(got.begin(), got.end(), expected.begin(), expected.end()));
+  }
+}
+
 TEST_CASE("a start_pos before the cache length re-runs from there") {
   const ModelConfig cfg = tiny_config();
   const Weights w = random_weights(cfg);

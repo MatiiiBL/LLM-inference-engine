@@ -14,6 +14,7 @@
 
 #include <charconv>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -606,6 +607,65 @@ TEST_CASE("SmolLM2 matches tokenizers where the obvious implementation would not
   CHECK(tok->encode("\x04").empty());
 }
 
+TEST_CASE("SmolLM2 matches tokenizers on every White_Space code point, and on look-alikes") {
+  const Tokenizer* tok = smollm();
+  if (!tok) return;
+
+  // "a", two spaces, c, "b". The regex's \s+(?!\S) keeps the two spaces one
+  // pre-token, ĠĠ (256), exactly when c is \s, Oniguruma's White_Space
+  // property; otherwise the first space stands alone as Ġ (216). The corpus
+  // only has five of the 25 White_Space code points, so a missing or extra
+  // one in is_space() would pass every other test. The look-alikes are \s in
+  // Python (U+001C..U+001F), formerly White_Space (U+180E), or blank but not
+  // spaces (U+200B, U+FEFF). Ids from tokenizers 0.23.3.
+  struct Case {
+    char32_t c;
+    Ids ids;
+  };
+  const Case cases[] = {
+      {0x0009, {81, 256, 197, 82}},
+      {0x000A, {81, 256, 198, 82}},
+      {0x000B, {81, 256, 199, 82}},
+      {0x000C, {81, 256, 200, 82}},
+      {0x000D, {81, 256, 201, 82}},
+      {0x0020, {81, 256, 278}},
+      {0x0085, {81, 256, 141, 223, 82}},
+      {0x00A0, {81, 256, 15442, 82}},
+      {0x1680, {81, 256, 172, 244, 218, 82}},
+      {0x2000, {81, 256, 321, 218, 82}},
+      {0x2001, {81, 256, 321, 219, 82}},
+      {0x2002, {81, 256, 321, 220, 82}},
+      {0x2003, {81, 256, 321, 221, 82}},
+      {0x2004, {81, 256, 321, 222, 82}},
+      {0x2005, {81, 256, 321, 223, 82}},
+      {0x2006, {81, 256, 321, 224, 82}},
+      {0x2007, {81, 256, 321, 225, 82}},
+      {0x2008, {81, 256, 321, 226, 82}},
+      {0x2009, {81, 256, 321, 227, 82}},
+      {0x200A, {81, 256, 321, 228, 82}},
+      {0x2028, {81, 256, 321, 118, 82}},
+      {0x2029, {81, 256, 321, 119, 82}},
+      {0x202F, {81, 256, 321, 124, 82}},
+      {0x205F, {81, 256, 32571, 249, 82}},
+      {0x3000, {81, 256, 12109, 218, 82}},
+      {0x001C, {81, 216, 216, 213, 82}},
+      {0x001D, {81, 216, 216, 82}},
+      {0x001E, {81, 216, 216, 214, 82}},
+      {0x001F, {81, 216, 216, 215, 82}},
+      {0x180E, {81, 216, 15822, 250, 232, 82}},
+      {0x200B, {81, 216, 459, 229, 82}},
+      {0xFEFF, {81, 216, 216, 186, 136, 140, 82}},
+  };
+  for (const Case& k : cases) {
+    std::string text = "a  ";
+    append_utf8(text, k.c);
+    text += "b";
+    char label[16];
+    std::snprintf(label, sizeof(label), "U+%04X", static_cast<unsigned>(k.c));
+    check_ids(tok->encode(text), k.ids, label);
+  }
+}
+
 // --------------------------------------------------------------------------
 // The pipeline stage by stage, on the tiny tokenizer
 // --------------------------------------------------------------------------
@@ -777,4 +837,88 @@ TEST_CASE("from_file throws on anything it does not implement") {
   CHECK_THROWS_AS(Tokenizer::from_file(dir.write("bad.json", "{\"model\": ")), std::runtime_error);
   CHECK_THROWS_AS(Tokenizer::from_file(dir.write("list.json", "[]")), std::runtime_error);
   CHECK_THROWS_AS(Tokenizer::from_dir(dir.path()), std::runtime_error);
+}
+
+TEST_CASE("from_file rejects ids that are not integers, leave gaps, or belong to another token") {
+  const std::string tiny = TinyTokenizer{}.json();
+  using Edit = std::pair<std::string_view, std::string_view>;
+  // The tiny tokenizer.json with the first `from` (which must occur in it)
+  // replaced by `to`, for each edit in turn.
+  const auto edited = [&](const std::vector<Edit>& edits) {
+    std::string text = tiny;
+    for (const auto& [from, to] : edits) {
+      const std::size_t at = text.find(from);
+      REQUIRE(at != std::string::npos);
+      text.replace(at, from.size(), to);
+    }
+    return text;
+  };
+  const TempDir dir;
+  const auto load = [&](const std::string& text) {
+    return Tokenizer::from_file(dir.write("tokenizer.json", text));
+  };
+  CHECK_NOTHROW(load(tiny));
+
+  // Every added token is in model.vocab too, under the same id, as in
+  // SmolLM2's file. Taking "<x>" out of model.vocab leaves it an added token
+  // only, still a valid file.
+  const Edit only_added{R"("<x>": 266, )", ""};
+  CHECK(load(edited({only_added})).encode("<x>") == Ids{kX});
+
+  struct Case {
+    std::string what;
+    std::vector<Edit> edits;
+    std::string message;
+  };
+  const Case cases[] = {
+      // A plain cast would make this id 259, or 1e300 undefined behaviour.
+      {"a fractional id", {{R"("abc": 259)", R"("abc": 259.75)"}},
+       "model.vocab id is not an integer: 259.75"},
+      {"an id past int64", {{R"("abc": 259)", R"("abc": 1e300)"}},
+       "model.vocab id is not an integer"},
+      {"a fractional added id", {{R"({"id": 266, )", R"({"id": 266.5, )"}},
+       "added_tokens id is not an integer"},
+      // Rejected before a 2^31-entry table is allocated for it.
+      {"a huge id", {{R"("abc": 259)", R"("abc": 2147483646)"}},
+       "model.vocab id 2147483646 is not below the 272 tokens"},
+      {"an added token away from its model.vocab id", {{R"({"id": 268, )", R"({"id": 97, )"}},
+       "added token zz has id 97, but model.vocab gives it 268"},
+      {"an added token on another token's model.vocab id",
+       {only_added, {R"({"id": 266, )", R"({"id": 97, )"}},
+       "added token <x> has id 97, which model.vocab gives to a"},
+      {"two added tokens on one id", {only_added, {R"({"id": 267, )", R"({"id": 266, )"}},
+       "added_tokens assigns id 266 twice"},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.what);
+    CHECK_THROWS_WITH_AS(load(edited(c.edits)), doctest::Contains(c.message.c_str()),
+                         std::runtime_error);
+  }
+}
+
+TEST_CASE("JSON nested more than 127 deep is rejected, not a stack overflow") {
+  const auto nested = [](int n) { return std::string(n, '[') + std::string(n, ']'); };
+  // The root object is one level, so a normalizer of n nested arrays makes
+  // tokenizer.json 1 + n deep. tokenizers accepts 127 levels and rejects
+  // 128; at 127 this is rejected for being a normalizer.
+  TinyTokenizer at_limit;
+  at_limit.normalizer = nested(126);
+  CHECK_THROWS_WITH_AS(load_tiny(at_limit), doctest::Contains("normalizer is not supported"),
+                       std::runtime_error);
+  TinyTokenizer over;
+  over.normalizer = nested(127);
+  CHECK_THROWS_WITH_AS(load_tiny(over), doctest::Contains("nests JSON more than 127 levels deep"),
+                       std::runtime_error);
+  // Quoting this normalizer in that error message overflowed the stack.
+  TinyTokenizer deep;
+  deep.normalizer = nested(100000);
+  CHECK_THROWS_WITH_AS(load_tiny(deep), doctest::Contains("more than 127 levels deep"),
+                       std::runtime_error);
+
+  const TempDir dir;
+  dir.write("tokenizer.json", TinyTokenizer{}.json());
+  dir.write("tokenizer_config.json", R"({"bos_token": )" + nested(100000) + "}");
+  CHECK_THROWS_WITH_AS(Tokenizer::from_dir(dir.path()),
+                       doctest::Contains("tokenizer_config.json: nests JSON more than 127"),
+                       std::runtime_error);
 }

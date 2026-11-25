@@ -32,7 +32,8 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     -n)
       [[ $# -ge 2 && $2 =~ ^[0-9]+$ ]] || usage
-      n=$2
+      # Decimal: bash arithmetic would read 010 as 8, and 08 not at all.
+      n=$((10#$2))
       shift 2
       ;;
     --)

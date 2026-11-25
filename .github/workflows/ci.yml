@@ -18,9 +18,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # The full pipeline: zero warnings, ctest under ASan+UBSan and TSan with zero
-  # skipped oracle checks, then the benchmarks. GCC on Linux, AppleClang on
-  # macOS: the two compilers warn about different things.
+  # The full pipeline: zero warnings, ctest under ASan+UBSan, under TSan and in
+  # the release build, each with zero skipped oracle checks, then the
+  # benchmarks. GCC on Linux, AppleClang on macOS: the two compilers warn about
+  # different things.
   pipeline:
     name: pipeline (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -111,6 +112,9 @@ jobs:
 
       - name: TSan — zero warnings, ctest, zero oracle skips
         run: ci/run.sh tsan
+
+      - name: Release — zero warnings, ctest, zero oracle skips, Q8_0 KL gate
+        run: ci/run.sh release
 
       - name: Release — benchmarks
         run: ci/run.sh bench

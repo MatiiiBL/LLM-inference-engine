@@ -26,6 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "json_depth.h"
 #include "minillm/loader.h"
 
 namespace minillm {
@@ -52,14 +53,18 @@ constexpr std::uint64_t kMaxHeaderLen = 100'000'000;
 /// other without a word, so in a safetensors header one tensor's entry would
 /// silently replace another's. `on_duplicate(top, key)` must throw; `top` is
 /// the root-level key the repeat sits under, empty when the repeat is a
-/// root-level key itself.
-template <class Json, class Input, class OnDuplicate>
-Json parse_unique_keys(Input&& input, const OnDuplicate& on_duplicate) {
+/// root-level key itself. `on_too_deep()` must throw too: it is called, before
+/// anything deeper is built, at a container nested more than
+/// loader_detail::kMaxJsonDepth deep (json_depth.h says why).
+template <class Json, class Input, class OnDuplicate, class OnTooDeep>
+Json parse_unique_keys(Input&& input, const OnDuplicate& on_duplicate,
+                       const OnTooDeep& on_too_deep) {
   std::vector<std::set<std::string>> open;  // keys seen so far, per open object
   std::string top;                          // the root object's latest key
   return Json::parse(std::forward<Input>(input),
                      [&](int depth, nlohmann::json::parse_event_t event, Json& parsed) {
                        using Event = nlohmann::json::parse_event_t;
+                       if (loader_detail::opens_too_deep(depth, event)) on_too_deep();
                        if (event == Event::object_start) {
                          open.emplace_back();
                        } else if (event == Event::object_end) {
@@ -184,12 +189,17 @@ SafetensorsFile open_safetensors(const fs::path& file) {
 
   ordered_json root;
   try {
-    root = parse_unique_keys<ordered_json>(header, [&](const std::string& top,
-                                                       const std::string& key) {
-      if (top.empty()) fail(file, "the header has two entries named '" + key + "'");
-      fail(file, (top == "__metadata__" ? "\"__metadata__\"" : "tensor '" + top + "'") +
-                     ": the key \"" + key + "\" appears twice");
-    });
+    root = parse_unique_keys<ordered_json>(
+        header,
+        [&](const std::string& top, const std::string& key) {
+          if (top.empty()) fail(file, "the header has two entries named '" + key + "'");
+          fail(file, (top == "__metadata__" ? "\"__metadata__\"" : "tensor '" + top + "'") +
+                         ": the key \"" + key + "\" appears twice");
+        },
+        [&] {
+          fail(file, "the header nests JSON more than " +
+                         std::to_string(loader_detail::kMaxJsonDepth) + " levels deep");
+        });
   } catch (const ordered_json::exception& e) {
     fail(file, std::string("header is not valid JSON: ") + e.what());
   }
@@ -419,11 +429,16 @@ Weights load_checkpoint(const std::filesystem::path& model_dir) {
     std::ifstream in(index_path, std::ios::binary);
     if (!in) fail(index_path, "cannot open file");
     try {
-      index = parse_unique_keys<nlohmann::json>(in, [&](const std::string& top,
-                                                        const std::string& key) {
-        fail(index_path, (top.empty() ? std::string() : "\"" + top + "\": ") + "the key \"" +
-                             key + "\" appears twice");
-      });
+      index = parse_unique_keys<nlohmann::json>(
+          in,
+          [&](const std::string& top, const std::string& key) {
+            fail(index_path, (top.empty() ? std::string() : "\"" + top + "\": ") + "the key \"" +
+                                 key + "\" appears twice");
+          },
+          [&] {
+            fail(index_path, "nests JSON more than " +
+                                 std::to_string(loader_detail::kMaxJsonDepth) + " levels deep");
+          });
     } catch (const nlohmann::json::exception& e) {
       fail(index_path, std::string("not valid JSON: ") + e.what());
     }

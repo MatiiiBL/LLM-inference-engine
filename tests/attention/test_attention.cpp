@@ -390,6 +390,38 @@ TEST_CASE("ops::attention keeps the softmax stable for large logits") {
   check_against_ref(ones, falling, v, n_kv - 1, 1.0f, "falling scores");
 }
 
+TEST_CASE("ops::attention gives keys whose score overflows to -inf weight 0, as ref:: does") {
+  // q . k = 64 * 1e20 * -1e20 overflows to -inf for the first `n_inf` keys;
+  // the rest score 0. The kernel visits keys in blocks of 128, so with
+  // n_inf = 128 or more a whole block is -inf before any finite score has set
+  // a running max. A query row whose every key is -inf is NaN in both.
+  Tensor q = Tensor::empty({1, 9, 64});
+  for (std::int64_t i = 0; i < q.numel(); ++i) q.f32()[i] = 1e20f;
+  for (const std::int64_t n_inf : {1, 127, 128, 129, 200, 256}) {
+    for (const std::int64_t n_kv : {n_inf, n_inf + 1, n_inf + 70}) {
+      CAPTURE(n_inf);
+      CAPTURE(n_kv);
+      Tensor k = Tensor::zeros({n_kv, 3, 64});
+      for (std::int64_t j = 0; j < n_inf; ++j) {
+        for (std::int64_t i = 0; i < 3 * 64; ++i) k.f32()[j * 3 * 64 + i] = -1e20f;
+      }
+      const Tensor v = random_tensor({n_kv, 3, 64}, 460 + static_cast<std::uint64_t>(n_kv));
+      check_against_ref(q, k, v, n_kv - 1, 0.125f,
+                        std::to_string(n_inf) + " of " + std::to_string(n_kv) + " keys at -inf");
+      // One of them scores NaN instead (1e40 overflows to +inf in dimension
+      // 0, -inf in the others): the whole row is NaN, as in ref::, wherever
+      // the block boundary falls.
+      const std::int64_t nan_key = n_inf / 2;
+      k.f32()[nan_key * 3 * 64] = 1e20f;
+      k.f32()[nan_key * 3 * 64 + 64] = 1e20f;
+      k.f32()[nan_key * 3 * 64 + 128] = 1e20f;
+      check_against_ref(q, k, v, n_kv - 1, 0.125f,
+                        std::to_string(n_inf) + " of " + std::to_string(n_kv) +
+                            " keys at -inf, one at NaN");
+    }
+  }
+}
+
 TEST_CASE("ops::attention accepts an empty pass") {
   // Zero query rows is a legal no-op, including against an empty cache.
   const Tensor q = Tensor::zeros({0, 9, 64});

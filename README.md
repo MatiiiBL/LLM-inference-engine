@@ -111,7 +111,7 @@ oracle/.venv/bin/python oracle/generate.py
 
 One command, idempotent, fixed seeds. It downloads the checkpoint (~270 MB)
 into `models/SmolLM2-135M/`, loads it with transformers in float32 with
-`attn_implementation="eager"`, and writes ~215 files into `oracle/data/`:
+`attn_implementation="eager"`, and writes 320 files into `oracle/data/`:
 
 | Directory | What |
 | --- | --- |
@@ -120,6 +120,7 @@ into `models/SmolLM2-135M/`, loads it with transformers in float32 with
 | `weights/` | per-layer-type samples: shape, stored dtype, first 16 values, fp32 sum |
 | `attention/` | layers 0 and 15 stage by stage: q/k/v projections, post-RoPE q/k, attention output, o_proj |
 | `model/` | 3 prompts: input ids, all 31 hidden states, logits, 64-token greedy generation |
+| `model_q8_0/` | the same 3 prompts with every projection and the embedding rounded to Q8_0, `dequantize(quantize_q8_0(W))`, plus `blocks.sha256`: the SHA-256 of each tensor's Q8_0 blocks, which the C++ quantizer must reproduce |
 | `manifest.json` | every file with its shape, dtype and description, plus the versions used |
 
 Use `--skip-download` to regenerate from an already-downloaded checkpoint
@@ -137,7 +138,7 @@ stage of [`ci/run.sh`](ci/run.sh), so the same pipeline runs locally from a
 clean clone with one command:
 
 ```sh
-ci/run.sh              # oracle -> asan -> tsan -> bench
+ci/run.sh              # oracle -> asan -> tsan -> release -> bench
 ci/run.sh asan         # or any subset of stages, in the order given
 ```
 
@@ -147,7 +148,11 @@ A run fails on:
   become errors through `CMAKE_COMPILE_WARNING_AS_ERROR`, which stays set in
   that build tree afterwards, so an incremental build cannot hide one. The
   build log is also grepped for linker and CMake warnings.
-- A failing test under ASan+UBSan or under TSan.
+- A failing test under ASan+UBSan, under TSan, or in the `release` build. The
+  release run is the one that checks the optimized code users run: the
+  tolerances were measured there, and the Q8_0 KL gate (`tests/model`) runs
+  only there. The stage also fails if that gate did not report all three of
+  its KL means, so a gate that silently stopped running cannot pass.
 - **Any skipped oracle check.** With `oracle/data/` and `models/` in place there
   are none, so a skip means one of them is missing or broken. That should be a
   red run, not a suspiciously fast green one. Skips that are pending another
@@ -180,8 +185,10 @@ status 2 if that is missing.
 
 ### Reading the benchmark output
 
-**Whole model** comes first: prefill and decode throughput in tokens/s, then
-peak RSS.
+**Whole model** comes first: prefill and decode throughput in tokens/s in each
+weight format, f32, bf16 (what `--weights auto` picks for SmolLM2-135M) and
+q8_0, then the f32 model's peak RSS. A format the checkpoint cannot be
+converted to, such as bf16 for one stored in f32, is reported as skipped.
 
 - *Prefill* is one forward pass over a 128-token synthetic prompt, starting
   from an empty cache.
@@ -214,11 +221,20 @@ its row shows is therefore the noise floor: about ±1% on a quiet machine, and a
 lot more while other jobs are running. An optimization that does not clear the
 noise floor has not been measured.
 
+**Q8_0 vs F32** and **BF16 vs F32** time `ops::matmul` over whole sweeps of the
+model's linear layers, the two formats' samples interleaved: one decode token
+(every projection and the LM head at m = 1, 211 calls), and every projection
+at m = 64 and at m = 79, the longest oracle prompt (210 calls). `speedup` is
+F32 time / the format's time. The decode row adds the weight bytes per second
+of each format and `read GB/s`, a plain sequential read of the F32 weights in
+the same rounds, the memory ceiling that decode is up against.
+
 **Runtime** times the thread pool itself: one `kernel_parallel_for` over 1024
 items with a trivial body, at each `--threads` count. `runtime.parallel_for.hot`
 calls back to back, as the forward pass does (about 240 calls per decode step);
-`runtime.parallel_for.cold` calls after the workers have gone to sleep, so it
-includes waking them.
+`runtime.parallel_for.large` is the same with a work size big enough to use
+every thread, as a prefill matmul does; `runtime.parallel_for.cold` calls after
+the workers have gone to sleep, so it includes waking them.
 
 **Machine-readable lines** close the run, one per measurement:
 
@@ -240,8 +256,13 @@ Names follow these patterns:
 | `op.<regime>.<op>.ops` / `.ref` | µs per call |
 | `op.<regime>.<op>.speedup` | ratio |
 | `op.<regime>.<op>.scaling` | ratio, only with several `--threads` counts |
-| `model.prefill`, `model.decode` | tok/s |
-| `memory.peak_rss.model` | MiB, after load + prefill + decode |
+| `model.prefill`, `model.decode` | tok/s, f32 weights |
+| `model.prefill.bf16`, `model.decode.bf16`, `.q8_0` | tok/s, bf16 or q8_0 weights |
+| `q8_0.<sweep>.f32` / `.q8_0`, `bf16.<sweep>.f32` / `.bf16` | µs per sweep; `<sweep>` is `decode.token`, `prefill.m64` or `prefill.m79` |
+| `q8_0.<sweep>.speedup`, `bf16.<sweep>.speedup` | ratio |
+| `q8_0.decode.token.f32.gbps`, `.q8_0.gbps`, `q8_0.read.gbps` (and `bf16.` likewise) | GB/s |
+| `runtime.parallel_for.hot` / `.large` / `.cold` | µs per call |
+| `memory.peak_rss.model` | MiB, after the f32 model's load + prefill + decode |
 | `memory.peak_rss.process` | MiB, whole run |
 
 `ci/run.sh bench` writes them to `build/release/bench-results.jsonl`, and CI

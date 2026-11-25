@@ -6,11 +6,13 @@
 // stderr, so `minillm ... > out.txt` captures exactly the generated text.
 //
 // Exit status: 0 on success (and for --help), 2 for a malformed command line,
-// 1 for anything that goes wrong after parsing. No exception escapes main().
+// 1 for anything that goes wrong after parsing, a failed write to stdout
+// included. No exception escapes main().
 //
 // The pieces live in private headers next to this file so the test can reach
-// them: args.h (flags, usage, the model-directory check), utf8_stream.h and
-// generate.h (the prefill/decode loop).
+// them: args.h (flags, usage, the model-directory check), utf8_stream.h,
+// output.h (checked writes to stdout) and generate.h (the prefill/decode
+// loop).
 
 #include <chrono>
 #include <cstddef>
@@ -34,6 +36,7 @@
 #include "minillm/runtime.h"
 #include "minillm/sampler.h"
 #include "minillm/tokenizer.h"
+#include "output.h"
 #include "utf8_stream.h"
 
 namespace {
@@ -42,12 +45,6 @@ using Clock = std::chrono::steady_clock;
 
 double seconds_between(Clock::time_point a, Clock::time_point b) {
   return std::chrono::duration<double>(b - a).count();
-}
-
-void write_stdout(const std::string& bytes) {
-  if (bytes.empty()) return;
-  std::fwrite(bytes.data(), 1, bytes.size(), stdout);
-  std::fflush(stdout);
 }
 
 void print_ids(const char* label, std::span<const std::int32_t> ids) {
@@ -164,9 +161,9 @@ int run(const minillm::cli::Options& opts) {
           t_first = Clock::now();
           first = false;
         }
-        write_stdout(stream.push(tokenizer.decode_token(id)));
+        cli::write_flushed(stdout, stream.push(tokenizer.decode_token(id)));
       });
-  write_stdout(stream.finish() + "\n");
+  cli::write_flushed(stdout, stream.finish() + "\n");
   const Clock::time_point t_end = Clock::now();
 
   const auto n_gen = static_cast<long long>(gen.ids.size());
@@ -198,7 +195,7 @@ int main(int argc, char** argv) {
       return 2;
     }
     if (opts.help) {
-      std::fwrite(minillm::cli::kUsage.data(), 1, minillm::cli::kUsage.size(), stdout);
+      minillm::cli::write_flushed(stdout, minillm::cli::kUsage);
       return 0;
     }
     return run(opts);

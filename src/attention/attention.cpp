@@ -256,9 +256,20 @@ void softmax_block(float* s, std::int64_t n, float scale, bool first_block, floa
     running_max = block_max;
   }
 
+  // No score so far may be finite: each is -inf, as when finite q and k have
+  // a dot product that overflows, or NaN, which never raises the max. With
+  // m = -inf, s - m would be -inf - -inf = NaN for the -inf ones, and the NaN
+  // would survive every later block. Next to the max over all the keys, which
+  // is what ref:: takes, they weigh exactly 0, so the weights are taken
+  // against 0 instead: exp(-inf) = 0, while a NaN score stays NaN and reaches
+  // the sum and the output, as in ref::. A later block with a finite max
+  // rescales this sum by exp(-inf - max) = 0. If none has one, the final
+  // division is 0 / 0 = NaN, as in ref:: too.
+  const float m =
+      running_max == -std::numeric_limits<float>::infinity() ? 0.0f : running_max;
+
   // Weights, four lanes at a time. The last partial vector is padded with
   // -inf, whose weight is exactly 0.
-  const float m = running_max;
   f32x4 total = splat4(0.0f);
   for (j = 0; j + 4 <= n; j += 4) {
     const f32x4 w = exp4(load4(s + j) - m);
