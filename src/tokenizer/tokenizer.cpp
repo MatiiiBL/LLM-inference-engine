@@ -440,22 +440,39 @@ std::shared_ptr<const Tokenizer::Vocab> Tokenizer::Vocab::load(const json& root,
   auto v = std::make_shared<Vocab>();
   constexpr std::int64_t kMaxId = std::numeric_limits<std::int32_t>::max() - 1;
 
+  const json& vocab = root.at("model").at("vocab");
+  if (!vocab.is_object()) fail(where, "model.vocab is not an object");
+  // The ids must be 0..n-1 without gaps, and n is at most the number of
+  // entries, so an id at or past that count is rejected before anything is
+  // sized by it: one "zz": 2147483646 would allocate a 2^31-entry table first.
+  const std::size_t entries =
+      vocab.size() + (root.contains("added_tokens") ? root.at("added_tokens").size() : 0);
+
   // Ids, from the model vocab and the added tokens together.
   std::vector<std::string> tokens;  // id -> token string
-  const auto claim = [&](std::int64_t id, const char* what) {
+  const auto claim = [&](const json& id_json, const char* what) {
+    // nlohmann would convert a float with a plain cast: 259.75 would be id
+    // 259, and 1e300 undefined behaviour. tokenizers reads ids as u32.
+    if (!id_json.is_number_integer()) {
+      fail(where, std::string(what) + " id is not an integer: " + id_json.dump());
+    }
+    const std::int64_t id = id_json.get<std::int64_t>();
     if (id < 0 || id > kMaxId) {
       fail(where, std::string(what) + " id out of range: " + std::to_string(id));
     }
     const auto i = static_cast<std::size_t>(id);
+    if (i >= entries) {
+      fail(where, std::string(what) + " id " + std::to_string(id) + " is not below the " +
+                      std::to_string(entries) +
+                      " tokens the file lists (ids must be 0..n-1 without gaps)");
+    }
     if (i >= tokens.size()) tokens.resize(i + 1);
     return i;
   };
 
-  const json& vocab = root.at("model").at("vocab");
-  if (!vocab.is_object()) fail(where, "model.vocab is not an object");
   std::vector<bool> taken;
   for (const auto& [token, id_json] : vocab.items()) {
-    const std::size_t id = claim(id_json.get<std::int64_t>(), "model.vocab");
+    const std::size_t id = claim(id_json, "model.vocab");
     if (id >= taken.size()) taken.resize(id + 1);
     if (taken[id]) fail(where, "model.vocab assigns id " + std::to_string(id) + " twice");
     taken[id] = true;
@@ -468,8 +485,24 @@ std::shared_ptr<const Tokenizer::Vocab> Tokenizer::Vocab::load(const json& root,
   if (root.contains("added_tokens")) {
     for (const json& t : root.at("added_tokens")) {
       const std::string content = t.at("content").get<std::string>();
-      const std::size_t id = claim(t.at("id").get<std::int64_t>(), "added_tokens");
+      const std::size_t id = claim(t.at("id"), "added_tokens");
       if (content.empty()) fail(where, "added token " + std::to_string(id) + " is empty");
+      if (id < added.size() && added[id]) {
+        fail(where, "added_tokens assigns id " + std::to_string(id) + " twice");
+      }
+      // tokenizers ignores an added token's id: it gives the token its
+      // model.vocab id, or the next free one if it has none. So the files it
+      // writes never give an added token an id that belongs to another
+      // token. This file trusts the id, so it rejects a file that does.
+      if (const auto it = v->model_ids.find(content);
+          it != v->model_ids.end() && static_cast<std::size_t>(it->second) != id) {
+        fail(where, "added token " + content + " has id " + std::to_string(id) +
+                        ", but model.vocab gives it " + std::to_string(it->second));
+      }
+      if (id < taken.size() && taken[id] && tokens[id] != content) {
+        fail(where, "added token " + content + " has id " + std::to_string(id) +
+                        ", which model.vocab gives to " + tokens[id]);
+      }
       for (const char* flag : {"single_word", "lstrip", "rstrip"}) {
         if (t.value(flag, false)) {
           fail(where, "added token " + content + ": " + flag + " is not supported");

@@ -779,6 +779,63 @@ TEST_CASE("from_file throws on anything it does not implement") {
   CHECK_THROWS_AS(Tokenizer::from_dir(dir.path()), std::runtime_error);
 }
 
+TEST_CASE("from_file rejects ids that are not integers, leave gaps, or belong to another token") {
+  const std::string tiny = TinyTokenizer{}.json();
+  using Edit = std::pair<std::string_view, std::string_view>;
+  // The tiny tokenizer.json with the first `from` (which must occur in it)
+  // replaced by `to`, for each edit in turn.
+  const auto edited = [&](const std::vector<Edit>& edits) {
+    std::string text = tiny;
+    for (const auto& [from, to] : edits) {
+      const std::size_t at = text.find(from);
+      REQUIRE(at != std::string::npos);
+      text.replace(at, from.size(), to);
+    }
+    return text;
+  };
+  const TempDir dir;
+  const auto load = [&](const std::string& text) {
+    return Tokenizer::from_file(dir.write("tokenizer.json", text));
+  };
+  CHECK_NOTHROW(load(tiny));
+
+  // Every added token is in model.vocab too, under the same id, as in
+  // SmolLM2's file. Taking "<x>" out of model.vocab leaves it an added token
+  // only, still a valid file.
+  const Edit only_added{R"("<x>": 266, )", ""};
+  CHECK(load(edited({only_added})).encode("<x>") == Ids{kX});
+
+  struct Case {
+    std::string what;
+    std::vector<Edit> edits;
+    std::string message;
+  };
+  const Case cases[] = {
+      // A plain cast would make this id 259, or 1e300 undefined behaviour.
+      {"a fractional id", {{R"("abc": 259)", R"("abc": 259.75)"}},
+       "model.vocab id is not an integer: 259.75"},
+      {"an id past int64", {{R"("abc": 259)", R"("abc": 1e300)"}},
+       "model.vocab id is not an integer"},
+      {"a fractional added id", {{R"({"id": 266, )", R"({"id": 266.5, )"}},
+       "added_tokens id is not an integer"},
+      // Rejected before a 2^31-entry table is allocated for it.
+      {"a huge id", {{R"("abc": 259)", R"("abc": 2147483646)"}},
+       "model.vocab id 2147483646 is not below the 272 tokens"},
+      {"an added token away from its model.vocab id", {{R"({"id": 268, )", R"({"id": 97, )"}},
+       "added token zz has id 97, but model.vocab gives it 268"},
+      {"an added token on another token's model.vocab id",
+       {only_added, {R"({"id": 266, )", R"({"id": 97, )"}},
+       "added token <x> has id 97, which model.vocab gives to a"},
+      {"two added tokens on one id", {only_added, {R"({"id": 267, )", R"({"id": 266, )"}},
+       "added_tokens assigns id 266 twice"},
+  };
+  for (const Case& c : cases) {
+    CAPTURE(c.what);
+    CHECK_THROWS_WITH_AS(load(edited(c.edits)), doctest::Contains(c.message.c_str()),
+                         std::runtime_error);
+  }
+}
+
 TEST_CASE("JSON nested more than 128 deep is rejected, not a stack overflow") {
   const auto nested = [](int n) { return std::string(n, '[') + std::string(n, ']'); };
   // The root object is one level, so a normalizer of n nested arrays makes
