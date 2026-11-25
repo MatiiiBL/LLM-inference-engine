@@ -795,11 +795,14 @@ TEST_CASE("forward() rejects a KV cache it cannot write, rather than writing pas
     const char* what;
     KVCache cache;
   };
+  // KVCache(n_layers, max_seq_len, n_kv_heads, head_dim): each case but the
+  // overflow one differs from the model in one field only.
   Case cases[] = {
       {"fewer layers", KVCache(1, 8, 2, 4)},
       {"more layers", KVCache(3, 8, 2, 4)},
-      {"other KV heads", KVCache(2, 8, 1, 8)},
-      {"another head_dim", KVCache(2, 4, 1, 1)},
+      {"fewer KV heads", KVCache(2, 8, 1, 4)},
+      {"a smaller head_dim", KVCache(2, 8, 2, 2)},
+      {"one float per position", KVCache(2, 4, 1, 1)},
       {"more positions than the scratch holds", KVCache::for_model(cfg, 32)},
   };
   for (Case& c : cases) {
