@@ -11,7 +11,7 @@
 //     model's linear layers (a decode token, a prefill), with the plain-read
 //     ceiling
 //   * the same for BF16 weights
-//   * prefill and decode tokens/s for the whole model
+//   * prefill and decode tokens/s for the whole model, in each weight format
 //   * peak resident memory
 //   * what one kernel_parallel_for costs the thread pool, hot and cold, and
 //     with a work size large enough to use every thread
@@ -128,9 +128,10 @@ struct Options {
 
 constexpr const char* kUsage = R"(usage: minillm_bench [options]
 
-Benchmarks every op in ops.h (ops:: vs ref::) at the model's real shapes, then
-prefill and decode throughput for the whole model, then peak resident memory,
-then the thread pool's cost per kernel_parallel_for.
+Benchmarks prefill and decode throughput for the whole model in each weight
+format (f32, bf16, q8_0) and its peak resident memory, then every op in ops.h
+(ops:: vs ref::) at the model's real shapes, then the Q8_0 and BF16 matmuls
+against F32, then the thread pool's cost per kernel_parallel_for.
 Run it from the repository root on the release preset:
 
   cmake --preset release && cmake --build --preset release
@@ -1059,99 +1060,139 @@ std::int32_t greedy(std::span<const float> logits) {
   return ops::argmax(row);
 }
 
-/// Prefill and decode throughput, then the peak RSS they needed. Returns how
-/// many benchmarks matched the filter.
+/// A weight format the whole model is timed in. f32's names carry no suffix:
+/// they are the series CI has recorded since before the other formats
+/// existed. bf16 is what the CLI's default, --weights auto, picks for
+/// SmolLM2-135M.
+struct ModelFormat {
+  const char* name;
+  DType dtype;
+  const char* suffix;
+};
+constexpr ModelFormat kModelFormats[] = {
+    {"f32", DType::F32, ""},
+    {"bf16", DType::BF16, ".bf16"},
+    {"q8_0", DType::Q8_0, ".q8_0"},
+};
+
+/// Prefill and decode throughput in each weight format, and the peak RSS the
+/// f32 model needed. Returns how many benchmarks matched the filter.
 int run_model_benches(const Options& opt, Report& report) {
-  const bool want_prefill = selected(opt, "model.prefill");
-  const bool want_decode = selected(opt, "model.decode");
-  if (!want_prefill && !want_decode) return 0;
-  const int matched = (want_prefill ? 1 : 0) + (want_decode ? 1 : 0);
+  int matched = 0;
+  bool printed_header = false;
+  for (const ModelFormat& format : kModelFormats) {
+    const std::string prefill_name = std::string("model.prefill") + format.suffix;
+    const std::string decode_name = std::string("model.decode") + format.suffix;
+    const bool want_prefill = selected(opt, prefill_name);
+    const bool want_decode = selected(opt, decode_name);
+    if (!want_prefill && !want_decode) continue;
+    matched += (want_prefill ? 1 : 0) + (want_decode ? 1 : 0);
+    const bool is_f32 = format.dtype == DType::F32;
 
-  std::optional<Model> model;
-  try {
-    model.emplace(Model::from_dir(opt.model_dir, opt.prompt_tokens + opt.decode_tokens));
-  } catch (const std::logic_error& e) {
-    if (!is_not_implemented(e)) throw;
-    report.skip("model.prefill, model.decode, memory.peak_rss.model", e.what());
-    return matched;
-  }
-
-  // Synthetic token ids: the tokenizer is not part of what is being timed,
-  // and no kernel's cost depends on which ids it sees.
-  const std::int64_t vocab = model->config().vocab_size;
-  std::vector<std::int32_t> prompt(static_cast<std::size_t>(opt.prompt_tokens));
-  for (std::size_t i = 0; i < prompt.size(); ++i) {
-    prompt[i] = static_cast<std::int32_t>((static_cast<std::int64_t>(i) * 7919 + 13) % vocab);
-  }
-
-  // One run is a prefill of the prompt from an empty cache, then a greedy
-  // decode of decode_tokens tokens, each step timed with its argmax.
-  auto run = [&](double& prefill_s, double& decode_s) {
-    model->reset();
-    const Clock::time_point t0 = Clock::now();
-    std::span<const float> logits = model->forward(prompt, 0);
-    prefill_s = seconds_since(t0);
-
-    const Clock::time_point t1 = Clock::now();
-    for (std::int64_t i = 0; i < opt.decode_tokens; ++i) {
-      const std::int32_t next = greedy(logits);
-      logits = model->forward(std::span<const std::int32_t>(&next, 1), opt.prompt_tokens + i);
+    // One format's model at a time: each is dropped before the next loads.
+    std::optional<Model> model;
+    try {
+      model.emplace(
+          Model::from_dir(opt.model_dir, opt.prompt_tokens + opt.decode_tokens, format.dtype));
+    } catch (const std::logic_error& e) {
+      if (!is_not_implemented(e)) throw;
+      report.skip(prefill_name + ", " + decode_name + (is_f32 ? ", memory.peak_rss.model" : ""),
+                  e.what());
+      continue;
     }
-    keep_alive(logits.data());
-    decode_s = seconds_since(t1);
-  };
 
-  std::printf("\n== whole model — %lld layers, %lld-token synthetic prompt, greedy decode ==\n\n",
-              static_cast<long long>(model->config().num_hidden_layers),
-              static_cast<long long>(opt.prompt_tokens));
-  std::fflush(stdout);
+    // Synthetic token ids: the tokenizer is not part of what is being timed,
+    // and no kernel's cost depends on which ids it sees.
+    const std::int64_t vocab = model->config().vocab_size;
+    std::vector<std::int32_t> prompt(static_cast<std::size_t>(opt.prompt_tokens));
+    for (std::size_t i = 0; i < prompt.size(); ++i) {
+      prompt[i] = static_cast<std::int32_t>((static_cast<std::int64_t>(i) * 7919 + 13) % vocab);
+    }
 
-  // With several thread counts, the runs are interleaved across them, one
-  // run at each count per round, as the op samples are.
-  const std::size_t n_counts = opt.threads.size();
-  double prefill_s = 0.0;
-  double decode_s = 0.0;
-  for (const int threads : opt.threads) {
-    set_num_threads(threads);
-    run(prefill_s, decode_s);  // warm-up
-  }
-  std::vector<std::vector<double>> prefill_tps(n_counts);
-  std::vector<std::vector<double>> decode_tps(n_counts);
-  for (int s = 0; s < opt.samples; ++s) {
+    // One run is a prefill of the prompt from an empty cache, then a greedy
+    // decode of decode_tokens tokens, each step timed with its argmax.
+    auto run = [&](double& prefill_s, double& decode_s) {
+      model->reset();
+      const Clock::time_point t0 = Clock::now();
+      std::span<const float> logits = model->forward(prompt, 0);
+      prefill_s = seconds_since(t0);
+
+      const Clock::time_point t1 = Clock::now();
+      for (std::int64_t i = 0; i < opt.decode_tokens; ++i) {
+        const std::int32_t next = greedy(logits);
+        logits = model->forward(std::span<const std::int32_t>(&next, 1), opt.prompt_tokens + i);
+      }
+      keep_alive(logits.data());
+      decode_s = seconds_since(t1);
+    };
+
+    if (!printed_header) {
+      std::printf(
+          "\n== whole model — %lld layers, %lld-token synthetic prompt, greedy decode, by weight "
+          "format ==\n\n",
+          static_cast<long long>(model->config().num_hidden_layers),
+          static_cast<long long>(opt.prompt_tokens));
+      std::printf("%-26s %3s %14s %6s %14s %14s %5s\n", "", "thr", "median", "+/-", "min", "max",
+                  "runs");
+      printed_header = true;
+    }
+    std::fflush(stdout);
+
+    // With several thread counts, the runs are interleaved across them, one
+    // run at each count per round, as the op samples are.
+    const std::size_t n_counts = opt.threads.size();
+    double prefill_s = 0.0;
+    double decode_s = 0.0;
+    for (const int threads : opt.threads) {
+      set_num_threads(threads);
+      run(prefill_s, decode_s);  // warm-up
+    }
+    std::vector<std::vector<double>> prefill_tps(n_counts);
+    std::vector<std::vector<double>> decode_tps(n_counts);
+    for (int s = 0; s < opt.samples; ++s) {
+      for (std::size_t i = 0; i < n_counts; ++i) {
+        set_num_threads(opt.threads[i]);
+        run(prefill_s, decode_s);
+        prefill_tps[i].push_back(static_cast<double>(opt.prompt_tokens) / prefill_s);
+        decode_tps[i].push_back(static_cast<double>(opt.decode_tokens) / decode_s);
+      }
+    }
+    // Read before any other format loads: the f32 model is the one this
+    // series has always measured, and loading bf16 or q8_0 converts from a
+    // full f32 checkpoint, which would raise the lifetime peak.
+    const double rss = peak_rss_mib();
+
+    auto row = [&](const std::string& label, int threads, const Stats& st) {
+      std::printf("%-26s %3d %8.1f tok/s %5.1f%% %8.1f tok/s %8.1f tok/s %5d\n", label.c_str(),
+                  threads, st.median(), st.spread() * 100.0, st.min(), st.max(), st.count());
+    };
     for (std::size_t i = 0; i < n_counts; ++i) {
-      set_num_threads(opt.threads[i]);
-      run(prefill_s, decode_s);
-      prefill_tps[i].push_back(static_cast<double>(opt.prompt_tokens) / prefill_s);
-      decode_tps[i].push_back(static_cast<double>(opt.decode_tokens) / decode_s);
+      const int threads = opt.threads[i];
+      const Stats prefill(prefill_tps[i]);
+      const Stats decode(decode_tps[i]);
+      if (want_prefill) {
+        row(std::string("prefill ") + format.name + " (" + std::to_string(opt.prompt_tokens) +
+                " tokens)",
+            threads, prefill);
+        report.add({prefill_name, threads, prefill.median(), "tok/s", opt.samples, prefill.count(),
+                    prefill.min(), prefill.max()});
+      }
+      if (want_decode) {
+        row(std::string("decode ") + format.name + " (" + std::to_string(opt.decode_tokens) +
+                " tokens)",
+            threads, decode);
+        report.add({decode_name, threads, decode.median(), "tok/s", opt.samples, decode.count(),
+                    decode.min(), decode.max()});
+      }
     }
+    if (is_f32) {
+      // Peak RSS covers the runs at every count; it is filed under the largest.
+      const int most = *std::max_element(opt.threads.begin(), opt.threads.end());
+      std::printf("%-26s %8.1f MiB  (f32: load + prefill + decode)\n", "peak RSS", rss);
+      report.add_value("memory.peak_rss.model", most, rss, "MiB", 1);
+    }
+    std::fflush(stdout);
   }
-  const double rss = peak_rss_mib();
-
-  std::printf("%-26s %3s %14s %6s %14s %14s %5s\n", "", "thr", "median", "+/-", "min", "max", "runs");
-  auto row = [&](const std::string& label, int threads, const Stats& st) {
-    std::printf("%-26s %3d %8.1f tok/s %5.1f%% %8.1f tok/s %8.1f tok/s %5d\n", label.c_str(), threads,
-                st.median(), st.spread() * 100.0, st.min(), st.max(), st.count());
-  };
-  for (std::size_t i = 0; i < n_counts; ++i) {
-    const int threads = opt.threads[i];
-    const Stats prefill(prefill_tps[i]);
-    const Stats decode(decode_tps[i]);
-    if (want_prefill) {
-      row("prefill (" + std::to_string(opt.prompt_tokens) + " tokens)", threads, prefill);
-      report.add({"model.prefill", threads, prefill.median(), "tok/s", opt.samples, prefill.count(),
-                  prefill.min(), prefill.max()});
-    }
-    if (want_decode) {
-      row("decode (" + std::to_string(opt.decode_tokens) + " tokens)", threads, decode);
-      report.add({"model.decode", threads, decode.median(), "tok/s", opt.samples, decode.count(),
-                  decode.min(), decode.max()});
-    }
-  }
-  // Peak RSS covers the runs at every count; it is filed under the largest.
-  const int most = *std::max_element(opt.threads.begin(), opt.threads.end());
-  std::printf("%-26s %8.1f MiB  (load + prefill + decode)\n", "peak RSS", rss);
-  std::fflush(stdout);
-  report.add_value("memory.peak_rss.model", most, rss, "MiB", 1);
   return matched;
 }
 

@@ -184,8 +184,9 @@ status 2 if that is missing.
 
 ### Reading the benchmark output
 
-**Whole model** comes first: prefill and decode throughput in tokens/s, then
-peak RSS.
+**Whole model** comes first: prefill and decode throughput in tokens/s in each
+weight format, f32, bf16 (what `--weights auto` picks for SmolLM2-135M) and
+q8_0, then the f32 model's peak RSS.
 
 - *Prefill* is one forward pass over a 128-token synthetic prompt, starting
   from an empty cache.
@@ -218,11 +219,20 @@ its row shows is therefore the noise floor: about ±1% on a quiet machine, and a
 lot more while other jobs are running. An optimization that does not clear the
 noise floor has not been measured.
 
+**Q8_0 vs F32** and **BF16 vs F32** time `ops::matmul` over whole sweeps of the
+model's linear layers, the two formats' samples interleaved: one decode token
+(every projection and the LM head at m = 1, 211 calls), and every projection
+at m = 64 and at m = 79, the longest oracle prompt (210 calls). `speedup` is
+F32 time / the format's time. The decode row adds the weight bytes per second
+of each format and `read GB/s`, a plain sequential read of the F32 weights in
+the same rounds, the memory ceiling that decode is up against.
+
 **Runtime** times the thread pool itself: one `kernel_parallel_for` over 1024
 items with a trivial body, at each `--threads` count. `runtime.parallel_for.hot`
 calls back to back, as the forward pass does (about 240 calls per decode step);
-`runtime.parallel_for.cold` calls after the workers have gone to sleep, so it
-includes waking them.
+`runtime.parallel_for.large` is the same with a work size big enough to use
+every thread, as a prefill matmul does; `runtime.parallel_for.cold` calls after
+the workers have gone to sleep, so it includes waking them.
 
 **Machine-readable lines** close the run, one per measurement:
 
@@ -244,8 +254,13 @@ Names follow these patterns:
 | `op.<regime>.<op>.ops` / `.ref` | µs per call |
 | `op.<regime>.<op>.speedup` | ratio |
 | `op.<regime>.<op>.scaling` | ratio, only with several `--threads` counts |
-| `model.prefill`, `model.decode` | tok/s |
-| `memory.peak_rss.model` | MiB, after load + prefill + decode |
+| `model.prefill`, `model.decode` | tok/s, f32 weights |
+| `model.prefill.bf16`, `model.decode.bf16`, `.q8_0` | tok/s, bf16 or q8_0 weights |
+| `q8_0.<sweep>.f32` / `.q8_0`, `bf16.<sweep>.f32` / `.bf16` | µs per sweep; `<sweep>` is `decode.token`, `prefill.m64` or `prefill.m79` |
+| `q8_0.<sweep>.speedup`, `bf16.<sweep>.speedup` | ratio |
+| `q8_0.decode.token.f32.gbps`, `.q8_0.gbps`, `q8_0.read.gbps` (and `bf16.` likewise) | GB/s |
+| `runtime.parallel_for.hot` / `.large` / `.cold` | µs per call |
+| `memory.peak_rss.model` | MiB, after the f32 model's load + prefill + decode |
 | `memory.peak_rss.process` | MiB, whole run |
 
 `ci/run.sh bench` writes them to `build/release/bench-results.jsonl`, and CI
