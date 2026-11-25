@@ -34,6 +34,7 @@
 #endif
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
@@ -45,6 +46,7 @@
 #include <filesystem>
 #include <functional>
 #include <initializer_list>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <random>
@@ -155,12 +157,17 @@ options:
 exit status: 0 ok, 1 error, 2 model directory missing
 )";
 
-std::int64_t parse_int(std::string_view flag, const char* text, std::int64_t min) {
+/// An integer in [min, max]. Out-of-range text fails like any other: strtoll
+/// saturates it, and a value past int would be truncated by the int options.
+std::int64_t parse_int(std::string_view flag, const char* text, std::int64_t min,
+                       std::int64_t max = std::numeric_limits<int>::max()) {
   char* end = nullptr;
+  errno = 0;
   const long long v = std::strtoll(text, &end, 10);
-  if (end == text || *end != '\0' || v < min) {
-    throw std::invalid_argument(std::string(flag) + " needs an integer >= " +
-                                std::to_string(min) + ", got '" + text + "'");
+  if (end == text || *end != '\0' || errno == ERANGE || v < min || v > max) {
+    throw std::invalid_argument(std::string(flag) + " needs an integer in [" +
+                                std::to_string(min) + ", " + std::to_string(max) + "], got '" +
+                                text + "'");
   }
   return v;
 }
