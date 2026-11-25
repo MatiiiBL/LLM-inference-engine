@@ -269,11 +269,29 @@ std::string token_bytes(std::string_view token) {
   throw std::runtime_error("Tokenizer: " + where + ": " + what);
 }
 
+/// Containers a tokenizer.json or tokenizer_config.json may nest, the root
+/// included: serde_json's default recursion limit, which the reference
+/// tokenizers library parses with. Real files nest about five deep.
+/// nlohmann parses any depth, but the error messages below quote rejected
+/// values with dump(), which recurses once per level: 100000 nested arrays
+/// as the normalizer overflowed the stack instead of throwing.
+constexpr int kMaxJsonDepth = 128;
+
 json read_json(const std::filesystem::path& path) {
   std::ifstream in(path, std::ios::binary);
   if (!in) fail(path.string(), "cannot open file");
   try {
-    return json::parse(in);
+    // `depth` counts the containers open around the one starting, so the
+    // root opens at depth 0.
+    return json::parse(in, [&](int depth, json::parse_event_t event, json&) {
+      if ((event == json::parse_event_t::object_start ||
+           event == json::parse_event_t::array_start) &&
+          depth >= kMaxJsonDepth) {
+        fail(path.string(),
+             "nests JSON more than " + std::to_string(kMaxJsonDepth) + " levels deep");
+      }
+      return true;
+    });
   } catch (const json::exception& e) {
     fail(path.string(), std::string("malformed JSON: ") + e.what());
   }

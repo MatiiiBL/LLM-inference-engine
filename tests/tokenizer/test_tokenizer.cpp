@@ -778,3 +778,29 @@ TEST_CASE("from_file throws on anything it does not implement") {
   CHECK_THROWS_AS(Tokenizer::from_file(dir.write("list.json", "[]")), std::runtime_error);
   CHECK_THROWS_AS(Tokenizer::from_dir(dir.path()), std::runtime_error);
 }
+
+TEST_CASE("JSON nested more than 128 deep is rejected, not a stack overflow") {
+  const auto nested = [](int n) { return std::string(n, '[') + std::string(n, ']'); };
+  // The root object is one level, so a normalizer of n nested arrays makes
+  // tokenizer.json 1 + n deep. At 128 it is rejected for being a normalizer.
+  TinyTokenizer at_limit;
+  at_limit.normalizer = nested(127);
+  CHECK_THROWS_WITH_AS(load_tiny(at_limit), doctest::Contains("normalizer is not supported"),
+                       std::runtime_error);
+  TinyTokenizer over;
+  over.normalizer = nested(128);
+  CHECK_THROWS_WITH_AS(load_tiny(over), doctest::Contains("nests JSON more than 128 levels deep"),
+                       std::runtime_error);
+  // Quoting this normalizer in that error message overflowed the stack.
+  TinyTokenizer deep;
+  deep.normalizer = nested(100000);
+  CHECK_THROWS_WITH_AS(load_tiny(deep), doctest::Contains("more than 128 levels deep"),
+                       std::runtime_error);
+
+  const TempDir dir;
+  dir.write("tokenizer.json", TinyTokenizer{}.json());
+  dir.write("tokenizer_config.json", R"({"bos_token": )" + nested(100000) + "}");
+  CHECK_THROWS_WITH_AS(Tokenizer::from_dir(dir.path()),
+                       doctest::Contains("tokenizer_config.json: nests JSON more than 128"),
+                       std::runtime_error);
+}

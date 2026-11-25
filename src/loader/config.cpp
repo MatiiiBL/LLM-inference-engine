@@ -16,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "json_depth.h"
 #include "minillm/config.h"
 
 namespace minillm {
@@ -107,7 +108,15 @@ class ConfigReader {
 ModelConfig parse(std::string_view text, const std::string& source) {
   json root;
   try {
-    root = json::parse(text);
+    // Error messages quote offending values with dump(), which recurses once
+    // per level of nesting, so a value too deep to quote is rejected here.
+    root = json::parse(text, [&](int depth, json::parse_event_t event, json&) {
+      if (loader_detail::opens_too_deep(depth, event)) {
+        throw std::runtime_error("ModelConfig: " + source + ": nests JSON more than " +
+                                 std::to_string(loader_detail::kMaxJsonDepth) + " levels deep");
+      }
+      return true;
+    });
   } catch (const json::exception& e) {
     throw std::runtime_error("ModelConfig: " + source + ": not valid JSON: " + e.what());
   }
